@@ -9,10 +9,10 @@ if (-not $versionMatch.Success) {
 $version = $versionMatch.Groups[1].Value
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $distRoot = Join-Path $root "dist"
-$outDir = Join-Path $distRoot "course-monitor-v$version-windows-x64-$stamp"
+$outDir = Join-Path $distRoot "Course-snatching-v$version-windows-x64-$stamp"
 $zipPath = "$outDir.zip"
 
-$skipTests = $env:COURSE_MONITOR_SKIP_TESTS -eq "1"
+$skipTests = $env:COURSE_SNATCHING_SKIP_TESTS -eq "1"
 
 New-Item -ItemType Directory -Force $distRoot | Out-Null
 if ((Test-Path -LiteralPath $outDir) -or (Test-Path -LiteralPath $zipPath)) {
@@ -20,7 +20,7 @@ if ((Test-Path -LiteralPath $outDir) -or (Test-Path -LiteralPath $zipPath)) {
 }
 
 # Warn about stale root binaries that confuse users
-foreach ($name in @("course-monitor.exe", "course-monitor-new.exe")) {
+foreach ($name in @("Course-snatching.exe", "Course-snatching-new.exe")) {
     $stale = Join-Path $root $name
     if (Test-Path -LiteralPath $stale) {
         Write-Warning "根目录存在过期产物 $name ；发布包以 dist/ 为准。建议删除根目录 EXE。"
@@ -41,11 +41,11 @@ try {
 
     New-Item -ItemType Directory $outDir | Out-Null
     New-Item -ItemType Directory (Join-Path $outDir "runtime\debug") -Force | Out-Null
-    $exeSrc = Join-Path $root "target\release\course-monitor.exe"
-    $exeName = "course-monitor-v$version-windows-x64.exe"
+    $exeSrc = Join-Path $root "target\release\Course-snatching.exe"
+    $exeName = "Course-snatching-v$version-windows-x64.exe"
     Copy-Item -LiteralPath $exeSrc -Destination (Join-Path $outDir $exeName)
     # Keep plain name for convenience
-    Copy-Item -LiteralPath $exeSrc -Destination (Join-Path $outDir "course-monitor.exe")
+    Copy-Item -LiteralPath $exeSrc -Destination (Join-Path $outDir "Course-snatching.exe")
     Copy-Item -LiteralPath (Join-Path $root "README.md") -Destination $outDir
     Copy-Item -LiteralPath (Join-Path $root "LICENSE") -Destination $outDir
     Copy-Item -LiteralPath (Join-Path $root "CHANGELOG.md") -Destination $outDir
@@ -57,7 +57,7 @@ try {
     $git = ""
     try { $git = (git -C $root rev-parse --short HEAD 2>$null) } catch {}
     $buildInfo = @"
-name=course-monitor
+name=Course-snatching
 version=$version
 target=windows-x64
 built_at=$stamp
@@ -84,9 +84,9 @@ git=$git
     Set-Content -LiteralPath (Join-Path $outDir "SHA256SUMS.txt") -Value ($sums -join "`n") -Encoding ASCII
 
 
-    # 可选 Authenticode：设置 COURSE_MONITOR_SIGN_THUMBPRINT 后对 dist 内 EXE 签名
-    if ($env:COURSE_MONITOR_SIGN_THUMBPRINT) {
-        $thumb = $env:COURSE_MONITOR_SIGN_THUMBPRINT
+    # 可选 Authenticode：设置 COURSE_SNATCHING_SIGN_THUMBPRINT 后对 dist 内 EXE 签名
+    if ($env:COURSE_SNATCHING_SIGN_THUMBPRINT) {
+        $thumb = $env:COURSE_SNATCHING_SIGN_THUMBPRINT
         Get-ChildItem -LiteralPath $outDir -Filter *.exe | ForEach-Object {
             Write-Output "Authenticode 签名 $($_.Name) ..."
             & signtool sign /sha1 $thumb /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName

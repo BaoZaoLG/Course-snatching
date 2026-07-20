@@ -26,7 +26,7 @@ fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("course-monitor-worker")
+            .thread_name("Course-snatching-worker")
             .enable_all()
             .build()
             .expect("failed to create async runtime")

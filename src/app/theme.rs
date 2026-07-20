@@ -45,7 +45,7 @@ pub(crate) fn custom_host_requiring_confirmation(raw: &str) -> Option<String> {
         return None;
     };
     let host = host_raw.to_ascii_lowercase();
-    if host == "jwxt.sias.edu.cn" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
         None
     } else {
         Some(host)

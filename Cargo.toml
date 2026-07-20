@@ -1,13 +1,13 @@
 [package]
-name = "course-monitor"
+name = "course-snatching"
 version = "0.10.1"
 edition = "2021"
 rust-version = "1.97.1"
-description = "教务选课监控 GUI：程序内登录 + 接口选课（无浏览器）"
+description = "教务选课监控桌面工具：程序内登录、余量监控与选课提交"
 license = "MIT"
 readme = "README.md"
-documentation = "https://docs.rs/course-monitor"
-keywords = ["egui", "course", "monitor"]
+repository = "https://github.com/BaoZaoLG/Course-snatching"
+keywords = ["egui", "course", "elect"]
 categories = ["gui"]
 include = [
     "/src/**",
@@ -23,6 +23,10 @@ include = [
     "/rust-toolchain.toml",
     "/scripts/**",
 ]
+
+[[bin]]
+name = "Course-snatching"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -59,4 +63,3 @@ codegen-units = 1
 strip = true
 opt-level = 3
 lto = "thin"
-

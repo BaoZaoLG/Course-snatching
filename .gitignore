@@ -6,20 +6,10 @@
 /*.rar
 /.tools/
 *.tmp
-
 /dist/
-
-# 本地误放的发布产物（正式包在 dist/）
-/course-monitor.exe
-/course-monitor-new.exe
-
-
-# local secrets / crash dumps
 *.log
-.crash.log
 
-
-# build / tool outputs
+# local tool noise
 /final-*.txt
 /t-*.txt
 /cargo-test-*.txt

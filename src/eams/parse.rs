@@ -293,7 +293,7 @@ pub(crate) fn extract_profiles_detailed(text: &str) -> Vec<(String, String)> {
         }
     };
 
-    // SIAS / Beangen: checkPaymentBeforeElect(profileId, shortTerm)
+    // / Beangen: checkPaymentBeforeElect(profileId, shortTerm)
     if let Ok(re) = Regex::new(r#"checkPaymentBeforeElect\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)"#) {
         let heading_re = Regex::new(r#"(?s)<h2[^>]*>(.*?)</h2>"#).ok();
         for c in re.captures_iter(text) {
@@ -437,7 +437,7 @@ pub(crate) fn extract_project_semester(html: &str) -> (Option<String>, Option<St
     (project, semester)
 }
 
-/// 解析 SIAS 返回的 JS 风格数组：var lessonJSONs = [{id:1,no:'x',...}]
+/// 解析 返回的 JS 风格数组：var lessonJSONs = [{id:1,no:'x',...}]
 pub(crate) fn parse_lessons_js_like(text: &str) -> Result<Vec<Lesson>> {
     let arr = extract_js_array_after(text, "lessonJSONs")
         .or_else(|| extract_js_array_after(text, "electableLessons"))

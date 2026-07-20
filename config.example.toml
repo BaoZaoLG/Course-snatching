@@ -1,4 +1,4 @@
-base_url = "https://jwxt.sias.edu.cn/eams"
+base_url = "https://example.edu/eams"
 username = ""
 interval_seconds = 1.5
 watch_serials = []
@@ -18,3 +18,7 @@ grab_seats_first = false
 only_available = false
 filter = ""
 first_run_ack = false
+open_burst_seconds = 20
+monitor_only = false
+schedule_enabled = false
+schedule_time = "2026-01-01 08:00:00"

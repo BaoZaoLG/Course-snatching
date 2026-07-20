@@ -4,8 +4,8 @@ fn main() {
     {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico");
-        res.set("ProductName", "选课助手");
-        res.set("FileDescription", "SIAS 选课助手");
+        res.set("ProductName", "Course-snatching");
+        res.set("FileDescription", "Course-snatching");
         res.set("ProductVersion", env!("CARGO_PKG_VERSION"));
         res.compile().expect("failed to compile Windows resources");
     }

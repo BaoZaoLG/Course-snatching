@@ -8,7 +8,7 @@ if (Test-Path $debug) {
     Write-Output "无需清理"
 }
 # Remove accidental root exes
-foreach ($name in @("course-monitor.exe", "course-monitor-new.exe")) {
+foreach ($name in @("Course-snatching.exe", "Course-snatching-new.exe")) {
     $p = Join-Path $root $name
     if (Test-Path -LiteralPath $p) {
         Remove-Item -LiteralPath $p -Force

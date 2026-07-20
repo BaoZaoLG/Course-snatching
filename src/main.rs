@@ -12,10 +12,10 @@ use config::AppConfig;
 use eframe::egui;
 use std::sync::Arc;
 
-const APP_TITLE: &str = concat!("选课助手 · SIAS v", env!("CARGO_PKG_VERSION"));
+const APP_TITLE: &str = concat!("Course-snatching v", env!("CARGO_PKG_VERSION"));
 
 fn load_icon() -> egui::IconData {
-    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("SIAS icon")
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).expect("icon")
 }
 
 fn install_panic_report() {
@@ -26,7 +26,7 @@ fn install_panic_report() {
             let _ = std::fs::create_dir_all(parent);
         }
         let report = format!(
-            "CourseMonitor panic report\n{}\n\n{:?}\n",
+            "Course-snatching panic report\n{}\n\n{:?}\n",
             info,
             std::backtrace::Backtrace::force_capture()
         );

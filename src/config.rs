@@ -65,7 +65,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://jwxt.sias.edu.cn/eams".into(),
+            base_url: "https://example.edu/eams".into(),
             username: String::new(),
             interval_seconds: 1.5,
             watch_serials: vec![],
@@ -97,7 +97,7 @@ impl AppConfig {
     /// 用户配置放在 roaming AppData，避免安装目录无写权限，也避免和发布文件混在一起。
     pub fn path() -> PathBuf {
         if let Some(dir) = std::env::var_os("APPDATA") {
-            return PathBuf::from(dir).join("CourseMonitor").join("config.toml");
+            return PathBuf::from(dir).join("Course-snatching").join("config.toml");
         }
         Self::legacy_path()
     }
@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn save_never_serializes_a_password_field() {
         let dir =
-            std::env::temp_dir().join(format!("course-monitor-config-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("Course-snatching-config-test-{}", std::process::id()));
         let path = dir.join("config.toml");
         let cfg = AppConfig::default();
         cfg.save_to(&path).unwrap();

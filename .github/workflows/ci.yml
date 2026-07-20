@@ -29,7 +29,7 @@ jobs:
         shell: pwsh
         run: |
           $files = cargo package --list --allow-dirty
-          $forbidden = @('config.toml', 'course-monitor.exe', 'src.rar', 'runtime\debug')
+          $forbidden = @('config.toml', 'Course-snatching.exe', 'src.rar', 'runtime\debug')
           foreach ($item in $forbidden) {
             if ($files | Select-String -SimpleMatch $item) {
               throw "Forbidden package content: $item"
@@ -37,9 +37,9 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: course-monitor-windows-x64
+          name: Course-snatching-windows-x64
           path: |
-            target/release/course-monitor.exe
+            target/release/Course-snatching.exe
             README.md
             LICENSE
             CHANGELOG.md

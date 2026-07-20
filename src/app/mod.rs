@@ -291,8 +291,8 @@ impl CourseApp {
 
                     // Left: brand + live state
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.label(RichText::new("选课助手").size(22.0).strong().color(TEXT));
-                        ui.label(RichText::new("SIAS").size(META_SIZE).strong().color(BLUE));
+                        ui.label(RichText::new("Course-snatching").size(20.0).strong().color(TEXT));
+                        ui.label(RichText::new("选课助手").size(META_SIZE).strong().color(BLUE));
                         ui.add_space(6.0);
                         status_dot(ui, color, running);
                         ui.label(RichText::new(label).size(META_SIZE).color(color));
@@ -1563,7 +1563,7 @@ impl CourseApp {
 
     fn export_result_summary(&mut self, summary: &str) {
         if let Some(path) = rfd::FileDialog::new()
-            .set_file_name("course-monitor-result.txt")
+            .set_file_name("Course-snatching-result.txt")
             .save_file()
         {
             match std::fs::write(&path, summary) {
@@ -1581,7 +1581,7 @@ impl CourseApp {
             .collect::<Vec<_>>()
             .join("\n");
         if let Some(path) = rfd::FileDialog::new()
-            .set_file_name("course-monitor-logs.txt")
+            .set_file_name("Course-snatching-logs.txt")
             .save_file()
         {
             match std::fs::write(&path, text) {
@@ -1593,7 +1593,7 @@ impl CourseApp {
 
     fn export_config(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .set_file_name("course-monitor-config.toml")
+            .set_file_name("Course-snatching-config.toml")
             .save_file()
         {
             match self.cfg.export_to(&path) {
@@ -2215,8 +2215,8 @@ mod tests {
     #[test]
     fn custom_hosts_require_per_session_confirmation() {
         assert_eq!(
-            custom_host_requiring_confirmation("https://jwxt.sias.edu.cn/eams"),
-            None
+            custom_host_requiring_confirmation("https://jwxt.example.edu.cn/eams"),
+            Some("jwxt.example.edu.cn".into())
         );
         assert_eq!(
             custom_host_requiring_confirmation("http://127.0.0.1:8080/eams"),

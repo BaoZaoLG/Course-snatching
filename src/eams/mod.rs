@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 CourseMonitor/0.8";
+const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 Course-snatching/0.10";
 
 const MAX_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
 
@@ -413,7 +413,7 @@ impl EamsClient {
     }
 
     /// 拉取全部可选课程（结构化数据）
-    /// SIAS 实际接口：
+    /// 实际接口：
     /// 1) POST/GET 进入 defaultPage
     /// 2) GET stdElectCourse!data.action?profileId=...  -> var lessonJSONs = [...]
     /// 3) GET stdElectCourse!queryStdCount.action?profileId=...&projectId=...&semesterId=...
@@ -683,9 +683,9 @@ mod tests {
     use std::thread;
 
     #[test]
-    #[ignore = "requires live SIAS network access"]
-    fn live_sias_login_page_exposes_the_expected_password_salt() {
-        let client = EamsClient::new("https://jwxt.sias.edu.cn/eams", 15, false).unwrap();
+    #[ignore = "requires live network access"]
+    fn live_example_login_page_exposes_the_expected_password_salt() {
+        let client = EamsClient::new("https://example.edu/eams", 15, false).unwrap();
         let login_url = client.url("loginExt.action").unwrap();
         let (_, html) = test_runtime()
             .block_on(client.send_raw_text(client.http.get(login_url), "打开登录页", true))
