@@ -86,6 +86,8 @@ pub struct SharedState {
     pub(crate) run_generation: AtomicU64,
     /// Generation of the task that currently owns `running`.
     pub(crate) run_owner: AtomicU64,
+    /// Bumped to cancel an armed scheduled start.
+    pub(crate) schedule_arm_generation: AtomicU64,
     pub logs: Mutex<VecDeque<LogItem>>,
     pub lessons: Mutex<Vec<Lesson>>,
     pub watch: Mutex<Vec<WatchStatus>>,
@@ -105,6 +107,7 @@ impl SharedState {
             revision: AtomicU64::new(0),
             run_generation: AtomicU64::new(0),
             run_owner: AtomicU64::new(0),
+            schedule_arm_generation: AtomicU64::new(0),
             logs: Mutex::new(VecDeque::new()),
             lessons: Mutex::new(Vec::new()),
             watch: Mutex::new(Vec::new()),

@@ -60,6 +60,8 @@ pub struct CourseApp {
     last_keepalive: f64,
     /// 已触发过的定时开抢键：YYYY-MM-DD HH:MM:SS
     schedule_fired_for: Option<String>,
+    /// Key currently armed in worker precise waiter.
+    schedule_armed_for: Option<String>,
     was_running: bool,
     result_summary: Option<String>,
 }
@@ -104,6 +106,7 @@ impl CourseApp {
             show_first_run,
             last_keepalive: 0.0,
             schedule_fired_for: None,
+            schedule_armed_for: None,
             was_running: false,
             result_summary: None,
         }
@@ -143,11 +146,23 @@ impl eframe::App for CourseApp {
             self.password.clear();
         }
         self.was_logged_in = logged;
+        let schedule_soon = self.cfg.schedule_enabled
+            && logged
+            && !running
+            && ScheduleStamp::parse(&self.cfg.schedule_time)
+                .and_then(|s| s.to_local_seconds())
+                .is_some_and(|target| {
+                    let now = worker::local_now_seconds();
+                    now <= target + 2 && target - now <= 120
+                });
         ctx.request_repaint_after(std::time::Duration::from_millis(
             if running || logging_in || refreshing {
-                90
+                50
+            } else if schedule_soon {
+                // Sub-frame wake while armed so UI countdown stays honest; precise fire is worker-side.
+                30
             } else {
-                700
+                400
             },
         ));
 
@@ -389,7 +404,7 @@ impl CourseApp {
                         ui,
                         &mut self.cfg.interval_seconds,
                         !running,
-                        0.1..=30.0,
+                        0.05..=30.0,
                         0.01,
                         2,
                         "秒",
@@ -399,7 +414,9 @@ impl CourseApp {
                     {
                         self.save_config();
                     }
-                    for (label, value) in [("稳妥", 1.0), ("均衡", 0.5), ("激进", 0.2)] {
+                    for (label, value) in
+                        [("稳妥", 1.0), ("均衡", 0.5), ("激进", 0.15), ("开课", 0.05)]
+                    {
                         if ui
                             .add_enabled(!running, quiet_button(label, 48.0))
                             .clicked()
@@ -1788,7 +1805,7 @@ impl CourseApp {
             .load(std::sync::atomic::Ordering::Acquire);
         let targets = self.cfg.cleaned_watch().len();
         let interval_ok = self.cfg.interval_seconds.is_finite()
-            && (0.1..=30.0).contains(&self.cfg.interval_seconds);
+            && (0.05..=30.0).contains(&self.cfg.interval_seconds);
         let mut checks = vec![
             (
                 logged,
@@ -1811,6 +1828,15 @@ impl CourseApp {
                 format!("轮询间隔 {:.2} 秒", self.cfg.interval_seconds),
             ),
         ];
+        if self.cfg.schedule_enabled && self.cfg.interval_seconds > 0.5 {
+            checks.push((
+                false,
+                format!(
+                    "定时开抢建议间隔 ≤ 0.3 秒（当前 {:.2}s），否则开课瞬间可能被抢满",
+                    self.cfg.interval_seconds
+                ),
+            ));
+        }
         if self.cfg.interval_seconds < 0.3 {
             checks.push((
                 true,
@@ -1821,16 +1847,29 @@ impl CourseApp {
     }
 
     fn maybe_trigger_schedule(&mut self, logged: bool, running: bool, logging_in: bool) {
-        if !self.cfg.schedule_enabled || !logged || running || logging_in {
+        // If a precise arm already started the run, mark the key fired so we don't double-trigger.
+        if running {
+            if let Some(key) = self.schedule_armed_for.take() {
+                self.schedule_fired_for = Some(key);
+            }
+            return;
+        }
+        if !self.cfg.schedule_enabled || !logged || logging_in {
+            worker::cancel_schedule_arm(&self.state);
+            self.schedule_armed_for = None;
             return;
         }
         if self.cfg.cleaned_watch().is_empty() {
+            worker::cancel_schedule_arm(&self.state);
+            self.schedule_armed_for = None;
             return;
         }
         let Some(stamp) = ScheduleStamp::parse(&self.cfg.schedule_time) else {
+            worker::cancel_schedule_arm(&self.state);
             return;
         };
         let Some(target_secs) = stamp.to_local_seconds() else {
+            worker::cancel_schedule_arm(&self.state);
             return;
         };
         let key = stamp.display();
@@ -1838,19 +1877,29 @@ impl CourseApp {
             return;
         }
         let now = worker::local_now_seconds();
-        if now < target_secs {
-            return;
-        }
         // Missed the window (e.g. app opened long after the target) — mark expired, don't fire.
         if now > target_secs + 30 {
             self.schedule_fired_for = Some(key);
+            worker::cancel_schedule_arm(&self.state);
             return;
         }
-        self.schedule_fired_for = Some(key.clone());
-        self.state
-            .log(LogLevel::Info, format!("定时开抢触发：{key}"));
-        self.status_line = format!("定时开抢已触发（{key}）");
-        self.start_grab();
+        if now >= target_secs {
+            self.schedule_fired_for = Some(key.clone());
+            self.schedule_armed_for = None;
+            worker::cancel_schedule_arm(&self.state);
+            self.state
+                .log(LogLevel::Info, format!("定时开抢触发：{key}"));
+            self.status_line = format!("定时开抢已触发（{key}）");
+            self.start_grab();
+            return;
+        }
+        // Precise background arm once per key (avoid re-arming every UI frame).
+        if self.schedule_armed_for.as_deref() != Some(key.as_str()) {
+            self.schedule_armed_for = Some(key.clone());
+            worker::arm_schedule(self.state.clone(), self.cfg.clone(), target_secs);
+            let remain = target_secs - now;
+            self.status_line = format!("定时精准确待命，约 {remain}s 后开抢");
+        }
     }
 
     fn show_schedule_editor(&mut self, ui: &mut egui::Ui) -> bool {
@@ -1989,6 +2038,23 @@ impl CourseApp {
                     );
                 });
 
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("开抢冲刺").size(META_SIZE).color(MUTED));
+                    let mut burst = self.cfg.open_burst_seconds as f64;
+                    if number_drag_f64(ui, &mut burst, true, 0.0..=120.0, 1.0, 0, "秒", 72.0)
+                        .changed()
+                    {
+                        self.cfg.open_burst_seconds = burst.round().clamp(0.0, 120.0) as u32;
+                        dirty = true;
+                    }
+                    ui.label(
+                        RichText::new("开始后前 N 秒去掉轮询正抖动，首轮不等待")
+                            .size(CAPTION_SIZE)
+                            .color(MUTED),
+                    );
+                });
+
                 if self.cfg.schedule_enabled {
                     ui.add_space(4.0);
                     if let Some(target) = stamp.to_local_seconds() {
@@ -2018,6 +2084,8 @@ impl CourseApp {
                 self.cfg.schedule_time = valid.display();
                 // re-arm when user changes the target
                 self.schedule_fired_for = None;
+                self.schedule_armed_for = None;
+                worker::cancel_schedule_arm(&self.state);
             }
         }
         dirty

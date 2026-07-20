@@ -58,6 +58,8 @@ pub struct AppConfig {
     pub schedule_enabled: bool,
     /// 定时开抢时刻，格式 YYYY-MM-DD HH:MM:SS（兼容旧版 HH:MM）。
     pub schedule_time: String,
+    /// 开始后前 N 秒进入冲刺：更短间隔、去掉正抖动，抢开课窗口。
+    pub open_burst_seconds: u32,
 }
 
 impl Default for AppConfig {
@@ -86,6 +88,7 @@ impl Default for AppConfig {
             first_run_ack: false,
             schedule_enabled: false,
             schedule_time: default_schedule_time(),
+            open_burst_seconds: 20,
         }
     }
 }
@@ -276,7 +279,7 @@ impl AppConfig {
         }) {
             bail!("监控目标中的教学班标识无效，请删除后重新加入");
         }
-        if !self.interval_seconds.is_finite() || !(0.1..=30.0).contains(&self.interval_seconds) {
+        if !self.interval_seconds.is_finite() || !(0.05..=30.0).contains(&self.interval_seconds) {
             bail!("轮询间隔必须在 0.1～30 秒之间");
         }
         if !(1..=20).contains(&self.max_consecutive_errors) {

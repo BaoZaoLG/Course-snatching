@@ -314,16 +314,26 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
         let mut consecutive_errors = 0u32;
         let mut consecutive_submission_errors = 0u32;
         let mut stopped_for_errors = false;
-        let mut effective_interval = cfg.interval_seconds.max(0.1);
+        let mut effective_interval = cfg.interval_seconds.max(0.05);
         let mut seat_open_prev: HashMap<String, bool> = HashMap::new();
+        let burst_secs = cfg.open_burst_seconds.min(120);
+        let burst_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(u64::from(burst_secs));
+        let mut first_round = true;
 
         while state.is_current_run(generation) && !pending.is_empty() {
+            let in_burst = burst_secs > 0 && tokio::time::Instant::now() < burst_deadline;
+            if in_burst {
+                // Sprint: stick to user interval (no adaptive slowdown from prior errors).
+                effective_interval = cfg.interval_seconds.max(0.05);
+            }
+
             let catalog = match client.fetch_lessons(&profile).await {
                 Ok(list) => {
                     consecutive_errors = 0;
                     if cfg.adaptive_interval {
                         effective_interval =
-                            (effective_interval * 0.92).max(cfg.interval_seconds.max(0.1));
+                            (effective_interval * 0.92).max(cfg.interval_seconds.max(0.05));
                     }
                     *state.lessons.lock() = list.clone();
                     enrich_watch_from_lessons(&state, &list);
@@ -656,13 +666,30 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
             if pending.is_empty() || !state.is_current_run(generation) {
                 break;
             }
-            let delay = poll_delay(effective_interval);
-            state.set_message(format!(
-                "本轮结束，剩余 {} 门，{:.2}s 后继续",
-                pending.len(),
-                delay.as_secs_f64()
-            ));
-            sleep_cancellable(&state, generation, delay).await;
+            // First round after start/schedule: no artificial wait before we already polled.
+            // Between rounds: burst mode skips positive jitter and can be sub-100ms.
+            let in_burst = burst_secs > 0 && tokio::time::Instant::now() < burst_deadline;
+            let delay = if first_round {
+                first_round = false;
+                Duration::from_millis(0)
+            } else {
+                poll_delay_for_mode(effective_interval, in_burst)
+            };
+            if !delay.is_zero() {
+                state.set_message(format!(
+                    "{}剩余 {} 门，{:.2}s 后继续",
+                    if in_burst {
+                        "冲刺中，"
+                    } else {
+                        "本轮结束，"
+                    },
+                    pending.len(),
+                    delay.as_secs_f64()
+                ));
+                sleep_cancellable(&state, generation, delay).await;
+            } else {
+                state.set_message(format!("冲刺开抢，剩余 {} 门", pending.len()));
+            }
         }
 
         if pending.is_empty() {
@@ -752,6 +779,68 @@ pub fn logout(state: &SharedState) {
     state.lessons.lock().clear();
     state.set_message("已退出登录");
     state.log(LogLevel::Info, "已退出登录");
+}
+
+/// Cancel any pending precise schedule arm.
+pub fn cancel_schedule_arm(state: &SharedState) {
+    state.schedule_arm_generation.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Sleep until `target_local_secs` (UTC+8 civil seconds) then start grab with minimal wake latency.
+pub fn arm_schedule(state: Arc<SharedState>, cfg: AppConfig, target_local_secs: i64) {
+    if target_local_secs <= 0 {
+        return;
+    }
+    let arm_gen = state.schedule_arm_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let now = local_now_seconds();
+    if now >= target_local_secs {
+        // Already due — start immediately (caller should also guard fired-once).
+        if !state.running.load(Ordering::Acquire) {
+            start_grab(state, cfg);
+        }
+        return;
+    }
+    state.set_message(format!("定时待命中，目标 T{:+}s", target_local_secs - now));
+    spawn_task(async move {
+        loop {
+            if state.schedule_arm_generation.load(Ordering::Acquire) != arm_gen {
+                return;
+            }
+            if state.running.load(Ordering::Acquire) || state.logging_in.load(Ordering::Acquire) {
+                return;
+            }
+            let now = local_now_seconds();
+            if now >= target_local_secs {
+                break;
+            }
+            let remain = target_local_secs - now;
+            // Coarse far away, then tighten to ~2ms near the deadline.
+            let sleep_ms: u64 = if remain > 30 {
+                500
+            } else if remain > 5 {
+                50
+            } else if remain > 1 {
+                10
+            } else {
+                2
+            };
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        }
+        if state.schedule_arm_generation.load(Ordering::Acquire) != arm_gen {
+            return;
+        }
+        if state.running.load(Ordering::Acquire) {
+            return;
+        }
+        state.log(
+            LogLevel::Info,
+            format!(
+                "精确定时触发（偏差约 {}ms 内）",
+                ((local_now_seconds() - target_local_secs).abs() * 1000).min(999)
+            ),
+        );
+        start_grab(state, cfg);
+    });
 }
 
 pub fn stop_grab(state: &SharedState) {
@@ -861,13 +950,27 @@ fn mark_pending_stopped(state: &SharedState, pending: &HashSet<String>) {
 }
 
 fn poll_delay(interval_seconds: f64) -> Duration {
+    poll_delay_for_mode(interval_seconds, false)
+}
+
+/// `burst`: no positive jitter, lower floor — used in open-course sprint window.
+fn poll_delay_for_mode(interval_seconds: f64, burst: bool) -> Duration {
+    let base = if burst {
+        interval_seconds.clamp(0.05, 30.0)
+    } else {
+        interval_seconds.clamp(0.05, 30.0)
+    };
+    if burst {
+        // Tiny negative bias only (never slower than base).
+        return Duration::from_secs_f64(base);
+    }
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.subsec_nanos())
         .unwrap_or(0);
-    // ±10% jitter keeps traffic less robotic; floor matches UI min interval.
+    // ±10% jitter keeps steady-state traffic less robotic.
     let jitter = (f64::from(nanos % 2001) / 10_000.0) - 0.1;
-    Duration::from_secs_f64((interval_seconds * (1.0 + jitter)).clamp(0.1, 30.0))
+    Duration::from_secs_f64((base * (1.0 + jitter)).clamp(0.05, 30.0))
 }
 
 fn error_backoff(interval_seconds: f64, consecutive_errors: u32) -> Duration {
@@ -918,7 +1021,11 @@ mod tests {
         }
         for _ in 0..100 {
             let delay = poll_delay(0.1).as_secs_f64();
-            assert!((0.1..=0.12).contains(&delay), "got {delay}");
+            assert!((0.05..=0.12).contains(&delay), "got {delay}");
+        }
+        for _ in 0..20 {
+            let burst = poll_delay_for_mode(0.1, true).as_secs_f64();
+            assert!((0.05..=0.1).contains(&burst), "burst got {burst}");
         }
     }
 
@@ -1094,22 +1201,22 @@ mod tests {
 
     #[test]
     fn monitor_only_does_not_submit_when_seat_open() {
-        let base = serve_sequence(vec![
-            "<html>elect page</html>",
-            "var lessonJSONs=[{id:371644,no:'MON.001',name:'Monitor',teachers:'甲',stdCount:1,limitCount:2}];",
-            "window.lessonId2Counts={'371644':{sc:1,lc:2}}",
-            // no elect response should be needed
-            "var lessonJSONs=[{id:371644,no:'MON.001',name:'Monitor',teachers:'甲',stdCount:1,limitCount:2}];",
-            "window.lessonId2Counts={'371644':{sc:1,lc:2}}",
-        ]);
+        let data = "var lessonJSONs=[{id:371644,no:'MON.001',name:'Monitor',teachers:'甲',stdCount:1,limitCount:2}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:1,lc:2}}";
+        let mut seq = vec!["<html>elect page</html>"];
+        for _ in 0..16 {
+            seq.push(data);
+            seq.push(counts);
+        }
+        let base = serve_sequence(seq);
         let state = prepared_state(&base);
         let mut cfg = test_config(&base, "MON.001");
         cfg.monitor_only = true;
         cfg.interval_seconds = 0.2;
-        cfg.max_consecutive_errors = 2;
+        cfg.open_burst_seconds = 0; // steady polling for this test
+        cfg.max_consecutive_errors = 5;
         start_grab(state.clone(), cfg);
-        // Let a couple of polls run, then stop.
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(Duration::from_millis(500));
         stop_grab(&state);
         wait_until_stopped(&state);
         let watch = state.watch.lock().clone();
@@ -1118,9 +1225,13 @@ mod tests {
         assert!(
             watch[0].detail.contains("仅监控")
                 || watch[0].detail.contains("余量")
-                || watch[0].state == WatchState::Checking
-                || watch[0].state == WatchState::Stopped
-                || watch[0].state == WatchState::Full,
+                || matches!(
+                    watch[0].state,
+                    WatchState::Checking
+                        | WatchState::Stopped
+                        | WatchState::Full
+                        | WatchState::Queued
+                ),
             "unexpected watch: {:?}",
             watch[0]
         );

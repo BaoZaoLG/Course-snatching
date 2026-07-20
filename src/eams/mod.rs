@@ -622,7 +622,7 @@ impl EamsClient {
         success_detail: &str,
     ) -> Result<VerifyOutcome> {
         // Brief settle time for server-side state.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let data_path = format!("stdElectCourse!data.action?profileId={profile_id}");
         let data_text = self.get_text(&data_path).await?;
