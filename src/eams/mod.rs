@@ -552,9 +552,16 @@ impl EamsClient {
     }
 
     /// 提交选课；对“成功”响应做轻量二次确认，降低误报。
-    pub async fn elect_lesson(&self, profile_id: &str, lesson_id: &str) -> Result<ElectResult> {
+    pub async fn elect_lesson(
+        &self,
+        profile_id: &str,
+        lesson_id: &str,
+        prior_selected: Option<u32>,
+    ) -> Result<ElectResult> {
         let pid = validate_numeric_id(profile_id, "profileId", true)?;
         let lesson_id = validate_numeric_id(lesson_id, "lessonId", false)?;
+        let before_selected = prior_selected;
+
         let mut url = self.url("stdElectCourse!batchOperator.action")?;
         if pid != "0" {
             url.query_pairs_mut().append_pair("profileId", pid);
@@ -577,24 +584,46 @@ impl EamsClient {
             )
             .await?;
         let result = classify_elect_response(&text);
-        if matches!(result, ElectResult::Success { .. }) {
-            match self.verify_elect_success(pid, lesson_id).await {
+        if let ElectResult::Success { detail } = &result {
+            match self
+                .verify_elect_success(pid, lesson_id, before_selected, detail)
+                .await
+            {
                 Ok(VerifyOutcome::Rejected(reason)) => {
                     return Ok(ElectResult::Failed { detail: reason });
                 }
-                Ok(VerifyOutcome::Confirmed) | Ok(VerifyOutcome::Inconclusive) | Err(_) => {}
+                Ok(VerifyOutcome::Confirmed) => {
+                    return Ok(ElectResult::Success {
+                        detail: if detail.contains("已确认") {
+                            detail.clone()
+                        } else {
+                            format!("{detail}（已二次确认）")
+                        },
+                    });
+                }
+                Ok(VerifyOutcome::Inconclusive) => {
+                    return Ok(ElectResult::Success {
+                        detail: format!("{detail}（提交成功，二次确认暂不确定）"),
+                    });
+                }
+                Err(_) => {}
             }
         }
         Ok(result)
     }
 
-    /// 成功响应后的轻量确认：课程已不在可选列表，或余量已满，视为合理。
-    /// 若仍显示有余量且响应像失败文案被误判，则拒绝。
+    /// 成功响应后的确认：人数上升 / 不在可选列表 / 已满 视为确认；
+    /// 若仍有余量且人数未变，且响应文案偏弱，则拒绝以免误报。
     async fn verify_elect_success(
         &self,
         profile_id: &str,
         lesson_id: &str,
+        before_selected: Option<u32>,
+        success_detail: &str,
     ) -> Result<VerifyOutcome> {
+        // Brief settle time for server-side state.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
         let data_path = format!("stdElectCourse!data.action?profileId={profile_id}");
         let data_text = self.get_text(&data_path).await?;
         if !data_text.contains(lesson_id) {
@@ -607,7 +636,6 @@ impl EamsClient {
         if lessons.is_empty() {
             return Ok(VerifyOutcome::Inconclusive);
         }
-        // best-effort merge counts if available
         let count_path = format!("stdElectCourse!queryStdCount.action?profileId={profile_id}");
         if let Ok(counts) = self.get_text(&count_path).await {
             let _ = merge_lesson_counts(&mut lessons, &counts);
@@ -615,11 +643,25 @@ impl EamsClient {
         let Some(lesson) = lessons.iter().find(|l| l.id == lesson_id) else {
             return Ok(VerifyOutcome::Confirmed);
         };
+
+        if let (Some(before), Some(after)) = (before_selected, lesson.seat.selected()) {
+            if after > before {
+                return Ok(VerifyOutcome::Confirmed);
+            }
+        }
         if lesson.seat.is_full() {
             return Ok(VerifyOutcome::Confirmed);
         }
         if lesson.seat.has_seat() {
-            // 仍有余量并不必然失败（多班额/延迟刷新），保持不确定。
+            let strong = success_detail.contains("选课成功")
+                || success_detail.contains("已经选过")
+                || success_detail.contains("已选过")
+                || success_detail.contains("操作成功");
+            if !strong {
+                return Ok(VerifyOutcome::Rejected(
+                    "提交返回疑似成功，但人数未变化且课程仍可选，已按失败处理".into(),
+                ));
+            }
             return Ok(VerifyOutcome::Inconclusive);
         }
         Ok(VerifyOutcome::Inconclusive)

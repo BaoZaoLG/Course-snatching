@@ -315,6 +315,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
         let mut consecutive_submission_errors = 0u32;
         let mut stopped_for_errors = false;
         let mut effective_interval = cfg.interval_seconds.max(0.1);
+        let mut seat_open_prev: HashMap<String, bool> = HashMap::new();
 
         while state.is_current_run(generation) && !pending.is_empty() {
             let catalog = match client.fetch_lessons(&profile).await {
@@ -502,6 +503,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     continue;
                 }
                 if !lesson.has_seat() {
+                    let was_open = seat_open_prev.get(&serial).copied().unwrap_or(false);
                     update_watch(
                         &state,
                         &serial,
@@ -510,11 +512,24 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                         Some(capacity.clone()),
                         Some(&lesson),
                     );
-                    state.log(LogLevel::Info, format!("[{serial}] 已满 {capacity}"));
+                    if was_open || !cfg.monitor_only {
+                        state.log(LogLevel::Info, format!("[{serial}] 已满 {capacity}"));
+                    }
+                    if cfg.monitor_only && was_open {
+                        crate::notify::dispatch_alert(
+                            "余量已满",
+                            format!("{serial} · {} · {capacity}", lesson.name),
+                            false,
+                            cfg.notify_enabled,
+                            cfg.sound_enabled,
+                        );
+                    }
+                    seat_open_prev.insert(serial.clone(), false);
                     continue;
                 }
 
                 if cfg.monitor_only {
+                    let was_open = seat_open_prev.get(&serial).copied().unwrap_or(false);
                     update_watch(
                         &state,
                         &serial,
@@ -523,17 +538,20 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                         Some(capacity.clone()),
                         Some(&lesson),
                     );
-                    state.log(
-                        LogLevel::Success,
-                        format!("[{serial}] 有余量 {capacity}（仅监控，不提交）"),
-                    );
-                    crate::notify::dispatch_alert(
-                        "发现余量",
-                        format!("{serial} · {} · {capacity}", lesson.name),
-                        true,
-                        cfg.notify_enabled,
-                        cfg.sound_enabled,
-                    );
+                    if !was_open {
+                        state.log(
+                            LogLevel::Success,
+                            format!("[{serial}] 有余量 {capacity}（仅监控，不提交）"),
+                        );
+                        crate::notify::dispatch_alert(
+                            "发现余量",
+                            format!("{serial} · {} · {capacity}", lesson.name),
+                            true,
+                            cfg.notify_enabled,
+                            cfg.sound_enabled,
+                        );
+                    }
+                    seat_open_prev.insert(serial.clone(), true);
                     continue;
                 }
 
@@ -550,7 +568,10 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     Some(&lesson),
                 );
 
-                match client.elect_lesson(&profile, &lesson.id).await {
+                match client
+                    .elect_lesson(&profile, &lesson.id, lesson.seat.selected())
+                    .await
+                {
                     Ok(ElectResult::Success { detail }) => {
                         consecutive_submission_errors = 0;
                         state.log(LogLevel::Success, format!("[{serial}] 成功：{detail}"));
@@ -724,6 +745,7 @@ pub fn keepalive(state: Arc<SharedState>, notify_enabled: bool, sound_enabled: b
 
 pub fn logout(state: &SharedState) {
     state.running.store(false, Ordering::Release);
+    state.stopping.store(false, Ordering::Release);
     state.run_generation.fetch_add(1, Ordering::AcqRel);
     state.logged_in.store(false, Ordering::Release);
     *state.client.lock() = None;
@@ -734,6 +756,9 @@ pub fn logout(state: &SharedState) {
 
 pub fn stop_grab(state: &SharedState) {
     if !state.running.load(Ordering::Acquire) {
+        return;
+    }
+    if state.stopping.swap(true, Ordering::AcqRel) {
         return;
     }
     // Invalidate the current run but leave `running` true until the worker guard drops.

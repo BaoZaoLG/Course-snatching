@@ -6,6 +6,18 @@ use reqwest::Url;
 use scraper::{Html, Selector};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
+use std::sync::LazyLock;
+
+static RE_SALT_PRIMARY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"CryptoJS\.SHA1\('([0-9a-fA-F-]{36})-'\s*\+\s*form\['password'\]\.value\)")
+        .expect("salt regex")
+});
+static RE_SALT_FALLBACK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"SHA1\('([0-9a-fA-F-]{36})-'").expect("salt fallback regex"));
+static RE_LESSON_COUNTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"['"]?(\d+)['"]?\s*:\s*\{\s*sc\s*:\s*(\d+)\s*,\s*lc\s*:\s*(\d+)"#)
+        .expect("counts regex")
+});
 
 pub(crate) fn classify_elect_response(text: &str) -> ElectResult {
     let summary = summarize_html(text);
@@ -91,13 +103,10 @@ pub(crate) fn normalize_base(raw: &str) -> Result<Url> {
 }
 
 pub(crate) fn extract_password_salt(html: &str) -> Option<String> {
-    let re =
-        Regex::new(r"CryptoJS\.SHA1\('([0-9a-fA-F-]{36})-'\s*\+\s*form\['password'\]\.value\)")
-            .ok()?;
-    re.captures(html).map(|c| c[1].to_string()).or_else(|| {
-        let re2 = Regex::new(r"SHA1\('([0-9a-fA-F-]{36})-'").ok()?;
-        re2.captures(html).map(|c| c[1].to_string())
-    })
+    RE_SALT_PRIMARY
+        .captures(html)
+        .map(|c| c[1].to_string())
+        .or_else(|| RE_SALT_FALLBACK.captures(html).map(|c| c[1].to_string()))
 }
 
 pub(crate) fn sha1_hex(s: &str) -> String {
@@ -602,9 +611,7 @@ pub(crate) fn js_like_to_json(input: &str) -> Result<String> {
 
 pub(crate) fn merge_lesson_counts(lessons: &mut [Lesson], counts_js: &str) -> usize {
     // window.lessonId2Counts={'371644':{sc:10,lc:50},...}
-    let re =
-        Regex::new(r#"[\'\"]?(\d+)[\'\"]?\s*:\s*\{\s*sc\s*:\s*(\d+)\s*,\s*lc\s*:\s*(\d+)"#).ok();
-    let Some(re) = re else { return 0 };
+    let re = &*RE_LESSON_COUNTS;
     let mut map = std::collections::HashMap::<String, (u32, u32)>::new();
     for c in re.captures_iter(counts_js) {
         let id = c[1].to_string();

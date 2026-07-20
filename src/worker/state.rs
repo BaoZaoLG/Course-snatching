@@ -77,6 +77,8 @@ pub struct WatchStatus {
 
 pub struct SharedState {
     pub running: AtomicBool,
+    /// True after stop requested until the worker guard drops.
+    pub stopping: AtomicBool,
     pub logging_in: AtomicBool,
     pub refreshing: AtomicBool,
     pub logged_in: AtomicBool,
@@ -96,6 +98,7 @@ impl SharedState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             running: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             logging_in: AtomicBool::new(false),
             refreshing: AtomicBool::new(false),
             logged_in: AtomicBool::new(false),
@@ -133,6 +136,7 @@ impl SharedState {
     pub fn clear_session(&self, message: &str) {
         self.logged_in.store(false, Ordering::Release);
         self.running.store(false, Ordering::Release);
+        self.stopping.store(false, Ordering::Release);
         self.run_generation.fetch_add(1, Ordering::AcqRel);
         *self.client.lock() = None;
         self.lessons.lock().clear();
@@ -152,6 +156,7 @@ impl SharedState {
         if self.running.swap(true, Ordering::AcqRel) {
             return None;
         }
+        self.stopping.store(false, Ordering::Release);
         let generation = self.run_generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.run_owner.store(generation, Ordering::Release);
         Some(generation)
@@ -160,6 +165,14 @@ impl SharedState {
     pub(crate) fn release_run_if_owner(&self, generation: u64) {
         if self.run_owner.load(Ordering::Acquire) == generation {
             self.running.store(false, Ordering::Release);
+            self.stopping.store(false, Ordering::Release);
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_busy(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+            || self.logging_in.load(Ordering::Acquire)
+            || self.refreshing.load(Ordering::Acquire)
     }
 }

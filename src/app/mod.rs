@@ -126,6 +126,10 @@ impl eframe::App for CourseApp {
             .state
             .running
             .load(std::sync::atomic::Ordering::Acquire);
+        let stopping = self
+            .state
+            .stopping
+            .load(std::sync::atomic::Ordering::Acquire);
         let logging_in = self
             .state
             .logging_in
@@ -194,6 +198,7 @@ impl eframe::App for CourseApp {
             root_ui,
             logged,
             running,
+            stopping,
             logging_in,
             refreshing,
             lesson_count,
@@ -229,6 +234,7 @@ impl CourseApp {
         root_ui: &mut egui::Ui,
         logged: bool,
         running: bool,
+        stopping: bool,
         logging_in: bool,
         refreshing: bool,
         lesson_count: usize,
@@ -252,7 +258,9 @@ impl CourseApp {
                     ui.set_height(32.0);
                     ui.spacing_mut().item_spacing.x = 8.0;
 
-                    let (label, color) = if running {
+                    let (label, color) = if stopping {
+                        ("正在停止", AMBER)
+                    } else if running {
                         ("抢课中", GREEN)
                     } else if logging_in {
                         ("登录中", AMBER)
@@ -409,7 +417,7 @@ impl CourseApp {
                     }
 
                     if ui
-                        .add_enabled(running, soft_danger_button("停止", 68.0))
+                        .add_enabled(running && !stopping, soft_danger_button("停止", 68.0))
                         .clicked()
                     {
                         worker::stop_grab(&self.state);
@@ -1522,12 +1530,29 @@ impl CourseApp {
                 .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(root_ui.ctx(), |ui| {
                     ui.set_min_width(420.0);
-                    ui.label(RichText::new(summary).size(META_SIZE).color(TEXT));
+                    ui.label(RichText::new(&summary).size(META_SIZE).color(TEXT));
                     ui.add_space(12.0);
-                    if ui.add(primary_button("知道了", BLUE, 100.0)).clicked() {
-                        self.result_summary = None;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.add(primary_button("知道了", BLUE, 100.0)).clicked() {
+                            self.result_summary = None;
+                        }
+                        if ui.add(quiet_button("导出摘要", 100.0)).clicked() {
+                            self.export_result_summary(&summary);
+                        }
+                    });
                 });
+        }
+    }
+
+    fn export_result_summary(&mut self, summary: &str) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name("course-monitor-result.txt")
+            .save_file()
+        {
+            match std::fs::write(&path, summary) {
+                Ok(()) => self.status_line = format!("结果摘要已导出：{}", path.display()),
+                Err(error) => self.status_line = format!("导出失败：{error}"),
+            }
         }
     }
 

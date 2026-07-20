@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Quality gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets
+      - name: Package
+        shell: pwsh
+        run: |
+          $env:COURSE_MONITOR_SKIP_TESTS = "1"
+          .\scripts\package.ps1
+          $zip = Get-ChildItem dist\*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $zip) { throw "no zip produced" }
+          "ZIP_PATH=$($zip.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ZIP_NAME=$($zip.Name)" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
