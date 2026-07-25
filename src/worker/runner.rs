@@ -667,7 +667,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                 break;
             }
             // First round after start/schedule: no artificial wait before we already polled.
-            // Between rounds: burst mode skips positive jitter and can be sub-100ms.
+            // Between rounds: burst mode uses the configured interval without jitter.
             let in_burst = burst_secs > 0 && tokio::time::Instant::now() < burst_deadline;
             let delay = if first_round {
                 first_round = false;
@@ -949,19 +949,10 @@ fn mark_pending_stopped(state: &SharedState, pending: &HashSet<String>) {
     state.touch();
 }
 
-fn poll_delay(interval_seconds: f64) -> Duration {
-    poll_delay_for_mode(interval_seconds, false)
-}
-
-/// `burst`: no positive jitter, lower floor — used in open-course sprint window.
+/// `burst`: use the base interval without jitter during the open-course sprint window.
 fn poll_delay_for_mode(interval_seconds: f64, burst: bool) -> Duration {
-    let base = if burst {
-        interval_seconds.clamp(0.05, 30.0)
-    } else {
-        interval_seconds.clamp(0.05, 30.0)
-    };
+    let base = interval_seconds.clamp(0.05, 30.0);
     if burst {
-        // Tiny negative bias only (never slower than base).
         return Duration::from_secs_f64(base);
     }
     let nanos = SystemTime::now()
@@ -1008,7 +999,7 @@ mod tests {
     use crate::config::AppConfig;
     use crate::eams::EamsClient;
     use crate::worker::time::{civil_from_days, now_hms};
-    use crate::worker::{local_now_seconds, now_parts, now_stamp, now_ymd, SharedState};
+    use crate::worker::{local_now_seconds, now_parts, now_stamp, SharedState};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1016,11 +1007,11 @@ mod tests {
     #[test]
     fn poll_delay_is_bounded() {
         for _ in 0..100 {
-            let delay = poll_delay(1.5).as_secs_f64();
+            let delay = poll_delay_for_mode(1.5, false).as_secs_f64();
             assert!((1.35..=1.65).contains(&delay));
         }
         for _ in 0..100 {
-            let delay = poll_delay(0.1).as_secs_f64();
+            let delay = poll_delay_for_mode(0.1, false).as_secs_f64();
             assert!((0.05..=0.12).contains(&delay), "got {delay}");
         }
         for _ in 0..20 {
@@ -1036,7 +1027,6 @@ mod tests {
     }
     #[test]
     fn now_helpers_are_well_formed() {
-        assert_eq!(now_ymd().len(), 10);
         assert_eq!(now_stamp().len(), 19);
         assert_eq!(now_hms().len(), 8);
         let parts = now_parts();

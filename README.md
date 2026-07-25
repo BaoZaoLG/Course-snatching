@@ -70,7 +70,8 @@ target\release\Course-snatching.exe
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
-.\scripts\audit.ps1
+cargo build --release
+.\scripts\quality-gate.ps1
 ```
 
 本地打包（默认先跑测试，生成 SHA256 / BUILD_INFO / SBOM）：
@@ -79,10 +80,10 @@ cargo test --all-targets
 .\scripts\package.ps1
 ```
 
-跳过测试：
+已在同一工作区通过完整质量门禁后，可避免打包时重复执行：
 
 ```powershell
-$env:COURSE_SNATCHING_SKIP_TESTS = "1"
+$env:COURSE_SNATCHING_SKIP_QUALITY_GATE = "1"
 .\scripts\package.ps1
 ```
 
@@ -93,8 +94,9 @@ $env:COURSE_SNATCHING_SKIP_TESTS = "1"
 推送版本 tag 触发 GitHub Actions 构建并创建 Release：
 
 ```powershell
-git tag v0.10.1
-git push origin v0.10.1
+.\scripts\release-preflight.ps1 -Tag v0.10.2
+git tag v0.10.2
+git push origin v0.10.2
 ```
 
 ## 目录结构

@@ -10,4 +10,4 @@ pub use runner::{
 };
 #[allow(unused_imports)]
 pub use state::{LogItem, LogLevel, SharedState, WatchState, WatchStatus};
-pub use time::{local_now_seconds, now_parts, now_stamp, now_ymd};
+pub use time::{local_now_seconds, now_parts, now_stamp};

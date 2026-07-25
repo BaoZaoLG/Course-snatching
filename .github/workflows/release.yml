@@ -17,15 +17,18 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Release preflight
+        shell: pwsh
+        run: .\scripts\release-preflight.ps1 -Tag "${{ github.ref_name }}"
+      - name: Install security audit tool
+        run: cargo install cargo-audit --locked
       - name: Quality gate
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --all-targets --all-features -- -D warnings
-          cargo test --all-targets
+        shell: pwsh
+        run: .\scripts\quality-gate.ps1
       - name: Package
         shell: pwsh
         run: |
-          $env:COURSE_SNATCHING_SKIP_TESTS = "1"
+          $env:COURSE_SNATCHING_SKIP_QUALITY_GATE = "1"
           .\scripts\package.ps1
           $zip = Get-ChildItem dist\*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $zip) { throw "no zip produced" }

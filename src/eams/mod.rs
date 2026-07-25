@@ -812,8 +812,11 @@ mod tests {
     }
 
     #[test]
-    fn sha1_password_matches_concatenated_form() {
-        assert_eq!(sha1_password("salt", "secret"), sha1_hex("salt-secret"));
+    fn sha1_password_matches_known_digest() {
+        assert_eq!(
+            sha1_password("salt", "secret"),
+            "5c9244fbb9b4dbe89423d65bff3e8218b813ec40"
+        );
     }
 
     #[test]
@@ -875,7 +878,6 @@ mod tests {
         assert!(SeatInfo::from_counts(Some(1), Some(2)).has_seat());
         assert!(SeatInfo::from_counts(Some(2), Some(2)).is_full());
         assert_eq!(SeatInfo::from_counts(Some(1), Some(2)).selected(), Some(1));
-        assert_eq!(SeatInfo::from_counts(Some(1), Some(2)).limit(), Some(2));
         assert_eq!(SeatInfo::Unknown.selected(), None);
     }
 

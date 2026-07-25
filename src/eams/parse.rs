@@ -109,12 +109,6 @@ pub(crate) fn extract_password_salt(html: &str) -> Option<String> {
         .or_else(|| RE_SALT_FALLBACK.captures(html).map(|c| c[1].to_string()))
 }
 
-pub(crate) fn sha1_hex(s: &str) -> String {
-    let mut h = Sha1::new();
-    h.update(s.as_bytes());
-    hex::encode(h.finalize())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VerifyOutcome {
     Confirmed,

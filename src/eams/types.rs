@@ -96,13 +96,6 @@ impl SeatInfo {
             Self::Unknown => None,
         }
     }
-
-    pub fn limit(self) -> Option<u32> {
-        match self {
-            Self::Known { limit, .. } => Some(limit),
-            Self::Unknown => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

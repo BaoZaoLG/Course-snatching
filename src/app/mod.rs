@@ -291,8 +291,18 @@ impl CourseApp {
 
                     // Left: brand + live state
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.label(RichText::new("Course-snatching").size(20.0).strong().color(TEXT));
-                        ui.label(RichText::new("选课助手").size(META_SIZE).strong().color(BLUE));
+                        ui.label(
+                            RichText::new("Course-snatching")
+                                .size(20.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            RichText::new("选课助手")
+                                .size(META_SIZE)
+                                .strong()
+                                .color(BLUE),
+                        );
                         ui.add_space(6.0);
                         status_dot(ui, color, running);
                         ui.label(RichText::new(label).size(META_SIZE).color(color));

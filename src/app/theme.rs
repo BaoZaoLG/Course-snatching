@@ -41,9 +41,7 @@ pub(crate) fn custom_host_requiring_confirmation(raw: &str) -> Option<String> {
     let Ok(parsed) = Url::parse(raw.trim()) else {
         return None;
     };
-    let Some(host_raw) = parsed.host_str() else {
-        return None;
-    };
+    let host_raw = parsed.host_str()?;
     let host = host_raw.to_ascii_lowercase();
     if host == "localhost" || host == "127.0.0.1" || host == "::1" {
         None

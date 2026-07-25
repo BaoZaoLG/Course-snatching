@@ -12,7 +12,8 @@ $distRoot = Join-Path $root "dist"
 $outDir = Join-Path $distRoot "Course-snatching-v$version-windows-x64-$stamp"
 $zipPath = "$outDir.zip"
 
-$skipTests = $env:COURSE_SNATCHING_SKIP_TESTS -eq "1"
+$skipQualityGate = $env:COURSE_SNATCHING_SKIP_QUALITY_GATE -eq "1"
+$completed = $false
 
 New-Item -ItemType Directory -Force $distRoot | Out-Null
 if ((Test-Path -LiteralPath $outDir) -or (Test-Path -LiteralPath $zipPath)) {
@@ -29,15 +30,10 @@ foreach ($name in @("Course-snatching.exe", "Course-snatching-new.exe")) {
 
 Push-Location $root
 try {
-    if (-not $skipTests) {
-        Write-Output "运行测试..."
-        cargo test
-        if ($LASTEXITCODE -ne 0) { throw "测试失败" }
+    if (-not $skipQualityGate) {
+        & (Join-Path $PSScriptRoot "quality-gate.ps1")
+        if ($LASTEXITCODE -ne 0) { throw "完整质量门禁失败" }
     }
-
-    Write-Output "Release 构建..."
-    cargo build --release
-    if ($LASTEXITCODE -ne 0) { throw "Release 构建失败" }
 
     New-Item -ItemType Directory $outDir | Out-Null
     New-Item -ItemType Directory (Join-Path $outDir "runtime\debug") -Force | Out-Null
@@ -97,9 +93,18 @@ git=$git
     Compress-Archive -LiteralPath $outDir -DestinationPath $zipPath -CompressionLevel Optimal
     $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -LiteralPath "$zipPath.sha256" -Value "$zipHash  $(Split-Path $zipPath -Leaf)" -Encoding ASCII
+    $completed = $true
     Write-Output "发布包已生成：$zipPath"
     Write-Output "SHA256: $zipHash"
 }
 finally {
     Pop-Location
+    if (-not $completed) {
+        foreach ($partial in @($outDir, $zipPath, "$zipPath.sha256")) {
+            if (Test-Path -LiteralPath $partial) {
+                Remove-Item -LiteralPath $partial -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Write-Output "已清理未完成的发布输出：$outDir"
+    }
 }

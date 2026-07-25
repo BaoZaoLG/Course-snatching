@@ -2,10 +2,15 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
+
+static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static CONFIG_SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -97,7 +102,9 @@ impl AppConfig {
     /// 用户配置放在 roaming AppData，避免安装目录无写权限，也避免和发布文件混在一起。
     pub fn path() -> PathBuf {
         if let Some(dir) = std::env::var_os("APPDATA") {
-            return PathBuf::from(dir).join("Course-snatching").join("config.toml");
+            return PathBuf::from(dir)
+                .join("Course-snatching")
+                .join("config.toml");
         }
         Self::legacy_path()
     }
@@ -179,6 +186,9 @@ impl AppConfig {
     }
 
     fn save_to(&self, path: &Path) -> Result<()> {
+        let _save_guard = CONFIG_SAVE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("创建配置目录失败：{}", parent.display()))?;
@@ -186,28 +196,24 @@ impl AppConfig {
         let mut normalized = self.clone();
         normalized.normalize();
         let body = toml::to_string_pretty(&normalized).context("序列化配置失败")?;
-        let tmp_path = path.with_extension("toml.tmp");
-        let backup_path = path.with_extension("toml.bak");
-        {
-            let mut file = fs::File::create(&tmp_path)
+        let tmp_path = next_config_temp_path(path);
+        let write_result = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
                 .with_context(|| format!("写入临时配置失败：{}", tmp_path.display()))?;
             file.write_all(body.as_bytes())
                 .with_context(|| format!("写入临时配置失败：{}", tmp_path.display()))?;
             file.sync_all()
                 .with_context(|| format!("同步临时配置失败：{}", tmp_path.display()))?;
-        }
-        if path.is_file() {
-            let _ = fs::copy(path, &backup_path);
-        }
-        if let Err(error) = fs::rename(&tmp_path, path) {
+            Ok(())
+        })();
+        if let Err(error) = write_result {
             let _ = fs::remove_file(&tmp_path);
-            if backup_path.is_file() {
-                let _ = fs::copy(&backup_path, path);
-            }
-            return Err(error).with_context(|| format!("替换配置失败：{}", path.display()));
+            return Err(error);
         }
-        let _ = fs::remove_file(backup_path);
-        Ok(())
+        atomic_replace(&tmp_path, path)
     }
 
     pub fn normalize(&mut self) {
@@ -526,9 +532,116 @@ fn invalid_backup_path(path: &Path) -> PathBuf {
     path.with_extension(format!("invalid-{timestamp}.toml"))
 }
 
+fn next_config_temp_path(destination: &Path) -> PathBuf {
+    let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let name = destination
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("config.toml"))
+        .to_string_lossy();
+    destination.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), sequence))
+}
+
+fn atomic_replace(temp: &Path, destination: &Path) -> Result<()> {
+    atomic_replace_with(temp, destination, platform_atomic_replace)
+}
+
+fn atomic_replace_with<F>(temp: &Path, destination: &Path, replace: F) -> Result<()>
+where
+    F: FnOnce(&Path, &Path, &Path) -> io::Result<()>,
+{
+    let backup = temp.with_extension("bak");
+    match replace(temp, destination, &backup) {
+        Ok(()) => {
+            if backup.is_file() {
+                fs::remove_file(&backup)
+                    .with_context(|| format!("配置已替换，但删除备份失败：{}", backup.display()))?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let restore_note = if backup.is_file() {
+                match fs::copy(&backup, destination) {
+                    Ok(_) => String::new(),
+                    Err(restore_error) => format!("；从备份恢复原配置失败：{restore_error}"),
+                }
+            } else {
+                String::new()
+            };
+            let cleanup_note = match fs::remove_file(temp) {
+                Ok(()) => String::new(),
+                Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {
+                    String::new()
+                }
+                Err(cleanup_error) => format!("；临时文件清理失败：{cleanup_error}"),
+            };
+            anyhow::bail!(
+                "替换配置失败：{}；备份路径：{}；系统错误：{}{}{}",
+                destination.display(),
+                backup.display(),
+                error,
+                restore_note,
+                cleanup_note
+            )
+        }
+    }
+}
+
+#[cfg(windows)]
+fn platform_atomic_replace(temp: &Path, destination: &Path, backup: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACEFILE_WRITE_THROUGH,
+    };
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    let temp = wide(temp);
+    let destination_wide = wide(destination);
+    let backup = wide(backup);
+    // SAFETY: all pointers reference live, NUL-terminated UTF-16 buffers for the call duration.
+    let replaced = unsafe {
+        if destination.is_file() {
+            ReplaceFileW(
+                destination_wide.as_ptr(),
+                temp.as_ptr(),
+                backup.as_ptr(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        } else {
+            MoveFileExW(
+                temp.as_ptr(),
+                destination_wide.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn platform_atomic_replace(temp: &Path, destination: &Path, _backup: &Path) -> io::Result<()> {
+    fs::rename(temp, destination)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "Course-snatching-config-test-{}-{}-{label}",
+            std::process::id(),
+            CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn cleaned_watch_trims_and_deduplicates() {
@@ -616,13 +729,101 @@ mod tests {
 
     #[test]
     fn save_never_serializes_a_password_field() {
-        let dir =
-            std::env::temp_dir().join(format!("Course-snatching-config-test-{}", std::process::id()));
+        let dir = config_test_dir("password");
         let path = dir.join("config.toml");
         let cfg = AppConfig::default();
         cfg.save_to(&path).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("password"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn first_save_creates_a_readable_config() {
+        let dir = config_test_dir("first-save");
+        let path = dir.join("config.toml");
+        let cfg = AppConfig {
+            username: "student01".into(),
+            ..Default::default()
+        };
+
+        cfg.save_to(&path).unwrap();
+
+        assert_eq!(AppConfig::read_from(&path).unwrap().username, "student01");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn repeated_overwrites_keep_the_latest_config_without_residue() {
+        let dir = config_test_dir("overwrite");
+        let path = dir.join("config.toml");
+        for index in 0..20 {
+            let cfg = AppConfig {
+                username: format!("student-{index}"),
+                ..Default::default()
+            };
+            cfg.save_to(&path).unwrap();
+        }
+
+        assert_eq!(AppConfig::read_from(&path).unwrap().username, "student-19");
+        let residue = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path() != path)
+            .collect::<Vec<_>>();
+        assert!(residue.is_empty(), "unexpected save residue: {residue:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replacement_failure_preserves_original_and_removes_temp() {
+        let dir = config_test_dir("failure");
+        fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("config.toml");
+        let temp = next_config_temp_path(&destination);
+        fs::write(&destination, "original").unwrap();
+        fs::write(&temp, "replacement").unwrap();
+
+        let error = atomic_replace_with(&temp, &destination, |_, destination, backup| {
+            fs::rename(destination, backup).unwrap();
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected replacement failure",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "original");
+        assert!(!temp.exists());
+        assert_eq!(
+            fs::read_to_string(temp.with_extension("bak")).unwrap(),
+            "original"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("备份路径"));
+        assert!(message.contains("injected replacement failure"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_temp_names_are_unique_and_stay_beside_destination() {
+        let destination = config_test_dir("names").join("config.toml");
+        let names = (0..32)
+            .map(|_| {
+                let destination = destination.clone();
+                std::thread::spawn(move || next_config_temp_path(&destination))
+            })
+            .map(|thread| thread.join().unwrap())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(names.len(), 32);
+        assert!(names
+            .iter()
+            .all(|path| path.parent() == destination.parent()));
+        assert!(names.iter().all(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(&std::process::id().to_string()))
+        }));
     }
 }

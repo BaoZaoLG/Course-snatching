@@ -1,6 +1,6 @@
 [package]
 name = "course-snatching"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 rust-version = "1.97.1"
 description = "教务选课监控桌面工具：程序内登录、余量监控与选课提交"
@@ -51,6 +51,7 @@ raw-window-handle = "0.6"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_UI_WindowsAndMessaging",
 ] }
