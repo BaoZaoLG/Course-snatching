@@ -1,5 +1,5 @@
 use super::time::now_hms;
-use crate::eams::{EamsClient, Lesson};
+use crate::eams::{EamsClient, Lesson, NetworkSnapshot};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -144,6 +144,15 @@ impl SharedState {
         *self.client.lock() = None;
         self.lessons.lock().clear();
         self.set_message(message);
+    }
+
+    /// Returns the current in-memory network health for the active session.
+    ///
+    /// Network metrics are intentionally not persisted: they contain only aggregate
+    /// request behaviour for this run and reset when the user logs out.
+    pub fn network_snapshot(&self) -> NetworkSnapshot {
+        let client = self.client.lock().clone();
+        client.map_or_else(NetworkSnapshot::default, |client| client.network_snapshot())
     }
 
     pub(crate) fn touch(&self) {

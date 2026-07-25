@@ -1,11 +1,13 @@
 //! 教务系统客户端：登录、课程拉取、选课提交。
 
+mod governor;
 mod parse;
 mod types;
 
+use governor::{RequestGovernor, RequestPriority};
 pub use types::{
-    is_auth_error, is_rate_limit_error, rate_limit_retry_after, EamsError, ElectResult, Lesson,
-    SeatInfo,
+    backend_error_kind, is_auth_error, is_rate_limit_error, rate_limit_retry_after,
+    BackendErrorKind, CircuitStatus, EamsError, ElectResult, Lesson, NetworkSnapshot, SeatInfo,
 };
 
 use crate::eams::parse::{
@@ -36,11 +38,18 @@ struct ProfileContext {
     semester_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ResponseHandling {
+    Standard { allow_login_page: bool },
+    LoginSubmission,
+}
+
 pub struct EamsClient {
     http: Client,
     base: Url,
     debug_dump_enabled: bool,
     profile_context: Mutex<HashMap<String, ProfileContext>>,
+    governor: std::sync::Arc<RequestGovernor>,
 }
 
 impl EamsClient {
@@ -69,6 +78,7 @@ impl EamsClient {
             base,
             debug_dump_enabled,
             profile_context: Mutex::new(HashMap::new()),
+            governor: RequestGovernor::new(),
         })
     }
 
@@ -78,53 +88,160 @@ impl EamsClient {
         action: &str,
         allow_login_page: bool,
     ) -> Result<(Url, String)> {
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("{action}失败"))?;
-        let status = response.status();
-        let final_url = response.url().clone();
-        let retry_after_secs = parse_retry_after_secs(response.headers());
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-        {
-            return Err(EamsError::ResponseTooLarge(MAX_RESPONSE_BYTES / 1024 / 1024).into());
-        }
-        let bytes = read_body_limited(response, MAX_RESPONSE_BYTES)
-            .await
-            .with_context(|| format!("读取{action}响应失败"))?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        if looks_like_login_page(&final_url, &text) && !allow_login_page {
-            return Err(EamsError::AuthExpired.into());
-        }
-        let code = status.as_u16();
-        if code == 429 || (code == 503 && retry_after_secs.is_some()) {
-            let summary = summarize_html(&text);
-            return Err(EamsError::RateLimited {
-                message: if summary.is_empty() {
-                    format!("HTTP {code}")
+        self.send_raw_text_with_priority(
+            request,
+            action,
+            ResponseHandling::Standard { allow_login_page },
+            RequestPriority::Session,
+        )
+        .await
+    }
+
+    async fn send_raw_text_with_priority(
+        &self,
+        request: RequestBuilder,
+        action: &str,
+        response_handling: ResponseHandling,
+        priority: RequestPriority,
+    ) -> Result<(Url, String)> {
+        let permit = self.governor.acquire(priority).await;
+        let result = async {
+            let response = request.send().await.map_err(|error| EamsError::Network {
+                kind: if error.is_timeout() {
+                    BackendErrorKind::Timeout
                 } else {
-                    summary
+                    BackendErrorKind::Transport
                 },
-                retry_after_secs,
+                message: format!("{action}失败"),
+            })?;
+            let status = response.status();
+            let final_url = response.url().clone();
+            let retry_after_secs = parse_retry_after_secs(response.headers());
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+            {
+                return Err(EamsError::ResponseTooLarge(MAX_RESPONSE_BYTES / 1024 / 1024).into());
             }
-            .into());
-        }
-        if !status.is_success() {
-            return Err(EamsError::HttpStatus {
-                status: code,
-                summary: summarize_html(&text),
+            let bytes = read_body_limited(response, MAX_RESPONSE_BYTES)
+                .await
+                .map_err(|error| {
+                    // `Response::chunk` can fail after headers have arrived.  Keep
+                    // that failure in the same typed path as send-time failures so
+                    // the governor can apply its network backoff consistently.
+                    if backend_error_kind(&error) != BackendErrorKind::Unknown {
+                        error.context(format!("读取{action}响应失败"))
+                    } else {
+                        let kind = error
+                            .chain()
+                            .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+                            .map_or(BackendErrorKind::Transport, |cause| {
+                                if cause.is_timeout() {
+                                    BackendErrorKind::Timeout
+                                } else {
+                                    BackendErrorKind::Transport
+                                }
+                            });
+                        anyhow::Error::new(EamsError::Network {
+                            kind,
+                            message: format!("读取{action}响应失败"),
+                        })
+                    }
+                })?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let code = status.as_u16();
+            if code == 429 || (code == 503 && retry_after_secs.is_some()) {
+                let summary = summarize_html(&text);
+                return Err(EamsError::RateLimited {
+                    message: if summary.is_empty() {
+                        format!("HTTP {code}")
+                    } else {
+                        summary
+                    },
+                    retry_after_secs,
+                }
+                .into());
             }
-            .into());
+            if !status.is_success() {
+                return Err(EamsError::HttpStatus {
+                    status: code,
+                    summary: summarize_html(&text),
+                }
+                .into());
+            }
+            let is_login_page = looks_like_login_page(&final_url, &text);
+            match response_handling {
+                ResponseHandling::LoginSubmission if is_login_page => {
+                    let reason = extract_login_error(&text)
+                        .unwrap_or_else(|| "账号或密码错误，或需要验证码".into());
+                    if ["过快", "太快", "频繁"]
+                        .iter()
+                        .any(|marker| reason.contains(marker))
+                    {
+                        return Err(EamsError::RateLimited {
+                            message: reason,
+                            retry_after_secs,
+                        }
+                        .into());
+                    }
+                    return Err(EamsError::Business { message: reason }.into());
+                }
+                ResponseHandling::Standard {
+                    allow_login_page: false,
+                } if is_login_page => return Err(EamsError::AuthExpired.into()),
+                _ => {}
+            }
+            Ok((final_url, text))
         }
-        Ok((final_url, text))
+        .await;
+
+        match &result {
+            Ok(_) => self.governor.record_success(&permit),
+            Err(error) => {
+                let _ = self.governor.record_failure(
+                    &permit,
+                    backend_error_kind(error),
+                    rate_limit_retry_after(error),
+                );
+            }
+        }
+        result
     }
 
     async fn send_text(&self, request: RequestBuilder, action: &str) -> Result<String> {
         self.send_raw_text(request, action, false)
             .await
             .map(|(_, text)| text)
+    }
+
+    async fn send_text_with_priority(
+        &self,
+        request: RequestBuilder,
+        action: &str,
+        priority: RequestPriority,
+    ) -> Result<String> {
+        self.send_raw_text_with_priority(
+            request,
+            action,
+            ResponseHandling::Standard {
+                allow_login_page: false,
+            },
+            priority,
+        )
+        .await
+        .map(|(_, text)| text)
+    }
+
+    pub fn network_snapshot(&self) -> NetworkSnapshot {
+        self.governor.snapshot()
+    }
+
+    pub fn set_burst_mode(&self, enabled: bool) {
+        self.governor.set_burst_mode(enabled);
+    }
+
+    pub fn circuit_is_open(&self) -> bool {
+        self.governor.circuit_is_open()
     }
 
     pub fn matches_base_url(&self, raw: &str) -> bool {
@@ -156,11 +273,16 @@ impl EamsClient {
             match self.login_once(username, password).await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    let rate_limited = is_rate_limit_error(&error)
-                        || ["过快", "太快", "频繁", "稍后"]
-                            .iter()
-                            .any(|marker| error.to_string().contains(marker));
+                    let kind = backend_error_kind(&error);
+                    let rate_limited = kind == BackendErrorKind::RateLimited
+                        || (kind == BackendErrorKind::Unknown
+                            && ["过快", "太快", "频繁", "稍后"]
+                                .iter()
+                                .any(|marker| error.to_string().contains(marker)));
                     if !rate_limited {
+                        return Err(error);
+                    }
+                    if self.circuit_is_open() {
                         return Err(error);
                     }
                     last_error = Some(error);
@@ -187,8 +309,9 @@ impl EamsClient {
                 true,
             )
             .await?;
-        let salt = extract_password_salt(&login_html)
-            .ok_or_else(|| anyhow!("无法从登录页解析密码 salt，页面可能已改版"))?;
+        let salt = extract_password_salt(&login_html).ok_or_else(|| EamsError::Parse {
+            message: "无法从登录页解析密码 salt，页面可能已改版".into(),
+        })?;
 
         // 模拟人工：打开页面后稍等再提交，避免被当成连点
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -203,39 +326,25 @@ impl EamsClient {
         ];
 
         // 2) 提交登录
-        let (final_url, body) = self
-            .send_raw_text(
-                self.http
-                    .post(login_url.clone())
-                    .header(REFERER, login_url.as_str())
-                    .header(
-                        CONTENT_TYPE,
-                        "application/x-www-form-urlencoded; charset=UTF-8",
-                    )
-                    .form(&form),
-                "提交登录",
-                true,
-            )
-            .await?;
-
-        if looks_like_login_page(&final_url, &body) {
-            let reason =
-                extract_login_error(&body).unwrap_or_else(|| "账号或密码错误，或需要验证码".into());
-            // 统一文案，方便上层识别限流
-            if reason.contains("过快") || reason.contains("太快") || reason.contains("频繁") {
-                return Err(EamsError::RateLimited {
-                    message: reason,
-                    retry_after_secs: None,
-                }
-                .into());
-            }
-            bail!("{reason}");
-        }
+        self.send_raw_text_with_priority(
+            self.http
+                .post(login_url.clone())
+                .header(REFERER, login_url.as_str())
+                .header(
+                    CONTENT_TYPE,
+                    "application/x-www-form-urlencoded; charset=UTF-8",
+                )
+                .form(&form),
+            "提交登录",
+            ResponseHandling::LoginSubmission,
+            RequestPriority::Session,
+        )
+        .await?;
 
         // 再访问一次首页确认会话
-        if self.ensure_logged_in().await.is_err() {
-            bail!("登录后会话无效，请重试");
-        }
+        self.ensure_logged_in()
+            .await
+            .context("登录后会话无效，请重试")?;
         Ok(())
     }
 
@@ -268,7 +377,10 @@ impl EamsClient {
         let mut successful_requests = 0usize;
         let mut last_error: Option<anyhow::Error> = None;
         for path in paths {
-            match self.get_text(path).await {
+            match self
+                .get_text_with_priority(path, RequestPriority::Session)
+                .await
+            {
                 Ok(text) => {
                     successful_requests += 1;
                     debug_blob.push_str(&format!("\n===== {path} len={} =====\n", text.len()));
@@ -326,12 +438,17 @@ impl EamsClient {
         Ok(out)
     }
 
-    /// 进入指定选课轮次（模拟页面“进入选课>>>”）
-    /// 会尝试多种常见 Beangen EAMS 入口，返回最像真实选课页的响应。
-    pub async fn enter_elect_profile(&self, profile_id: &str) -> Result<String> {
+    /// 进入指定选课轮次（模拟页面“进入选课>>>”），继承调用方优先级。
+    async fn enter_elect_profile_with_priority(
+        &self,
+        profile_id: &str,
+        priority: RequestPriority,
+    ) -> Result<String> {
         let pid = validate_numeric_id(profile_id, "profileId", true)?;
         if pid == "0" {
-            return self.get_text("stdElectCourse!defaultPage.action").await;
+            return self
+                .get_text_with_priority("stdElectCourse!defaultPage.action", priority)
+                .await;
         }
 
         let default_url = self.url("stdElectCourse!defaultPage.action")?;
@@ -344,7 +461,10 @@ impl EamsClient {
         ] {
             let mut url = default_url.clone();
             url.query_pairs_mut().append_pair(query_name, pid);
-            match self.send_text(self.http.get(url), "进入选课轮次").await {
+            match self
+                .send_text_with_priority(self.http.get(url), "进入选课轮次", priority)
+                .await
+            {
                 Ok(text) => {
                     if score_elect_page(&text) >= 200 {
                         return Ok(text);
@@ -357,7 +477,10 @@ impl EamsClient {
         }
 
         let referer = self.url("stdElectCourse.action")?;
-        match self.get_text("stdElectCourse.action").await {
+        match self
+            .get_text_with_priority("stdElectCourse.action", priority)
+            .await
+        {
             Ok(_) => {}
             Err(error) if is_auth_error(&error) => return Err(error),
             Err(error) => last_error = Some(error),
@@ -376,12 +499,13 @@ impl EamsClient {
         ];
         for (label, form) in forms {
             match self
-                .send_text(
+                .send_text_with_priority(
                     self.http
                         .post(default_url.clone())
                         .header(REFERER, referer.as_str())
                         .form(&form),
                     "进入选课轮次",
+                    priority,
                 )
                 .await
             {
@@ -418,6 +542,39 @@ impl EamsClient {
     /// 2) GET stdElectCourse!data.action?profileId=...  -> var lessonJSONs = [...]
     /// 3) GET stdElectCourse!queryStdCount.action?profileId=...&projectId=...&semesterId=...
     pub async fn fetch_lessons(&self, profile_id: &str) -> Result<Vec<Lesson>> {
+        self.fetch_lessons_for_monitoring(profile_id)
+            .await
+            .map(|(lessons, _complete)| lessons)
+    }
+
+    pub(crate) async fn fetch_lessons_for_monitoring(
+        &self,
+        profile_id: &str,
+    ) -> Result<(Vec<Lesson>, bool)> {
+        let _refresh_guard = self.governor.enter_refresh().await;
+        self.fetch_lessons_under_refresh_gate(profile_id, RequestPriority::Refresh)
+            .await
+    }
+
+    /// Background keepalive is skipped while a full refresh is active, so it
+    /// never waits in the full-refresh FIFO ahead of foreground work.
+    pub async fn fetch_lessons_for_keepalive(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<Vec<Lesson>>> {
+        let Some(_refresh_guard) = self.governor.try_enter_refresh() else {
+            return Ok(None);
+        };
+        self.fetch_lessons_under_refresh_gate(profile_id, RequestPriority::KeepAlive)
+            .await
+            .map(|(lessons, _complete)| Some(lessons))
+    }
+
+    async fn fetch_lessons_under_refresh_gate(
+        &self,
+        profile_id: &str,
+        priority: RequestPriority,
+    ) -> Result<(Vec<Lesson>, bool)> {
         let pid = validate_numeric_id(profile_id, "profileId", true)?;
 
         // 每个登录会话只需建立一次轮次上下文，后续轮询直接请求数据接口。
@@ -425,7 +582,7 @@ impl EamsClient {
         let (project_id, semester_id, entered) = if let Some(context) = cached_context {
             (context.project_id, context.semester_id, String::new())
         } else {
-            let entered = match self.enter_elect_profile(pid).await {
+            let entered = match self.enter_elect_profile_with_priority(pid, priority).await {
                 Ok(text) => text,
                 Err(error) if is_auth_error(&error) => return Err(error),
                 Err(_) => String::new(),
@@ -445,11 +602,11 @@ impl EamsClient {
 
         // 核心：课程 JSON（其实是 JS 对象字面量）
         let data_path = format!("stdElectCourse!data.action?profileId={pid}");
-        let data_text = match self.get_text(&data_path).await {
+        let data_text = match self.get_text_with_priority(&data_path, priority).await {
             Ok(text) => text,
             Err(error) => {
                 self.profile_context.lock().remove(pid);
-                return Err(error).with_context(|| format!("请求课程数据失败: {data_path}"));
+                return Err(error).context("请求课程数据失败");
             }
         };
         // data dump on failure below
@@ -459,7 +616,7 @@ impl EamsClient {
             .or_else(|_| parse_lessons_json(&data_text))
         {
             Ok(lessons) => lessons,
-            Err(error) => {
+            Err(_error) => {
                 self.profile_context.lock().remove(pid);
                 let saved = self.save_debug("lessons_last.html", &data_text);
                 if !entered.is_empty() {
@@ -472,7 +629,10 @@ impl EamsClient {
                 } else {
                     "；可在高级设置中临时开启原始调试页面后重试"
                 };
-                return Err(error).with_context(|| format!("解析课程数据失败{hint}"));
+                return Err(EamsError::Parse {
+                    message: format!("解析课程数据失败{hint}"),
+                }
+                .into());
             }
         };
 
@@ -504,7 +664,7 @@ impl EamsClient {
         // 失败时课程保持 SeatInfo::Unknown，由上层决定是否提交。
         let mut merged_counts = 0usize;
         for path in count_paths {
-            match self.get_text(&path).await {
+            match self.get_text_with_priority(&path, priority).await {
                 Ok(counts) => {
                     let n = merge_lesson_counts(&mut lessons, &counts);
                     if n > 0 {
@@ -522,8 +682,6 @@ impl EamsClient {
                 Err(_) => {}
             }
         }
-        let _ = merged_counts;
-
         if lessons.is_empty() {
             // 兜底：旧解析路径
             if !entered.is_empty() {
@@ -546,9 +704,12 @@ impl EamsClient {
             } else {
                 "；可在高级设置中临时开启原始调试页面后重试"
             };
-            bail!("未能解析课程列表。请确认选课已开放{hint}");
+            return Err(EamsError::Parse {
+                message: format!("未能解析课程列表。请确认选课已开放{hint}"),
+            }
+            .into());
         }
-        Ok(lessons)
+        Ok((lessons, merged_counts > 0))
     }
 
     /// 提交选课；对“成功”响应做轻量二次确认，降低误报。
@@ -558,6 +719,7 @@ impl EamsClient {
         lesson_id: &str,
         prior_selected: Option<u32>,
     ) -> Result<ElectResult> {
+        let _submission_guard = self.governor.enter_submission().await;
         let pid = validate_numeric_id(profile_id, "profileId", true)?;
         let lesson_id = validate_numeric_id(lesson_id, "lessonId", false)?;
         let before_selected = prior_selected;
@@ -575,12 +737,13 @@ impl EamsClient {
         let operator = format!("{lesson_id}:true:0");
         let form = [("optype", "true"), ("operator0", operator.as_str())];
         let text = self
-            .send_text(
+            .send_text_with_priority(
                 self.http
                     .post(url)
                     .header(REFERER, referer.as_str())
                     .form(&form),
                 "提交选课",
+                RequestPriority::Submission,
             )
             .await?;
         let result = classify_elect_response(&text);
@@ -625,7 +788,9 @@ impl EamsClient {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let data_path = format!("stdElectCourse!data.action?profileId={profile_id}");
-        let data_text = self.get_text(&data_path).await?;
+        let data_text = self
+            .get_text_with_priority(&data_path, RequestPriority::Submission)
+            .await?;
         if !data_text.contains(lesson_id) {
             return Ok(VerifyOutcome::Confirmed);
         }
@@ -637,7 +802,10 @@ impl EamsClient {
             return Ok(VerifyOutcome::Inconclusive);
         }
         let count_path = format!("stdElectCourse!queryStdCount.action?profileId={profile_id}");
-        if let Ok(counts) = self.get_text(&count_path).await {
+        if let Ok(counts) = self
+            .get_text_with_priority(&count_path, RequestPriority::Submission)
+            .await
+        {
             let _ = merge_lesson_counts(&mut lessons, &counts);
         }
         let Some(lesson) = lessons.iter().find(|l| l.id == lesson_id) else {
@@ -667,9 +835,20 @@ impl EamsClient {
         Ok(VerifyOutcome::Inconclusive)
     }
 
+    #[cfg(test)]
     async fn get_text(&self, path: &str) -> Result<String> {
+        self.get_text_with_priority(path, RequestPriority::Session)
+            .await
+    }
+
+    async fn get_text_with_priority(
+        &self,
+        path: &str,
+        priority: RequestPriority,
+    ) -> Result<String> {
         let url = self.url(path)?;
-        self.send_text(self.http.get(url), &format!("请求 {path}"))
+        let endpoint = path.split_once('?').map_or(path, |(endpoint, _)| endpoint);
+        self.send_text_with_priority(self.http.get(url), &format!("请求 {endpoint}"), priority)
             .await
     }
 }
@@ -809,6 +988,113 @@ mod tests {
         assert!(requests.contains(&format!("password={expected}")));
         assert!(requests.contains("JSESSIONID=test-session"));
         assert!(!requests.contains("secret"));
+    }
+
+    #[test]
+    fn http_200_login_rate_limit_text_updates_governor_before_success() {
+        let page = r#"<form id="loginForm"><input name="password"><div class="actionError">请不要过快点击</div></form>"#;
+        let base = serve_many(vec![page]);
+        let mut client = EamsClient::new(&base, 5, false).unwrap();
+        client.governor = RequestGovernor::new_for_semantic_response_tests();
+        let login_url = client.url("loginExt.action").unwrap();
+
+        let error = test_runtime()
+            .block_on(client.send_raw_text_with_priority(
+                client.http.post(login_url),
+                "提交登录",
+                ResponseHandling::LoginSubmission,
+                RequestPriority::Session,
+            ))
+            .unwrap_err();
+
+        assert!(is_rate_limit_error(&error));
+        let snapshot = client.network_snapshot();
+        assert_eq!(snapshot.total_rate_limits, 1);
+        assert_eq!(snapshot.consecutive_errors, 1);
+        assert_eq!(
+            snapshot.last_error_kind,
+            Some(BackendErrorKind::RateLimited)
+        );
+        assert!(!snapshot.cooldown_remaining.is_zero());
+        assert_eq!(snapshot.circuit_status, CircuitStatus::Closed);
+    }
+
+    #[test]
+    fn three_http_200_login_rate_limit_pages_open_circuit() {
+        let page = r#"<form id="loginForm"><input name="password"><div class="actionError">请不要过快点击</div></form>"#;
+        let base = serve_many(vec![page, page, page]);
+        let mut client = EamsClient::new(&base, 5, false).unwrap();
+        client.governor = RequestGovernor::new_for_semantic_response_tests();
+        let login_url = client.url("loginExt.action").unwrap();
+        let runtime = test_runtime();
+
+        for attempt in 0..3 {
+            let error = runtime
+                .block_on(client.send_raw_text_with_priority(
+                    client.http.post(login_url.clone()),
+                    "提交登录",
+                    ResponseHandling::LoginSubmission,
+                    RequestPriority::Session,
+                ))
+                .unwrap_err();
+            assert!(is_rate_limit_error(&error));
+            if attempt < 2 {
+                client.governor.clear_cooldown_for_tests();
+            }
+        }
+
+        let snapshot = client.network_snapshot();
+        assert_eq!(snapshot.total_rate_limits, 3);
+        assert_eq!(snapshot.consecutive_errors, 3);
+        assert_eq!(
+            snapshot.last_error_kind,
+            Some(BackendErrorKind::RateLimited)
+        );
+        assert_eq!(snapshot.circuit_status, CircuitStatus::Open);
+        assert!(!snapshot.cooldown_remaining.is_zero());
+    }
+
+    #[test]
+    fn half_open_http_200_login_rate_limit_reopens_circuit() {
+        let page = r#"<form id="loginForm"><input name="password"><div class="actionError">请不要过快点击</div></form>"#;
+        let base = serve_many(vec![page, page, page, page]);
+        let mut client = EamsClient::new(&base, 5, false).unwrap();
+        client.governor = RequestGovernor::new_for_semantic_response_tests();
+        let login_url = client.url("loginExt.action").unwrap();
+        let runtime = test_runtime();
+
+        for attempt in 0..3 {
+            runtime
+                .block_on(client.send_raw_text_with_priority(
+                    client.http.post(login_url.clone()),
+                    "提交登录",
+                    ResponseHandling::LoginSubmission,
+                    RequestPriority::Session,
+                ))
+                .unwrap_err();
+            if attempt < 2 {
+                client.governor.clear_cooldown_for_tests();
+            }
+        }
+        tokio_sleep(&runtime, Duration::from_millis(50));
+        assert_eq!(
+            client.network_snapshot().circuit_status,
+            CircuitStatus::HalfOpen
+        );
+
+        let error = runtime
+            .block_on(client.send_raw_text_with_priority(
+                client.http.post(login_url),
+                "提交登录",
+                ResponseHandling::LoginSubmission,
+                RequestPriority::Session,
+            ))
+            .unwrap_err();
+        assert!(is_rate_limit_error(&error));
+        let snapshot = client.network_snapshot();
+        assert_eq!(snapshot.total_rate_limits, 4);
+        assert_eq!(snapshot.circuit_status, CircuitStatus::Open);
+        assert!(snapshot.cooldown_remaining >= Duration::from_millis(35));
     }
 
     #[test]
@@ -970,8 +1256,11 @@ mod tests {
 
         let base = format!("http://{address}/eams");
         let client = EamsClient::new(&base, 5, false).unwrap();
-        let lessons = test_runtime().block_on(client.fetch_lessons("0")).unwrap();
+        let (lessons, complete_refresh) = test_runtime()
+            .block_on(client.fetch_lessons_for_monitoring("0"))
+            .unwrap();
         assert_eq!(lessons.len(), 1);
+        assert!(!complete_refresh);
         assert!(!lessons[0].capacity_known());
         assert_eq!(lessons[0].no, "ABC.001");
     }
@@ -1034,6 +1323,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    fn tokio_sleep(runtime: &tokio::runtime::Runtime, duration: Duration) {
+        runtime.block_on(async {
+            tokio::time::sleep(duration).await;
+        });
     }
 
     fn serve_many(bodies: Vec<&'static str>) -> String {

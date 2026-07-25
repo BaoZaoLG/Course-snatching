@@ -12,7 +12,7 @@ use crate::app::theme::{
     WATCH_CARD_MIN_H,
 };
 use crate::config::{days_in_month, AppConfig, ScheduleStamp};
-use crate::eams::Lesson;
+use crate::eams::{CircuitStatus, Lesson, NetworkSnapshot};
 use crate::worker::{self, LogLevel, SharedState, WatchState};
 use eframe::egui::{self, Align, Align2, Color32, Layout, RichText, Sense, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -199,6 +199,7 @@ impl eframe::App for CourseApp {
 
         let lesson_count = self.state.lessons.lock().len();
         let worker_msg = self.state.worker_message.lock().clone();
+        let network = self.state.network_snapshot();
         if !worker_msg.is_empty() {
             self.status_line = worker_msg;
         }
@@ -219,6 +220,7 @@ impl eframe::App for CourseApp {
             lesson_count,
             watch_count,
             &active_pid,
+            &network,
         );
 
         let log_reveal =
@@ -255,6 +257,7 @@ impl CourseApp {
         lesson_count: usize,
         watch_count: usize,
         active_pid: &str,
+        network: &NetworkSnapshot,
     ) {
         let reveal = root_ui.ctx().animate_bool_with_time(
             egui::Id::new("advanced_settings_reveal"),
@@ -344,6 +347,10 @@ impl CourseApp {
                         });
                     }
                 });
+
+                ui.add_space(10.0);
+
+                self.show_network_summary(ui, network);
 
                 ui.add_space(10.0);
 
@@ -593,7 +600,7 @@ impl CourseApp {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(14.0, 8.0);
                             dirty |= ui
-                                .checkbox(&mut self.cfg.adaptive_interval, "限流自适应间隔")
+                                .checkbox(&mut self.cfg.adaptive_interval, "网络异常时自动降速")
                                 .changed();
                             dirty |= ui
                                 .checkbox(&mut self.cfg.grab_seats_first, "优先检查有余量")
@@ -610,6 +617,9 @@ impl CourseApp {
                                 apply_style(ui.ctx(), self.cfg.dark_mode);
                             }
                         });
+
+                        ui.add_space(10.0);
+                        self.show_network_diagnostics(ui);
 
                         ui.add_space(10.0);
                         // Run parameters: left-aligned label + capsule pairs (no far-right orphan).
@@ -675,6 +685,59 @@ impl CourseApp {
                     });
                 });
         });
+    }
+
+    fn show_network_summary(&self, ui: &mut egui::Ui, network: &NetworkSnapshot) {
+        let mut items = vec![format!("实际 {:.1} 请求/秒", network.requests_per_second)];
+        if !network.cooldown_remaining.is_zero() {
+            items.push(format!(
+                "服务器冷却 {} 秒",
+                network.cooldown_remaining.as_secs().max(1)
+            ));
+        }
+        if let Some(latency_ms) = network.latency_ewma_ms {
+            items.push(format!("最近延迟 {:.0} ms", latency_ms));
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(12.0, 4.0);
+            for item in items {
+                ui.label(RichText::new(item).size(CAPTION_SIZE).color(MUTED));
+            }
+        });
+    }
+
+    fn show_network_diagnostics(&self, ui: &mut egui::Ui) {
+        let network = self.state.network_snapshot();
+        let circuit = match network.circuit_status {
+            CircuitStatus::Closed => "正常",
+            CircuitStatus::Open => "冷却中",
+            CircuitStatus::HalfOpen => "恢复探测中",
+        };
+        let last_error = network
+            .last_error_kind
+            .map_or("无".to_owned(), |kind| kind.label().to_owned());
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+            ui.label(
+                RichText::new("网络诊断")
+                    .size(BODY_SIZE)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "累计限流 {}　连续网络错误 {}　熔断 {}　最近错误 {}",
+                    network.total_rate_limits, network.consecutive_errors, circuit, last_error,
+                ))
+                .size(CAPTION_SIZE)
+                .color(MUTED),
+            );
+        });
+        ui.label(
+            RichText::new("请求预算、服务器冷却和熔断保护始终生效，关闭自动降速不会绕过这些保护。")
+                .size(CAPTION_SIZE)
+                .color(MUTED),
+        );
     }
 
     fn show_log_drawer(&mut self, root_ui: &mut egui::Ui, reveal: f32) {
@@ -1501,7 +1564,7 @@ impl CourseApp {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(format!(
-                            "间隔 {:.2} 秒　限流自适应 {}　优先余量 {}　仅监控 {}",
+                            "间隔 {:.2} 秒　网络异常时自动降速 {}　优先余量 {}　仅监控 {}",
                             self.cfg.interval_seconds,
                             on_off(self.cfg.adaptive_interval),
                             on_off(self.cfg.grab_seats_first),
@@ -1850,7 +1913,7 @@ impl CourseApp {
         if self.cfg.interval_seconds < 0.3 {
             checks.push((
                 true,
-                "间隔较激进，遇限流会自动放慢（若已开启自适应）".into(),
+                "间隔较激进；网络异常时会自动降速，硬性请求预算始终生效".into(),
             ));
         }
         checks

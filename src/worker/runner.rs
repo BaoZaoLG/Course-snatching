@@ -2,7 +2,8 @@ use super::state::*;
 use super::time::*;
 use crate::config::AppConfig;
 use crate::eams::{
-    is_auth_error, is_rate_limit_error, rate_limit_retry_after, EamsClient, ElectResult, Lesson,
+    backend_error_kind, is_auth_error, BackendErrorKind, CircuitStatus, EamsClient, ElectResult,
+    Lesson,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -42,6 +43,20 @@ struct ActivityGuard {
     activity: Activity,
     /// Set for Activity::Run so Drop only clears `running` if this task still owns it.
     run_generation: Option<u64>,
+}
+
+struct BurstModeGuard(Arc<EamsClient>);
+
+impl BurstModeGuard {
+    fn new(client: Arc<EamsClient>) -> Self {
+        Self(client)
+    }
+}
+
+impl Drop for BurstModeGuard {
+    fn drop(&mut self) {
+        self.0.set_burst_mode(false);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -121,7 +136,7 @@ pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
 
         if let Err(error) = client.login(&username, password.as_str()).await {
             state.logged_in.store(false, Ordering::Release);
-            if is_rate_limit_error(&error) {
+            if backend_error_kind(&error) == BackendErrorKind::RateLimited {
                 state.log(
                     LogLevel::Error,
                     format!("登录失败：{error:#}（请等待几秒后再试）"),
@@ -308,32 +323,53 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
 
     spawn_task(async move {
         let _guard = ActivityGuard::for_run(state.clone(), generation);
+        let _burst_guard = BurstModeGuard::new(client.clone());
         let mut pending: HashSet<String> = watch.into_iter().collect();
         let mut succeeded = 0usize;
         let mut terminal_failures = 0usize;
-        let mut consecutive_errors = 0u32;
+        let mut consecutive_refresh_failures = 0u32;
+        let mut consecutive_network_failures = 0u32;
         let mut consecutive_submission_errors = 0u32;
         let mut stopped_for_errors = false;
-        let mut effective_interval = cfg.interval_seconds.max(0.05);
+        let requested_interval = cfg.interval_seconds.max(0.05);
+        let mut effective_interval = requested_interval;
+        // Only relax a previously increased interval after a stable sequence
+        // of complete refreshes, preventing fast/slow oscillation.
+        let mut consecutive_successful_refreshes = 0u32;
         let mut seat_open_prev: HashMap<String, bool> = HashMap::new();
         let burst_secs = cfg.open_burst_seconds.min(120);
         let burst_deadline =
             tokio::time::Instant::now() + Duration::from_secs(u64::from(burst_secs));
-        let mut first_round = true;
+        // A circuit-breaker trip ends this sprint permanently; after its
+        // cooldown the worker resumes ordinary monitoring instead.
+        let mut burst_aborted_by_circuit = false;
 
         while state.is_current_run(generation) && !pending.is_empty() {
-            let in_burst = burst_secs > 0 && tokio::time::Instant::now() < burst_deadline;
-            if in_burst {
-                // Sprint: stick to user interval (no adaptive slowdown from prior errors).
-                effective_interval = cfg.interval_seconds.max(0.05);
+            let round_started = tokio::time::Instant::now();
+            if client.circuit_is_open() {
+                burst_aborted_by_circuit = true;
             }
+            let in_burst = burst_secs > 0
+                && !burst_aborted_by_circuit
+                && tokio::time::Instant::now() < burst_deadline;
+            client.set_burst_mode(in_burst);
 
-            let catalog = match client.fetch_lessons(&profile).await {
-                Ok(list) => {
-                    consecutive_errors = 0;
-                    if cfg.adaptive_interval {
-                        effective_interval =
-                            (effective_interval * 0.92).max(cfg.interval_seconds.max(0.05));
+            let catalog = match client.fetch_lessons_for_monitoring(&profile).await {
+                Ok((list, complete_refresh)) => {
+                    consecutive_refresh_failures = 0;
+                    if complete_refresh {
+                        consecutive_network_failures = 0;
+                        consecutive_successful_refreshes =
+                            consecutive_successful_refreshes.saturating_add(1);
+                        effective_interval = recovered_interval_after_success(
+                            effective_interval,
+                            requested_interval,
+                            consecutive_successful_refreshes,
+                            cfg.adaptive_interval,
+                        );
+                    } else {
+                        consecutive_successful_refreshes = 0;
+                        consecutive_network_failures = client.network_snapshot().consecutive_errors;
                     }
                     *state.lessons.lock() = list.clone();
                     enrich_watch_from_lessons(&state, &list);
@@ -352,23 +388,40 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                         );
                         break;
                     }
-                    consecutive_errors += 1;
-                    if cfg.adaptive_interval
-                        && (is_rate_limit_error(&error)
-                            || error.to_string().contains("限流")
-                            || error.to_string().contains("过快"))
-                    {
+                    consecutive_refresh_failures = consecutive_refresh_failures.saturating_add(1);
+                    let reported_kind = backend_error_kind(&error);
+                    let error_text = format!("{error:#}");
+                    let error_kind = worker_error_kind(reported_kind, &error_text);
+                    let is_network_failure = is_network_error(error_kind);
+                    if is_network_failure {
+                        consecutive_network_failures =
+                            consecutive_network_failures.saturating_add(1);
+                    } else {
+                        consecutive_network_failures = 0;
+                    }
+                    consecutive_successful_refreshes = 0;
+                    if cfg.adaptive_interval && is_network_failure {
                         let old = effective_interval;
                         effective_interval = (effective_interval * 1.6).min(30.0);
                         state.log(
                             LogLevel::Warn,
-                            format!("检测到限流/过快，间隔 {old:.2}s → {effective_interval:.2}s"),
+                            format!(
+                                "检测到{}，间隔 {old:.2}s → {effective_interval:.2}s",
+                                error_kind.label()
+                            ),
                         );
+                    }
+                    let network = client.network_snapshot();
+                    let circuit_protecting = circuit_protects(network.circuit_status);
+                    if circuit_protecting {
+                        burst_aborted_by_circuit = true;
+                        client.set_burst_mode(false);
                     }
                     state.log(
                         LogLevel::Warn,
                         format!(
-                            "刷新课程失败（连续 {consecutive_errors}/{} 次）：{error:#}",
+                            "刷新课程失败（{}，连续刷新失败 {consecutive_refresh_failures}/{}，连续网络异常 {consecutive_network_failures}）：{error:#}",
+                            error_kind.label(),
                             cfg.max_consecutive_errors
                         ),
                     );
@@ -382,27 +435,55 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             None,
                         );
                     }
-                    if consecutive_errors >= cfg.max_consecutive_errors {
+                    // 网络瞬态由不可绕过的 governor 冷却/熔断处理；旧的停止阈值
+                    // 继续约束解析或未知程序错误，避免页面改版后无限空转。
+                    if !is_network_failure
+                        && consecutive_refresh_failures >= cfg.max_consecutive_errors
+                    {
                         stopped_for_errors = true;
-                        state.set_message(format!("连续失败 {consecutive_errors} 次，已自动停止"));
+                        state.set_message(format!(
+                            "连续刷新失败 {consecutive_refresh_failures} 次，已自动停止"
+                        ));
                         crate::notify::dispatch_alert(
                             "已自动停止",
-                            format!("连续失败 {consecutive_errors} 次"),
+                            format!("连续刷新失败 {consecutive_refresh_failures} 次"),
                             false,
                             cfg.notify_enabled,
                             cfg.sound_enabled,
                         );
                         break;
                     }
-                    let delay = rate_limit_retry_after(&error)
-                        .unwrap_or_else(|| error_backoff(effective_interval, consecutive_errors));
-                    if rate_limit_retry_after(&error).is_some() {
+                    // User cadence is measured from round start. Server cooldown is
+                    // measured from the response and must not be shortened.
+                    let requested_period =
+                        Duration::from_secs_f64(effective_interval.clamp(0.05, 30.0));
+                    let user_wait = requested_period.saturating_sub(round_started.elapsed());
+                    let compatibility_backoff = if reported_kind == BackendErrorKind::Unknown
+                        && error_kind == BackendErrorKind::RateLimited
+                    {
+                        fixed_network_backoff(consecutive_network_failures)
+                    } else {
+                        Duration::ZERO
+                    };
+                    let delay = user_wait
+                        .max(network.cooldown_remaining)
+                        .max(compatibility_backoff);
+                    if error_kind == BackendErrorKind::RateLimited
+                        && !network.cooldown_remaining.is_zero()
+                    {
                         state.set_message(format!(
-                            "服务器限流，{:.1}s 后重试（Retry-After）",
+                            "服务器限流，{:.1}s 后重试（服务器冷却）",
                             delay.as_secs_f64()
                         ));
-                    } else {
+                    } else if burst_aborted_by_circuit {
+                        state.set_message(format!(
+                            "网络保护已启用，{:.1}s 后以普通监控继续",
+                            delay.as_secs_f64()
+                        ));
+                    } else if is_network_failure {
                         state.set_message(format!("网络异常，{:.1}s 后重试", delay.as_secs_f64()));
+                    } else {
+                        state.set_message(format!("刷新异常，{:.1}s 后重试", delay.as_secs_f64()));
                     }
                     sleep_cancellable(&state, generation, delay).await;
                     continue;
@@ -635,7 +716,14 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             state.clear_session("登录失效，请重新登录");
                             break;
                         }
-                        state.log(LogLevel::Error, format!("[{serial}] 提交异常：{error:#}"));
+                        let reported_kind = backend_error_kind(&error);
+                        let error_text = format!("{error:#}");
+                        let error_kind = worker_error_kind(reported_kind, &error_text);
+                        let network_failure = is_network_error(error_kind);
+                        state.log(
+                            LogLevel::Error,
+                            format!("[{serial}] 提交异常（{}）：{error:#}", error_kind.label()),
+                        );
                         update_watch(
                             &state,
                             &serial,
@@ -644,8 +732,15 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             None,
                             Some(&lesson),
                         );
-                        consecutive_submission_errors += 1;
-                        if consecutive_submission_errors >= cfg.max_consecutive_errors {
+                        consecutive_submission_errors =
+                            consecutive_submission_errors.saturating_add(1);
+                        if circuit_protects(client.network_snapshot().circuit_status) {
+                            burst_aborted_by_circuit = true;
+                            client.set_burst_mode(false);
+                        }
+                        if !network_failure
+                            && consecutive_submission_errors >= cfg.max_consecutive_errors
+                        {
                             stopped_for_errors = true;
                             state.set_message(format!(
                                 "提交连续失败 {consecutive_submission_errors} 次，已自动停止"
@@ -666,15 +761,14 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
             if pending.is_empty() || !state.is_current_run(generation) {
                 break;
             }
-            // First round after start/schedule: no artificial wait before we already polled.
-            // Between rounds: burst mode uses the configured interval without jitter.
-            let in_burst = burst_secs > 0 && tokio::time::Instant::now() < burst_deadline;
-            let delay = if first_round {
-                first_round = false;
-                Duration::from_millis(0)
-            } else {
-                poll_delay_for_mode(effective_interval, in_burst)
-            };
+            // The first request starts immediately; every subsequent round honours
+            // the expected period, counting governor/request time already elapsed.
+            let in_burst = burst_secs > 0
+                && !burst_aborted_by_circuit
+                && !client.circuit_is_open()
+                && tokio::time::Instant::now() < burst_deadline;
+            let desired_period = poll_delay_for_mode(effective_interval, in_burst);
+            let delay = desired_period.saturating_sub(round_started.elapsed());
             if !delay.is_zero() {
                 state.set_message(format!(
                     "{}剩余 {} 门，{:.2}s 后继续",
@@ -724,7 +818,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
             }
         } else if state.logged_in.load(Ordering::Acquire) {
             mark_pending_stopped(&state, &pending);
-            if !stopped_for_errors && consecutive_errors < cfg.max_consecutive_errors {
+            if !stopped_for_errors {
                 state.log(LogLevel::Info, "已停止");
                 state.set_message("已停止");
             }
@@ -749,11 +843,12 @@ pub fn keepalive(state: Arc<SharedState>, notify_enabled: bool, sound_enabled: b
         return;
     }
     spawn_task(async move {
-        match client.fetch_lessons(&profile).await {
-            Ok(list) => {
+        match client.fetch_lessons_for_keepalive(&profile).await {
+            Ok(Some(list)) => {
                 *state.lessons.lock() = list;
                 state.touch();
             }
+            Ok(None) => {}
             Err(error) if is_auth_error(&error) => {
                 state.clear_session("登录已过期，请重新登录");
                 state.log(LogLevel::Warn, "会话保活发现登录失效");
@@ -959,14 +1054,60 @@ fn poll_delay_for_mode(interval_seconds: f64, burst: bool) -> Duration {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.subsec_nanos())
         .unwrap_or(0);
-    // ±10% jitter keeps steady-state traffic less robotic.
-    let jitter = (f64::from(nanos % 2001) / 10_000.0) - 0.1;
+    // 0–10% positive jitter keeps traffic less robotic without shortening the
+    // user's requested polling period.
+    let jitter = f64::from(nanos % 1001) / 10_000.0;
     Duration::from_secs_f64((base * (1.0 + jitter)).clamp(0.05, 30.0))
 }
 
-fn error_backoff(interval_seconds: f64, consecutive_errors: u32) -> Duration {
-    let factor = 2u64.saturating_pow(consecutive_errors.saturating_sub(1).min(5));
-    Duration::from_secs_f64((interval_seconds * factor as f64).clamp(1.0, 30.0))
+fn worker_error_kind(reported: BackendErrorKind, message: &str) -> BackendErrorKind {
+    if reported == BackendErrorKind::Unknown
+        && ["限流", "过快", "太快", "频繁", "稍后"]
+            .iter()
+            .any(|marker| message.contains(marker))
+    {
+        BackendErrorKind::RateLimited
+    } else {
+        reported
+    }
+}
+
+fn is_network_error(kind: BackendErrorKind) -> bool {
+    matches!(
+        kind,
+        BackendErrorKind::RateLimited
+            | BackendErrorKind::Timeout
+            | BackendErrorKind::Server
+            | BackendErrorKind::Transport
+    )
+}
+
+fn circuit_protects(status: CircuitStatus) -> bool {
+    matches!(status, CircuitStatus::Open | CircuitStatus::HalfOpen)
+}
+
+fn recovered_interval_after_success(
+    current: f64,
+    requested: f64,
+    consecutive_successes: u32,
+    enabled: bool,
+) -> f64 {
+    if enabled && consecutive_successes >= 5 && current > requested {
+        (current * 0.92).max(requested)
+    } else {
+        current
+    }
+}
+
+fn fixed_network_backoff(consecutive_failures: u32) -> Duration {
+    const DELAYS: [Duration; 5] = [
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+        Duration::from_secs(16),
+        Duration::from_secs(30),
+    ];
+    DELAYS[consecutive_failures.saturating_sub(1).min(4) as usize]
 }
 
 fn mask_account(username: &str) -> String {
@@ -1008,15 +1149,15 @@ mod tests {
     fn poll_delay_is_bounded() {
         for _ in 0..100 {
             let delay = poll_delay_for_mode(1.5, false).as_secs_f64();
-            assert!((1.35..=1.65).contains(&delay));
+            assert!((1.5..=1.65).contains(&delay));
         }
         for _ in 0..100 {
             let delay = poll_delay_for_mode(0.1, false).as_secs_f64();
-            assert!((0.05..=0.12).contains(&delay), "got {delay}");
+            assert!((0.1..=0.11).contains(&delay), "got {delay}");
         }
         for _ in 0..20 {
             let burst = poll_delay_for_mode(0.1, true).as_secs_f64();
-            assert!((0.05..=0.1).contains(&burst), "burst got {burst}");
+            assert!((0.099..=0.101).contains(&burst), "burst got {burst}");
         }
     }
 
@@ -1035,10 +1176,54 @@ mod tests {
     }
 
     #[test]
-    fn error_backoff_is_capped() {
-        assert_eq!(error_backoff(1.0, 1), Duration::from_secs(1));
-        assert_eq!(error_backoff(1.0, 2), Duration::from_secs(2));
-        assert_eq!(error_backoff(10.0, 10), Duration::from_secs(30));
+    fn interval_recovers_only_after_five_complete_refreshes() {
+        let requested = 1.0;
+        let slowed = 8.0;
+        assert_eq!(
+            recovered_interval_after_success(slowed, requested, 4, true),
+            slowed
+        );
+        let recovered = recovered_interval_after_success(slowed, requested, 5, true);
+        assert!(recovered < slowed && recovered >= requested);
+        assert_eq!(
+            recovered_interval_after_success(slowed, requested, 10, false),
+            slowed
+        );
+    }
+
+    #[test]
+    fn typed_error_wins_and_only_unknown_text_uses_rate_limit_fallback() {
+        assert_eq!(
+            worker_error_kind(BackendErrorKind::Business, "业务失败：请求过快"),
+            BackendErrorKind::Business
+        );
+        assert_eq!(
+            worker_error_kind(BackendErrorKind::Unknown, "请不要过快点击"),
+            BackendErrorKind::RateLimited
+        );
+        assert_eq!(
+            worker_error_kind(BackendErrorKind::Unknown, "页面结构未知"),
+            BackendErrorKind::Unknown
+        );
+    }
+
+    #[test]
+    fn circuit_protection_ends_burst_without_classifying_business_results_as_network() {
+        assert!(circuit_protects(CircuitStatus::Open));
+        assert!(circuit_protects(CircuitStatus::HalfOpen));
+        assert!(!circuit_protects(CircuitStatus::Closed));
+        assert!(!is_network_error(BackendErrorKind::Business));
+        assert!(is_network_error(BackendErrorKind::RateLimited));
+    }
+
+    #[test]
+    fn fallback_network_backoff_uses_documented_sequence() {
+        assert_eq!(fixed_network_backoff(1), Duration::from_secs(2));
+        assert_eq!(fixed_network_backoff(2), Duration::from_secs(4));
+        assert_eq!(fixed_network_backoff(3), Duration::from_secs(8));
+        assert_eq!(fixed_network_backoff(4), Duration::from_secs(16));
+        assert_eq!(fixed_network_backoff(5), Duration::from_secs(30));
+        assert_eq!(fixed_network_backoff(99), Duration::from_secs(30));
     }
 
     #[test]
