@@ -19,18 +19,17 @@ fn load_icon() -> egui::IconData {
 }
 
 fn install_panic_report() {
+    // Retention is best-effort; diagnostics must never affect application startup.
+    let _ = AppConfig::retain_crash_reports();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let path = AppConfig::path().with_file_name("crash.log");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let report = format!(
             "Course-snatching panic report\n{}\n\n{:?}\n",
             info,
             std::backtrace::Backtrace::force_capture()
         );
-        let _ = std::fs::write(path, report);
+        // Never let a failed diagnostics write mask or re-panic over the original failure.
+        let _ = AppConfig::write_crash_report(&report);
         default_hook(info);
     }));
 }

@@ -11,6 +11,12 @@ use url::Url;
 
 static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CONFIG_SAVE_LOCK: Mutex<()> = Mutex::new(());
+static CRASH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub const DEBUG_FILE_LIMIT: usize = 10;
+pub const DEBUG_TOTAL_BYTES_LIMIT: u64 = 20 * 1024 * 1024;
+pub const DEBUG_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+pub const CRASH_FILE_LIMIT: usize = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -35,7 +41,8 @@ pub struct AppConfig {
     pub profile_id: String,
     pub timeout_seconds: u64,
     pub auto_fetch_on_login: bool,
-    /// 仅在排障时开启；调试文件可能包含教务页面中的个人信息。
+    /// 旧配置读取兼容字段。该开关只在当前会话有效，永不以开启状态写回配置。
+    #[serde(skip_serializing)]
     pub debug_dump_enabled: bool,
     /// 连续网络/解析失败达到该次数后自动停止，避免无效请求服务器。
     pub max_consecutive_errors: u32,
@@ -155,7 +162,12 @@ impl AppConfig {
         }
 
         match Self::read_from(&path) {
-            Ok(cfg) => (cfg, None),
+            Ok(mut cfg) => {
+                // Raw page dumps may contain personal information. A persisted legacy option
+                // must never silently re-enable them in a new application session.
+                cfg.debug_dump_enabled = false;
+                (cfg, None)
+            }
             Err(error) => {
                 let backup = invalid_backup_path(&path);
                 let backup_note = match fs::copy(&path, &backup) {
@@ -178,6 +190,9 @@ impl AppConfig {
         let mut cfg: Self =
             toml::from_str(&text).with_context(|| format!("解析配置失败：{}", path.display()))?;
         cfg.normalize();
+        // This legacy field is accepted on read only. Raw pages can contain personal data,
+        // so every fresh application session must start with dumping disabled.
+        cfg.debug_dump_enabled = false;
         Ok(cfg)
     }
 
@@ -319,8 +334,160 @@ impl AppConfig {
     }
 
     pub fn crash_log_path() -> PathBuf {
-        Self::data_dir().join("crash.log")
+        Self::crash_dir()
     }
+
+    pub fn debug_dir() -> PathBuf {
+        Self::data_dir().join("debug")
+    }
+
+    pub fn crash_dir() -> PathBuf {
+        Self::data_dir().join("crash")
+    }
+
+    /// Best-effort rotation for privacy-sensitive raw pages. Errors intentionally do not
+    /// interrupt login, monitoring, or a diagnostic dump.
+    pub fn retain_debug_files() -> io::Result<()> {
+        retain_files(
+            &Self::debug_dir(),
+            DEBUG_FILE_LIMIT,
+            DEBUG_TOTAL_BYTES_LIMIT,
+            Some(DEBUG_MAX_AGE_SECS),
+        )
+    }
+
+    pub fn retain_crash_reports() -> io::Result<()> {
+        retain_files(&Self::crash_dir(), CRASH_FILE_LIMIT, u64::MAX, None)
+    }
+
+    /// Panic reporting must not trigger a second panic. Each report has its own file so a
+    /// later crash does not overwrite the evidence from an earlier one.
+    pub fn write_crash_report(report: &str) -> io::Result<PathBuf> {
+        let dir = Self::crash_dir();
+        fs::create_dir_all(&dir)?;
+        let _ = retain_files(&dir, CRASH_FILE_LIMIT.saturating_sub(1), u64::MAX, None);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let seq = CRASH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "crash-{}-{}-{}.log",
+            std::process::id(),
+            stamp,
+            seq
+        ));
+        fs::write(&path, report)?;
+        let _ = Self::retain_crash_reports();
+        Ok(path)
+    }
+}
+
+#[derive(Debug)]
+struct RetainedFile {
+    path: PathBuf,
+    modified: SystemTime,
+    len: u64,
+}
+
+/// Removes oldest regular files until all supplied bounds hold. Directories and unreadable
+/// entries are left untouched, making this safe to use in a user-owned data directory.
+pub fn retain_files(
+    dir: &Path,
+    max_files: usize,
+    max_total_bytes: u64,
+    max_age_secs: Option<u64>,
+) -> io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let now = SystemTime::now();
+    let mut files = fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata.is_file().then(|| RetainedFile {
+                path: entry.path(),
+                modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+                len: metadata.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|file| file.modified);
+
+    let mut remaining_files = files.len();
+    let mut total = files.iter().map(|file| file.len).sum::<u64>();
+    for file in files {
+        let expired = max_age_secs.is_some_and(|max_age| {
+            now.duration_since(file.modified)
+                .map(|age| age.as_secs() > max_age)
+                .unwrap_or(false)
+        });
+        let over_limit = remaining_files > max_files || total > max_total_bytes;
+        if (expired || over_limit) && fs::remove_file(&file.path).is_ok() {
+            remaining_files = remaining_files.saturating_sub(1);
+            total = total.saturating_sub(file.len);
+        }
+    }
+    Ok(())
+}
+
+/// Logs and diagnostic notes can contain server text. Strip the common credential and session
+/// forms before any export; raw pages are handled by a separate explicit confirmation.
+pub fn redact_diagnostic_text(text: &str) -> String {
+    let header = regex::Regex::new(r"(?im)^(cookie|set-cookie|authorization)\s*:\s*.*$")
+        .expect("header redaction regex");
+    let key_value =
+        regex::Regex::new(r"(?i)(password|passwd|token|session(?:id)?)(\s*[:=]\s*)([^\s,;]+)")
+            .expect("redaction regex");
+    let query = regex::Regex::new(r"(?i)([?&](?:password|passwd|token|session(?:id)?)=)[^&#\s]+")
+        .expect("query redaction regex");
+    let text = header.replace_all(text, "$1: [已隐藏]");
+    let text = key_value.replace_all(&text, "$1$2[已隐藏]");
+    query.replace_all(&text, "${1}[已隐藏]").into_owned()
+}
+
+/// Sanitises a raw debug response before it can be added to an explicitly requested
+/// diagnostic bundle. Submission forms are excluded wholesale because retaining an
+/// election payload would create an avoidable privacy risk.
+pub fn redact_diagnostic_page(name: &str, content: &str) -> Option<String> {
+    let lowered = format!("{name}\n{content}").to_ascii_lowercase();
+    const SUBMISSION_MARKERS: [&str; 5] = [
+        "batchoperator",
+        "operator0",
+        "optype",
+        "elect_lesson",
+        "selection payload",
+    ];
+    if SUBMISSION_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return None;
+    }
+
+    let text = redact_diagnostic_text(content);
+    let embedded_secret = regex::Regex::new(
+        r#"(?i)(password|passwd|token|session(?:id)?|jsessionid|authorization|cookie)(\s*[\"']?\s*[:=]\s*[\"']?)([^\"'&<>\s,;]+)"#,
+    )
+    .expect("embedded diagnostic secret regex");
+    let html_value = regex::Regex::new(
+        r#"(?i)(<(?:input|meta)\b[^>]*(?:name|id)\s*=\s*[\"']?(?:password|passwd|token|session(?:id)?|jsessionid)[\"']?[^>]*\bvalue\s*=\s*[\"'])([^\"']*)([\"'])"#,
+    )
+    .expect("HTML diagnostic secret regex");
+    let text = embedded_secret.replace_all(&text, "$1$2[已隐藏]");
+    Some(html_value.replace_all(&text, "$1[已隐藏]$3").into_owned())
+}
+
+pub fn redact_diagnostic_url(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        return raw.split('?').next().unwrap_or_default().to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 /// 定时开抢的完整本地时刻（东八区）。
@@ -736,6 +903,107 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("password"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn debug_dump_is_session_only_and_never_written_back() {
+        let dir = config_test_dir("debug-session");
+        let path = dir.join("config.toml");
+        let cfg = AppConfig {
+            debug_dump_enabled: true,
+            ..Default::default()
+        };
+
+        cfg.save_to(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("debug_dump_enabled"));
+        assert!(!AppConfig::read_from(&path).unwrap().debug_dump_enabled);
+
+        fs::write(&path, "debug_dump_enabled = true\n").unwrap();
+        assert!(!AppConfig::read_from(&path).unwrap().debug_dump_enabled);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retention_removes_oldest_files_until_count_and_size_fit() {
+        let dir = config_test_dir("retention");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in [
+            ("old.txt", "1111"),
+            ("middle.txt", "2222"),
+            ("new.txt", "3333"),
+        ] {
+            fs::write(dir.join(name), content).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        retain_files(&dir, 2, 8, None).unwrap();
+
+        assert!(!dir.join("old.txt").exists());
+        assert!(dir.join("middle.txt").exists());
+        assert!(dir.join("new.txt").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retention_enforces_zero_count_and_expiry_bounds() {
+        let dir = config_test_dir("retention-expiry");
+        fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.txt");
+        fs::write(&old, "old").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&old).unwrap();
+        let old_time = SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(8 * 24 * 60 * 60))
+            .unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        drop(file);
+
+        retain_files(&dir, 10, DEBUG_TOTAL_BYTES_LIMIT, Some(DEBUG_MAX_AGE_SECS)).unwrap();
+        assert!(!old.exists(), "files older than seven days must be removed");
+
+        fs::write(dir.join("one.txt"), "1").unwrap();
+        retain_files(&dir, 0, u64::MAX, None).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn diagnostic_redaction_hides_credentials_sessions_and_query_values() {
+        let text = "Cookie: session=very-secret; other=value\npassword=hunter2 token: abc123 \
+https://example.edu/eams?sessionId=abc&course=1";
+        let redacted = redact_diagnostic_text(text);
+        assert!(!redacted.contains("very-secret"));
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("abc123"));
+        assert!(!redacted.contains("sessionId=abc"));
+        assert!(redacted.contains("[已隐藏]"));
+
+        let url = redact_diagnostic_url("https://user:secret@example.edu/eams?a=1#detail");
+        assert_eq!(url, "https://example.edu/eams");
+    }
+
+    #[test]
+    fn raw_diagnostic_pages_never_export_secrets_or_submission_forms() {
+        let page = concat!(
+            "Cookie: JSESSIONID=cookie-secret\n",
+            "Authorization: Bearer auth-secret\n",
+            "<input name='password' value='test-password'>",
+            "<script>var token='token-secret'; var sessionId='session-secret';</script>"
+        );
+        let redacted = redact_diagnostic_page("login.html", page).unwrap();
+        for secret in [
+            "cookie-secret",
+            "auth-secret",
+            "test-password",
+            "token-secret",
+            "session-secret",
+        ] {
+            assert!(!redacted.contains(secret), "diagnostic leaked {secret}");
+        }
+
+        let submission = "<form action='stdElectCourse!batchOperator.action'><input name='operator0' value='123:true:0'></form>";
+        assert!(redact_diagnostic_page("submit.html", submission).is_none());
     }
 
     #[test]

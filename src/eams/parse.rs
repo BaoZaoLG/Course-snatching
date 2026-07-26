@@ -1,4 +1,5 @@
 use super::{EamsError, ElectResult, Lesson, SeatInfo};
+use crate::config::AppConfig;
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use reqwest::header::HeaderMap;
@@ -384,19 +385,22 @@ pub(crate) fn extract_profiles_detailed(text: &str) -> Vec<(String, String)> {
 }
 
 pub(crate) fn save_debug_text(name: &str, content: &str) -> Result<()> {
-    let dir = debug_dir();
+    let dir = AppConfig::debug_dir();
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(name), content)?;
+    let _ = AppConfig::retain_debug_files();
+    let safe_name = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    std::fs::write(dir.join(safe_name), content)?;
+    let _ = AppConfig::retain_debug_files();
     Ok(())
-}
-
-fn debug_dir() -> std::path::PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return parent.join("runtime").join("debug");
-        }
-    }
-    std::path::PathBuf::from("runtime/debug")
 }
 
 pub(crate) fn extract_all_profile_ids(text: &str) -> Vec<String> {

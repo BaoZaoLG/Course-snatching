@@ -1,3 +1,4 @@
+mod schedule;
 mod theme;
 
 #[allow(unused_imports)]
@@ -11,7 +12,7 @@ use crate::app::theme::{
     MUTED, PANEL_TITLE, QUIET_FILL, QUIET_HOVER, RED, ROW_ALT, ROW_HOVER, ROW_LINE, TEXT,
     WATCH_CARD_MIN_H,
 };
-use crate::config::{days_in_month, AppConfig, ScheduleStamp};
+use crate::config::{redact_diagnostic_text, redact_diagnostic_url, AppConfig, ScheduleStamp};
 use crate::eams::{CircuitStatus, Lesson, NetworkSnapshot};
 use crate::worker::{self, LogLevel, SharedState, WatchState};
 use eframe::egui::{self, Align, Align2, Color32, Layout, RichText, Sense, Vec2};
@@ -56,6 +57,7 @@ pub struct CourseApp {
     confirm_clear_logs: bool,
     confirm_remove: Option<usize>,
     confirm_start_grab: bool,
+    confirm_export_raw_diagnostics: bool,
     show_first_run: bool,
     last_keepalive: f64,
     /// 已触发过的定时开抢键：YYYY-MM-DD HH:MM:SS
@@ -69,6 +71,9 @@ pub struct CourseApp {
 impl CourseApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_fonts(&cc.egui_ctx);
+        // Raw response dumps are user-owned diagnostics. Enforce their privacy/size policy
+        // as the session starts, as well as before and after each write.
+        let _ = AppConfig::retain_debug_files();
         let (cfg, config_warning) = AppConfig::load_with_warning();
         apply_style(&cc.egui_ctx, cfg.dark_mode);
         cc.egui_ctx
@@ -103,6 +108,7 @@ impl CourseApp {
             confirm_clear_logs: false,
             confirm_remove: None,
             confirm_start_grab: false,
+            confirm_export_raw_diagnostics: false,
             show_first_run,
             last_keepalive: 0.0,
             schedule_fired_for: None,
@@ -566,7 +572,10 @@ impl CourseApp {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(10.0, 6.0);
                             let debug_changed = ui
-                                .checkbox(&mut self.cfg.debug_dump_enabled, "保存原始调试页面")
+                                .checkbox(
+                                    &mut self.cfg.debug_dump_enabled,
+                                    "本次会话保存原始调试页面",
+                                )
                                 .changed();
                             ui.label(
                                 RichText::new("仅排障时开启，文件可能包含个人信息")
@@ -589,9 +598,9 @@ impl CourseApp {
                                     self.confirmed_custom_host = confirmed.then_some(host);
                                 }
                             }
-                            if debug_changed {
-                                self.save_config();
-                            }
+                            // The option intentionally stays in memory only; legacy config
+                            // values are force-disabled when a new session starts.
+                            let _ = debug_changed;
                         });
 
                         ui.add_space(10.0);
@@ -788,6 +797,31 @@ impl CourseApp {
                             .clicked()
                         {
                             self.export_logs();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("诊断包").size(META_SIZE).color(MUTED),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE),
+                            )
+                            .clicked()
+                        {
+                            self.export_diagnostics(false);
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("含原始页面…").size(META_SIZE).color(MUTED),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE),
+                            )
+                            .on_hover_text("仅在明确确认后导出原始调试页面")
+                            .clicked()
+                        {
+                            self.confirm_export_raw_diagnostics = true;
                         }
                         egui::ComboBox::from_id_salt("log_filter")
                             .selected_text(match self.log_filter {
@@ -1496,6 +1530,30 @@ impl CourseApp {
                     });
                 });
         }
+        if self.confirm_export_raw_diagnostics {
+            egui::Window::new("确认导出原始页面")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(root_ui.ctx(), |ui| {
+                    ui.set_min_width(430.0);
+                    ui.label("原始调试页面可能含个人信息，仅应发送给你信任的支持人员。");
+                    ui.label(
+                        RichText::new("默认诊断包不会包含这些内容。")
+                            .size(CAPTION_SIZE)
+                            .color(MUTED),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(quiet_button("取消", 72.0)).clicked() {
+                            self.confirm_export_raw_diagnostics = false;
+                        }
+                        if ui.add(soft_danger_button("仍要包含", 90.0)).clicked() {
+                            self.confirm_export_raw_diagnostics = false;
+                            self.export_diagnostics(true);
+                        }
+                    });
+                });
+        }
         if let Some(index) = self.confirm_remove {
             egui::Window::new("确认移除监控")
                 .collapsible(false)
@@ -1661,6 +1719,92 @@ impl CourseApp {
                 Ok(()) => self.status_line = format!("日志已导出：{}", path.display()),
                 Err(error) => self.status_line = format!("导出失败：{error}"),
             }
+        }
+    }
+
+    fn export_diagnostics(&mut self, include_raw_pages: bool) {
+        let default_name = if include_raw_pages {
+            "Course-snatching-diagnostics-with-pages.json"
+        } else {
+            "Course-snatching-diagnostics.json"
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+        let logs = self
+            .state
+            .logs
+            .lock()
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "time": item.time,
+                    "level": item.level.label(),
+                    "message": redact_diagnostic_text(&item.message),
+                })
+            })
+            .collect::<Vec<_>>();
+        let network = self.state.network_snapshot();
+        let raw_pages = if include_raw_pages {
+            std::fs::read_dir(AppConfig::debug_dir())
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    std::fs::read_to_string(entry.path())
+                        .ok()
+                        .map(|content| (name, content))
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        let base_url = redact_diagnostic_url(&self.cfg.base_url);
+        let document = serde_json::json!({
+            "format": "Course-snatching diagnostic package v1",
+            "version": env!("CARGO_PKG_VERSION"),
+            "system": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
+            "network": {
+                "requests_per_second": network.requests_per_second,
+                "latency_ewma_ms": network.latency_ewma_ms,
+                "total_rate_limits": network.total_rate_limits,
+                "consecutive_errors": network.consecutive_errors,
+                "cooldown_seconds": network.cooldown_remaining.as_secs(),
+                "last_error_kind": network.last_error_kind.map(|kind| format!("{kind:?}")),
+                "circuit_status": format!("{:?}", network.circuit_status),
+            },
+            "configuration": {
+                "base_url": base_url,
+                "account": Self::mask_diagnostic_account(&self.cfg.username),
+                "interval_seconds": self.cfg.interval_seconds,
+                "timeout_seconds": self.cfg.timeout_seconds,
+                "monitor_only": self.cfg.monitor_only,
+                "target_count": self.cfg.watch_serials.len(),
+                "raw_pages_included": include_raw_pages,
+            },
+            "logs": logs,
+            "raw_debug_pages": raw_pages,
+        });
+        match serde_json::to_vec_pretty(&document)
+            .and_then(|body| std::fs::write(&path, body).map_err(serde_json::Error::io))
+        {
+            Ok(()) => self.status_line = format!("诊断包已导出：{}", path.display()),
+            Err(error) => self.status_line = format!("导出诊断包失败：{error}"),
+        }
+    }
+
+    fn mask_diagnostic_account(account: &str) -> String {
+        let chars = account.trim().chars().collect::<Vec<_>>();
+        match chars.len() {
+            0 => String::new(),
+            1 => "*".into(),
+            2 => format!("{}*", chars[0]),
+            _ => format!("{}***{}", chars[0], chars[chars.len() - 1]),
         }
     }
 
@@ -1917,251 +2061,6 @@ impl CourseApp {
             ));
         }
         checks
-    }
-
-    fn maybe_trigger_schedule(&mut self, logged: bool, running: bool, logging_in: bool) {
-        // If a precise arm already started the run, mark the key fired so we don't double-trigger.
-        if running {
-            if let Some(key) = self.schedule_armed_for.take() {
-                self.schedule_fired_for = Some(key);
-            }
-            return;
-        }
-        if !self.cfg.schedule_enabled || !logged || logging_in {
-            worker::cancel_schedule_arm(&self.state);
-            self.schedule_armed_for = None;
-            return;
-        }
-        if self.cfg.cleaned_watch().is_empty() {
-            worker::cancel_schedule_arm(&self.state);
-            self.schedule_armed_for = None;
-            return;
-        }
-        let Some(stamp) = ScheduleStamp::parse(&self.cfg.schedule_time) else {
-            worker::cancel_schedule_arm(&self.state);
-            return;
-        };
-        let Some(target_secs) = stamp.to_local_seconds() else {
-            worker::cancel_schedule_arm(&self.state);
-            return;
-        };
-        let key = stamp.display();
-        if self.schedule_fired_for.as_deref() == Some(key.as_str()) {
-            return;
-        }
-        let now = worker::local_now_seconds();
-        // Missed the window (e.g. app opened long after the target) — mark expired, don't fire.
-        if now > target_secs + 30 {
-            self.schedule_fired_for = Some(key);
-            worker::cancel_schedule_arm(&self.state);
-            return;
-        }
-        if now >= target_secs {
-            self.schedule_fired_for = Some(key.clone());
-            self.schedule_armed_for = None;
-            worker::cancel_schedule_arm(&self.state);
-            self.state
-                .log(LogLevel::Info, format!("定时开抢触发：{key}"));
-            self.status_line = format!("定时开抢已触发（{key}）");
-            self.start_grab();
-            return;
-        }
-        // Precise background arm once per key (avoid re-arming every UI frame).
-        if self.schedule_armed_for.as_deref() != Some(key.as_str()) {
-            self.schedule_armed_for = Some(key.clone());
-            worker::arm_schedule(self.state.clone(), self.cfg.clone(), target_secs);
-            let remain = target_secs - now;
-            self.status_line = format!("定时精准确待命，约 {remain}s 后开抢");
-        }
-    }
-
-    fn show_schedule_editor(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut dirty = false;
-        let mut stamp = ScheduleStamp::parse(&self.cfg.schedule_time).unwrap_or(ScheduleStamp {
-            year: 2026,
-            month: 1,
-            day: 1,
-            hour: 8,
-            minute: 0,
-            second: 0,
-        });
-
-        egui::Frame::NONE
-            .fill(GLASS_SOFT)
-            .stroke(egui::Stroke::new(1.0, LINE))
-            .corner_radius(10.0)
-            .inner_margin(egui::Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(10.0, 8.0);
-                    dirty |= ui
-                        .checkbox(&mut self.cfg.schedule_enabled, "定时开抢")
-                        .changed();
-                    ui.label(
-                        RichText::new("到点自动开始（需已登录且有监控目标）")
-                            .size(CAPTION_SIZE)
-                            .color(MUTED),
-                    );
-                });
-
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("开抢时刻")
-                        .size(META_SIZE)
-                        .strong()
-                        .color(TEXT),
-                );
-                ui.add_space(6.0);
-
-                // Date row: 年 月 日
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                    let mut year = stamp.year as u32;
-                    if number_drag_u32(ui, &mut year, true, 2024..=2035, 0.2, "年", 64.0).changed()
-                    {
-                        stamp.year = year as i32;
-                        dirty = true;
-                    }
-                    if number_drag_u32(ui, &mut stamp.month, true, 1..=12, 0.15, "月", 48.0)
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-                    let max_day = days_in_month(stamp.year, stamp.month).max(1);
-                    if stamp.day > max_day {
-                        stamp.day = max_day;
-                        dirty = true;
-                    }
-                    if number_drag_u32(ui, &mut stamp.day, true, 1..=max_day, 0.15, "日", 48.0)
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-                });
-
-                ui.add_space(6.0);
-                // Time row: 时 分 秒
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                    if number_drag_u32(ui, &mut stamp.hour, true, 0..=23, 0.15, "时", 48.0)
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-                    if number_drag_u32(ui, &mut stamp.minute, true, 0..=59, 0.2, "分", 48.0)
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-                    if number_drag_u32(ui, &mut stamp.second, true, 0..=59, 0.2, "秒", 48.0)
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
-                    if ui.add(quiet_button("设为现在", 88.0)).clicked() {
-                        let (y, m, d, h, mi, s) = worker::now_parts();
-                        stamp = ScheduleStamp {
-                            year: y,
-                            month: m,
-                            day: d,
-                            hour: h,
-                            minute: mi,
-                            second: s,
-                        };
-                        dirty = true;
-                    }
-                    if ui.add(quiet_button("明天 08:00", 96.0)).clicked() {
-                        let (y, m, d, _, _, _) = worker::now_parts();
-                        let mut ny = y;
-                        let mut nm = m;
-                        let mut nd = d + 1;
-                        let max = days_in_month(ny, nm);
-                        if nd > max {
-                            nd = 1;
-                            nm += 1;
-                            if nm > 12 {
-                                nm = 1;
-                                ny += 1;
-                            }
-                        }
-                        stamp = ScheduleStamp {
-                            year: ny,
-                            month: nm,
-                            day: nd,
-                            hour: 8,
-                            minute: 0,
-                            second: 0,
-                        };
-                        dirty = true;
-                    }
-                    ui.label(
-                        RichText::new(format!(
-                            "设定 {}　现在 {}",
-                            stamp.display(),
-                            worker::now_stamp()
-                        ))
-                        .size(CAPTION_SIZE)
-                        .color(MUTED),
-                    );
-                });
-
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("开抢冲刺").size(META_SIZE).color(MUTED));
-                    let mut burst = self.cfg.open_burst_seconds as f64;
-                    if number_drag_f64(ui, &mut burst, true, 0.0..=120.0, 1.0, 0, "秒", 72.0)
-                        .changed()
-                    {
-                        self.cfg.open_burst_seconds = burst.round().clamp(0.0, 120.0) as u32;
-                        dirty = true;
-                    }
-                    ui.label(
-                        RichText::new("开始后前 N 秒去掉轮询正抖动，首轮不等待")
-                            .size(CAPTION_SIZE)
-                            .color(MUTED),
-                    );
-                });
-
-                if self.cfg.schedule_enabled {
-                    ui.add_space(4.0);
-                    if let Some(target) = stamp.to_local_seconds() {
-                        let now = worker::local_now_seconds();
-                        let hint = if now < target {
-                            let wait = target - now;
-                            let h = wait / 3600;
-                            let m = (wait % 3600) / 60;
-                            let s = wait % 60;
-                            format!("距开抢还有 {h:02}:{m:02}:{s:02}")
-                        } else if now <= target + 30 {
-                            "即将触发…".into()
-                        } else {
-                            "该时刻已过，请重新选择".into()
-                        };
-                        ui.label(
-                            RichText::new(hint)
-                                .size(CAPTION_SIZE)
-                                .color(if now < target { BLUE } else { AMBER }),
-                        );
-                    }
-                }
-            });
-
-        if dirty {
-            if let Some(valid) = stamp.validated() {
-                self.cfg.schedule_time = valid.display();
-                // re-arm when user changes the target
-                self.schedule_fired_for = None;
-                self.schedule_armed_for = None;
-                worker::cancel_schedule_arm(&self.state);
-            }
-        }
-        dirty
     }
 
     fn move_watch(&mut self, serial: &str, delta: isize) {

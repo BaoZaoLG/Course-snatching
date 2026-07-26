@@ -1,0 +1,194 @@
+//! Shared HTTP transport, session cookie handling, and request governance.
+
+use super::parse::{
+    extract_login_error, looks_like_login_page, normalize_base, origin_key, parse_retry_after_secs,
+    read_body_limited, summarize_html,
+};
+use super::{
+    backend_error_kind, rate_limit_retry_after, BackendErrorKind, EamsClient, EamsError,
+    ProfileContext, RequestGovernor, RequestPriority, ResponseHandling, MAX_RESPONSE_BYTES, UA,
+};
+use anyhow::Result;
+use parking_lot::Mutex;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::redirect::Policy;
+use reqwest::{Client, RequestBuilder, Url};
+use std::collections::HashMap;
+use std::time::Duration;
+
+impl EamsClient {
+    pub fn new(base_url: &str, timeout_secs: u64, debug_dump_enabled: bool) -> Result<Self> {
+        let base = normalize_base(base_url)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static(UA));
+        let allowed_origin = origin_key(&base);
+        let http = Client::builder()
+            .default_headers(headers)
+            .cookie_store(true)
+            .timeout(Duration::from_secs(timeout_secs.max(5)))
+            .redirect(Policy::custom(move |attempt| {
+                if attempt.previous().len() >= 12 {
+                    return attempt.error("too many redirects");
+                }
+                if origin_key(attempt.url()) == allowed_origin {
+                    attempt.follow()
+                } else {
+                    attempt.error("blocked cross-origin redirect")
+                }
+            }))
+            .build()?;
+        Ok(Self {
+            http,
+            base,
+            debug_dump_enabled,
+            profile_context: Mutex::new(HashMap::<String, ProfileContext>::new()),
+            governor: RequestGovernor::new(),
+        })
+    }
+
+    pub(super) async fn send_raw_text(
+        &self,
+        request: RequestBuilder,
+        action: &str,
+        allow_login_page: bool,
+    ) -> Result<(Url, String)> {
+        self.send_raw_text_with_priority(
+            request,
+            action,
+            ResponseHandling::Standard { allow_login_page },
+            RequestPriority::Session,
+        )
+        .await
+    }
+
+    pub(super) async fn send_raw_text_with_priority(
+        &self,
+        request: RequestBuilder,
+        action: &str,
+        response_handling: ResponseHandling,
+        priority: RequestPriority,
+    ) -> Result<(Url, String)> {
+        let permit = self.governor.acquire(priority).await;
+        let result = async {
+            let response = request.send().await.map_err(|error| EamsError::Network {
+                kind: if error.is_timeout() {
+                    BackendErrorKind::Timeout
+                } else {
+                    BackendErrorKind::Transport
+                },
+                message: format!("{action}失败"),
+            })?;
+            let status = response.status();
+            let final_url = response.url().clone();
+            let retry_after_secs = parse_retry_after_secs(response.headers());
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+            {
+                return Err(EamsError::ResponseTooLarge(MAX_RESPONSE_BYTES / 1024 / 1024).into());
+            }
+            let bytes = read_body_limited(response, MAX_RESPONSE_BYTES)
+                .await
+                .map_err(|error| {
+                    if backend_error_kind(&error) != BackendErrorKind::Unknown {
+                        error.context(format!("读取{action}响应失败"))
+                    } else {
+                        let kind = error
+                            .chain()
+                            .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+                            .map_or(BackendErrorKind::Transport, |cause| {
+                                if cause.is_timeout() {
+                                    BackendErrorKind::Timeout
+                                } else {
+                                    BackendErrorKind::Transport
+                                }
+                            });
+                        anyhow::Error::new(EamsError::Network {
+                            kind,
+                            message: format!("读取{action}响应失败"),
+                        })
+                    }
+                })?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let code = status.as_u16();
+            if code == 429 || (code == 503 && retry_after_secs.is_some()) {
+                let summary = summarize_html(&text);
+                return Err(EamsError::RateLimited {
+                    message: if summary.is_empty() {
+                        format!("HTTP {code}")
+                    } else {
+                        summary
+                    },
+                    retry_after_secs,
+                }
+                .into());
+            }
+            if !status.is_success() {
+                return Err(EamsError::HttpStatus {
+                    status: code,
+                    summary: summarize_html(&text),
+                }
+                .into());
+            }
+            let is_login_page = looks_like_login_page(&final_url, &text);
+            match response_handling {
+                ResponseHandling::LoginSubmission if is_login_page => {
+                    let reason = extract_login_error(&text)
+                        .unwrap_or_else(|| "账号或密码错误，或需要验证码".into());
+                    if ["过快", "太快", "频繁"]
+                        .iter()
+                        .any(|marker| reason.contains(marker))
+                    {
+                        return Err(EamsError::RateLimited {
+                            message: reason,
+                            retry_after_secs,
+                        }
+                        .into());
+                    }
+                    return Err(EamsError::Business { message: reason }.into());
+                }
+                ResponseHandling::Standard {
+                    allow_login_page: false,
+                } if is_login_page => return Err(EamsError::AuthExpired.into()),
+                _ => {}
+            }
+            Ok((final_url, text))
+        }
+        .await;
+        match &result {
+            Ok(_) => self.governor.record_success(&permit),
+            Err(error) => {
+                let _ = self.governor.record_failure(
+                    &permit,
+                    backend_error_kind(error),
+                    rate_limit_retry_after(error),
+                );
+            }
+        }
+        result
+    }
+
+    pub(super) async fn send_text(&self, request: RequestBuilder, action: &str) -> Result<String> {
+        self.send_raw_text(request, action, false)
+            .await
+            .map(|(_, text)| text)
+    }
+
+    pub(super) async fn send_text_with_priority(
+        &self,
+        request: RequestBuilder,
+        action: &str,
+        priority: RequestPriority,
+    ) -> Result<String> {
+        self.send_raw_text_with_priority(
+            request,
+            action,
+            ResponseHandling::Standard {
+                allow_login_page: false,
+            },
+            priority,
+        )
+        .await
+        .map(|(_, text)| text)
+    }
+}
