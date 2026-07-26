@@ -59,6 +59,9 @@ struct RedactedPages {
     unreadable: usize,
 }
 
+/// 单条吐司的展示时长（秒）。
+const TOAST_SECONDS: f64 = 4.5;
+
 /// 密码输入框的固定 Id：登录成功后要按它清掉 egui 侧的输入状态。
 static PASSWORD_FIELD_ID: std::sync::LazyLock<egui::Id> =
     std::sync::LazyLock::new(|| egui::Id::new("login_password_field"));
@@ -211,6 +214,8 @@ pub struct CourseApp {
     log_filter: LogFilter,
     catalog_sort: CatalogSort,
     toast: Option<(f64, String, bool)>,
+    /// 待展示的吐司队列。同一帧里来多条告警时逐条显示，而不是互相覆盖。
+    toast_queue: std::collections::VecDeque<(String, bool)>,
     confirm_logout: bool,
     confirm_clear_logs: bool,
     confirm_remove: Option<usize>,
@@ -271,6 +276,7 @@ impl CourseApp {
             catalog_sort: CatalogSort::Default,
             catalog_view: CatalogView::default(),
             toast: None,
+            toast_queue: std::collections::VecDeque::new(),
             confirm_logout: false,
             confirm_clear_logs: false,
             confirm_remove: None,
@@ -353,17 +359,24 @@ impl eframe::App for CourseApp {
         }));
 
         // Alerts are only queued when notify_enabled was on at dispatch time.
+        //
+        // 排队而不是直接覆盖：一轮里同时抢到两门课时，`self.toast = Some(..)`
+        // 会让前一条在同一帧内被后一条盖掉——用户永远看不到第一条，而那恰恰
+        // 是「抢到了」这种最不该错过的通知。
         for alert in crate::notify::take_alerts() {
-            let t = root_ui.ctx().input(|i| i.time);
-            self.toast = Some((
-                t + 4.5,
-                format!("{}：{}", alert.title, alert.body),
-                alert.success,
-            ));
+            self.toast_queue
+                .push_back((format!("{}：{}", alert.title, alert.body), alert.success));
         }
+        let now_time = root_ui.ctx().input(|i| i.time);
         if let Some((until, _, _)) = self.toast {
-            if root_ui.ctx().input(|i| i.time) > until {
+            if now_time > until {
                 self.toast = None;
+            }
+        }
+        // 当前没有在显示的吐司才取下一条，保证每条都有完整的展示时间。
+        if self.toast.is_none() {
+            if let Some((text, success)) = self.toast_queue.pop_front() {
+                self.toast = Some((now_time + TOAST_SECONDS, text, success));
             }
         }
         let now = root_ui.ctx().input(|i| i.time);
@@ -2024,6 +2037,15 @@ impl CourseApp {
                 "last_error_kind": network.last_error_kind.map(|kind| format!("{kind:?}")),
                 "circuit_status": format!("{:?}", network.circuit_status),
             },
+            // 命中的解析策略是「教务换版」最早的信号，诊断包里必须有它。
+            "parsing": {
+                "catalog_strategy": self
+                    .state
+                    .client
+                    .lock()
+                    .as_ref()
+                    .and_then(|client| client.catalog_strategy_label()),
+            },
             "configuration": {
                 "base_url": base_url,
                 "account": Self::mask_diagnostic_account(&self.cfg.username),
@@ -2578,6 +2600,48 @@ mod tests {
                 });
             });
         });
+    }
+
+    // F-02：一轮里同时抢到两门课时，两条告警会在同一帧到达。直接赋值会让
+    // 第一条被第二条盖掉——而「抢到了」恰恰是最不该错过的通知。
+    #[test]
+    fn queued_alerts_are_shown_one_after_another() {
+        let mut queue: std::collections::VecDeque<(String, bool)> = Default::default();
+        let mut toast: Option<(f64, String, bool)> = None;
+        let mut now = 100.0_f64;
+
+        // 同一帧到达两条。
+        queue.push_back(("抢课成功：甲".into(), true));
+        queue.push_back(("抢课成功：乙".into(), true));
+
+        // 取第一条。
+        if toast.is_none() {
+            if let Some((text, ok)) = queue.pop_front() {
+                toast = Some((now + TOAST_SECONDS, text, ok));
+            }
+        }
+        assert_eq!(toast.as_ref().unwrap().1, "抢课成功：甲");
+        assert_eq!(queue.len(), 1, "the second alert must still be queued");
+
+        // 第一条没过期之前，第二条不许插队。
+        now += TOAST_SECONDS / 2.0;
+        if toast.as_ref().is_some_and(|(until, ..)| now > *until) {
+            toast = None;
+        }
+        assert_eq!(toast.as_ref().unwrap().1, "抢课成功：甲");
+
+        // 到期后才轮到第二条。
+        now += TOAST_SECONDS;
+        if toast.as_ref().is_some_and(|(until, ..)| now > *until) {
+            toast = None;
+        }
+        if toast.is_none() {
+            if let Some((text, ok)) = queue.pop_front() {
+                toast = Some((now + TOAST_SECONDS, text, ok));
+            }
+        }
+        assert_eq!(toast.as_ref().unwrap().1, "抢课成功：乙");
+        assert!(queue.is_empty());
     }
 
     // S-04：密码输入缓冲必须是自动清零的，且要预分配——裸 String 每敲一个

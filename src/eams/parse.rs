@@ -260,6 +260,52 @@ pub(crate) async fn read_body_limited(
     Ok(buf)
 }
 
+/// 解析课程目录时命中的策略。
+///
+/// 记录它是为了「换版预警」：教务系统换版本时，命中的策略几乎必然会先变
+/// （比如从 `from_page` 掉到 `js_like` 再掉到 `json`），而这通常发生在彻底
+/// 解析失败的几天之前。此前没有任何地方记录这条信息，只能等它彻底不能用了
+/// 才发现。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogStrategy {
+    FromPage,
+    JsLike,
+    Json,
+    HtmlTable,
+}
+
+impl CatalogStrategy {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::FromPage => "page",
+            Self::JsLike => "js_like",
+            Self::Json => "json",
+            Self::HtmlTable => "html_table",
+        }
+    }
+}
+
+/// 按既定顺序尝试各解析策略，并把命中的那个报告出来。
+///
+/// 把回退链收在一处，免得两个调用点各写一遍 `or_else` 却只有一处记录命中。
+pub(crate) fn parse_catalog_with_strategy(text: &str) -> Result<(Vec<Lesson>, CatalogStrategy)> {
+    if let Ok(lessons) = parse_lessons_from_page(text) {
+        return Ok((lessons, CatalogStrategy::FromPage));
+    }
+    if let Ok(lessons) = parse_lessons_js_like(text) {
+        return Ok((lessons, CatalogStrategy::JsLike));
+    }
+    if let Ok(lessons) = parse_lessons_json(text) {
+        return Ok((lessons, CatalogStrategy::Json));
+    }
+    // 表格解析返回空表示没匹配上（它不返回 Result）。
+    let lessons = parse_lessons_from_html_table(text);
+    if lessons.is_empty() {
+        bail!("no catalog parser matched");
+    }
+    Ok((lessons, CatalogStrategy::HtmlTable))
+}
+
 /// 从 `Content-Type` 头里取字符集标签。
 fn charset_from_content_type(content_type: Option<&str>) -> Option<&'static encoding_rs::Encoding> {
     let value = content_type?.to_ascii_lowercase();
@@ -1151,6 +1197,35 @@ pub(crate) fn summarize_html(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T-05：命中的解析策略是「教务换版」最早的信号——它通常在彻底解析失败的
+    // 几天之前就先降级。
+    #[test]
+    fn catalog_strategy_reports_which_parser_matched() {
+        let js_like = "var lessonJSONs=[{id:371644,no:'ST.001',name:'甲',teachers:'张',stdCount:1,limitCount:9}];";
+        let (lessons, strategy) = parse_catalog_with_strategy(js_like).unwrap();
+        assert_eq!(lessons.len(), 1);
+        assert!(
+            matches!(
+                strategy,
+                CatalogStrategy::JsLike | CatalogStrategy::FromPage
+            ),
+            "got {strategy:?}"
+        );
+
+        let json = r#"[{"id":"371644","no":"ST.002","name":"乙","teachers":"李","stdCount":1,"limitCount":9}]"#;
+        let (lessons, strategy) = parse_catalog_with_strategy(json).unwrap();
+        assert_eq!(lessons.len(), 1);
+        // 具体哪一级命中不重要（前面的解析器也可能吃下 JSON 数组）——
+        // 重要的是「命中了哪一级」这条信息真的被报告出来了。
+        assert!(
+            !strategy.label().is_empty(),
+            "the winning strategy must be reported"
+        );
+
+        // 一个都不匹配时必须是 Err，而不是「空列表也算成功」。
+        assert!(parse_catalog_with_strategy("<html>什么都没有</html>").is_err());
+    }
 
     // C-01：所有 ']' 都出现在第一个 '[' 之前时，&text[start..=end] 会 panic。
     // 这条路径是可达的（WAF 拦截页、乱序截断的壳页），而 panic 在 spawn_task

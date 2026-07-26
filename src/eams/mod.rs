@@ -73,9 +73,9 @@ pub use types::{
 use crate::eams::parse::{
     classify_elect_response, extract_all_profile_ids, extract_profiles_detailed,
     extract_project_semester, merge_lesson_counts, normalize_base, page_looks_like_elect_ui,
-    parse_lessons_from_html_table, parse_lessons_from_page, parse_lessons_js_like,
-    parse_lessons_json, plausible_profile_id, save_debug_text, score_elect_page,
-    validate_numeric_id, VerifyOutcome,
+    parse_catalog_with_strategy, parse_lessons_from_html_table, parse_lessons_from_page,
+    parse_lessons_js_like, parse_lessons_json, plausible_profile_id, save_debug_text,
+    score_elect_page, validate_numeric_id, VerifyOutcome,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
@@ -107,11 +107,49 @@ pub struct EamsClient {
     pub(super) debug_dump_enabled: bool,
     pub(super) profile_context: Mutex<HashMap<String, ProfileContext>>,
     pub(super) governor: std::sync::Arc<RequestGovernor>,
+    /// 最近一次目录解析命中的策略。
+    catalog_strategy: Mutex<Option<parse::CatalogStrategy>>,
+    /// 待上报的策略变化提示（换版预警）。
+    strategy_changes: Mutex<Vec<String>>,
 }
 
 impl EamsClient {
     pub fn network_snapshot(&self) -> NetworkSnapshot {
         self.governor.snapshot()
+    }
+
+    /// 记录本次目录解析命中的策略，并在它变化时留下一条警告。
+    ///
+    /// 策略降级（page → js_like → json → html_table）几乎必然先于彻底解析
+    /// 失败发生。此前这条信息哪里都不记，只能等它彻底不能用了才发现。
+    fn note_catalog_strategy(&self, strategy: parse::CatalogStrategy) {
+        let mut last = self.catalog_strategy.lock();
+        if *last == Some(strategy) {
+            return;
+        }
+        let previous = last.replace(strategy);
+        if let Some(previous) = previous {
+            self.strategy_changes.lock().push(format!(
+                "课程列表解析策略从 {} 变为 {}——教务系统可能换版了，请留意后续解析失败",
+                previous.label(),
+                strategy.label()
+            ));
+        }
+    }
+
+    /// 取走累积的策略变化提示，交给 worker 写进日志。
+    ///
+    /// 协议层不认识日志系统（那是 worker 的东西），所以用「攒起来让上层取」
+    /// 而不是回调，避免为了一条提示把两层耦合起来。
+    pub fn take_strategy_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *self.strategy_changes.lock())
+    }
+
+    /// 当前命中的解析策略标签，供诊断包如实记录。
+    pub fn catalog_strategy_label(&self) -> Option<&'static str> {
+        self.catalog_strategy
+            .lock()
+            .map(parse::CatalogStrategy::label)
     }
 
     pub fn set_burst_mode(&self, enabled: bool) {
@@ -415,11 +453,13 @@ impl EamsClient {
         };
         // data dump on failure below
 
-        let mut lessons = match parse_lessons_from_page(&data_text)
-            .or_else(|_| parse_lessons_js_like(&data_text))
-            .or_else(|_| parse_lessons_json(&data_text))
-        {
-            Ok(lessons) => lessons,
+        let mut lessons = match parse_catalog_with_strategy(&data_text) {
+            Ok((lessons, strategy)) => {
+                // 命中的策略是「教务换版」最早的信号——通常在彻底解析失败的
+                // 几天之前就会先降级。记下来，别等到完全不能用才发现。
+                self.note_catalog_strategy(strategy);
+                lessons
+            }
             Err(_error) => {
                 self.profile_context.lock().remove(pid);
                 let saved = self.save_debug("lessons_last.html", &data_text).await;

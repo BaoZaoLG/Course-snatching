@@ -63,6 +63,8 @@ impl EamsClient {
             debug_dump_enabled,
             profile_context: Mutex::new(HashMap::<String, ProfileContext>::new()),
             governor,
+            catalog_strategy: Mutex::new(None),
+            strategy_changes: Mutex::new(Vec::new()),
         })
     }
 

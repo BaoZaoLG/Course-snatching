@@ -110,6 +110,10 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                 () = run_cancelled(&state, generation) => break,
                 result = client.fetch_lessons_for_monitoring(&profile) => result,
             };
+            // 换版预警：解析策略降级通常先于彻底解析失败几天发生。
+            for notice in client.take_strategy_notices() {
+                state.log(LogLevel::Warn, notice);
+            }
             let catalog = match fetch_result {
                 Ok((list, complete_refresh)) => {
                     consecutive_refresh_failures = 0;
