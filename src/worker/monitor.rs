@@ -477,11 +477,26 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     Some(&lesson),
                 );
 
+                // 冲刺窗口内跳过二次确认：那两个请求正好花在最需要速度的时刻，
+                // 而它们要回答的问题下一轮目录刷新本来就会回答。
+                let confirm_mode = if tokio::time::Instant::now() < burst_deadline
+                    && burst_secs > 0
+                    && !burst_aborted_by_circuit
+                {
+                    crate::eams::ConfirmMode::Optimistic
+                } else {
+                    crate::eams::ConfirmMode::Verify
+                };
                 // 与刷新一致：提交等待也要能被停止请求穿透。
                 let elect_result = tokio::select! {
                     biased;
                     () = run_cancelled(&state, generation) => break 'run,
-                    result = client.elect_lesson(&profile, &lesson.id, lesson.seat.selected()) => result,
+                    result = client.elect_lesson(
+                        &profile,
+                        &lesson.id,
+                        lesson.seat.selected(),
+                        confirm_mode,
+                    ) => result,
                 };
                 match elect_result {
                     Ok(ElectResult::Success { detail }) => {

@@ -2,6 +2,22 @@
 
 mod backoff;
 pub mod clock;
+
+/// 提交后等服务端状态落定的时间。
+///
+/// 这段等待原先发生在提交闸门内部，等于白白占用最高优先级的独占许可。
+const SUBMISSION_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// 提交成功后是否做二次确认。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmMode {
+    /// 冲刺窗口内：拿到成功响应就返回。确认要花 2 个请求 + 一次等待，
+    /// 而它要回答的问题（真的选上了吗）下一轮目录刷新本来就会回答；
+    /// 误报由「已经选过」强标记在下一轮自然收敛。
+    Optimistic,
+    /// 常规：做二次确认，降低误报。
+    Verify,
+}
 /// 统一退避（decorrelated jitter）。worker 层的兜底退避也用它，避免三处
 /// 各写一份确定性阶梯造成重试雪崩。
 pub fn backoff_for_attempt(attempt: u32) -> std::time::Duration {
@@ -33,6 +49,8 @@ use parking_lot::Mutex;
 use reqwest::header::REFERER;
 use reqwest::{Client, Url};
 use std::collections::HashMap;
+// 生产路径的等待时长都由具名常量表达；Duration 只剩测试在直接构造。
+#[cfg(test)]
 use std::time::Duration;
 
 pub(super) const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 Course-snatching/0.10";
@@ -464,13 +482,20 @@ impl EamsClient {
     }
 
     /// 提交选课；对“成功”响应做轻量二次确认，降低误报。
+    ///
+    /// 闸门只包住那一个 POST。原实现把二次确认也圈在提交闸门（单许可信号量）
+    /// 里，于是一次提交实际占用 3 个 RTT + 50ms，且三个请求全部走最高优先级
+    /// ——目标 A 的「事后确认」会插队挡住目标 B 的真实提交。N=3 时单轮光提交
+    /// 就要 1.1s 以上，而 README 建议冲刺间隔填 0.05–0.15s。也就是说在最需要
+    /// 快的 20 秒里，超过一半的请求预算花在「确认刚才那次是不是真成了」，
+    /// 而这个信息下一轮目录刷新本来就会给出来。
     pub async fn elect_lesson(
         &self,
         profile_id: &str,
         lesson_id: &str,
         prior_selected: Option<u32>,
+        confirm: ConfirmMode,
     ) -> Result<ElectResult> {
-        let _submission_guard = self.governor.enter_submission().await;
         let pid = validate_numeric_id(profile_id, "profileId", true)?;
         let lesson_id = validate_numeric_id(lesson_id, "lessonId", false)?;
         let before_selected = prior_selected;
@@ -487,8 +512,10 @@ impl EamsClient {
         }
         let operator = format!("{lesson_id}:true:0");
         let form = [("optype", "true"), ("operator0", operator.as_str())];
-        let text = self
-            .send_text_with_priority(
+        // 闸门只包住 POST：guard 在这个块结束时就释放，后面的确认不再占用它。
+        let text = {
+            let _submission_guard = self.governor.enter_submission().await;
+            self.send_text_with_priority(
                 self.http
                     .post(url)
                     .header(REFERER, referer.as_str())
@@ -496,8 +523,15 @@ impl EamsClient {
                 "提交选课",
                 RequestPriority::Submission,
             )
-            .await?;
+            .await?
+        };
         let result = classify_elect_response(&text);
+        if confirm == ConfirmMode::Optimistic {
+            // 冲刺窗口内不做确认：确认要花 2 个请求 + 一次等待，正好卡在最需要
+            // 速度的时刻，而它要回答的问题下一轮目录刷新本来就会回答。误报由
+            // 「已经选过」强标记在下一轮自然收敛。
+            return Ok(result);
+        }
         if let ElectResult::Success { detail } = &result {
             match self
                 .verify_elect_success(pid, lesson_id, before_selected, detail)
@@ -539,11 +573,13 @@ impl EamsClient {
         success_detail: &str,
     ) -> Result<VerifyOutcome> {
         // Brief settle time for server-side state.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(SUBMISSION_SETTLE).await;
 
         let data_path = format!("stdElectCourse!data.action?profileId={profile_id}");
+        // 确认走 Refresh 优先级：它不是延迟敏感的，绝不能插队挡住别的目标的
+        // 真实提交（原实现三个请求全走 Submission，rank 0）。
         let data_text = self
-            .get_text_with_priority(&data_path, RequestPriority::Submission)
+            .get_text_with_priority(&data_path, RequestPriority::Refresh)
             .await?;
         // 注意：不能凭“页面不含 lesson_id 子串”就判 Confirmed——HTTP 200 的
         // 异常壳页（如“请求参数非法”）天然不含数字 id。必须先解析出非空
@@ -557,7 +593,7 @@ impl EamsClient {
         }
         let count_path = format!("stdElectCourse!queryStdCount.action?profileId={profile_id}");
         if let Ok(counts) = self
-            .get_text_with_priority(&count_path, RequestPriority::Submission)
+            .get_text_with_priority(&count_path, RequestPriority::Refresh)
             .await
         {
             let _ = merge_lesson_counts(&mut lessons, &counts);
@@ -719,7 +755,7 @@ mod tests {
         let base = serve_many(vec![submit, data, counts]);
         let client = EamsClient::new(&base, 5, false).unwrap();
         let result = test_runtime()
-            .block_on(client.elect_lesson("0", "371644", Some(2)))
+            .block_on(client.elect_lesson("0", "371644", Some(2), ConfirmMode::Verify))
             .unwrap();
         assert!(
             matches!(&result, ElectResult::Busy { detail } if detail.contains("复核")),
@@ -733,7 +769,7 @@ mod tests {
         let base = serve_many(vec!["选课成功", "<html>请求参数非法</html>"]);
         let client = EamsClient::new(&base, 5, false).unwrap();
         let result = test_runtime()
-            .block_on(client.elect_lesson("0", "371644", Some(2)))
+            .block_on(client.elect_lesson("0", "371644", Some(2), ConfirmMode::Verify))
             .unwrap();
         assert!(
             matches!(&result, ElectResult::Success { detail } if detail.contains("暂不确定")),
@@ -748,7 +784,7 @@ mod tests {
         let base = serve_many(vec!["选课成功", others, counts]);
         let client = EamsClient::new(&base, 5, false).unwrap();
         let result = test_runtime()
-            .block_on(client.elect_lesson("0", "371644", Some(2)))
+            .block_on(client.elect_lesson("0", "371644", Some(2), ConfirmMode::Verify))
             .unwrap();
         assert!(
             matches!(&result, ElectResult::Success { detail } if detail.contains("已二次确认")),

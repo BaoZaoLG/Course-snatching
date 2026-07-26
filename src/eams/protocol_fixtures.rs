@@ -202,6 +202,51 @@ fn parser_fixtures_have_golden_results() {
     assert!(body_looks_like_login_page(LOGIN_EXPIRED));
 }
 
+// G-02：冲刺窗口内一次提交只准打一个请求。
+//
+// 原实现一次提交要 3 个 RTT + 50ms，且三个请求全部走最高优先级——目标 A 的
+// 「事后确认」会插队挡住目标 B 的真实提交。N=3 时单轮光提交就超过 1 秒，
+// 而冲刺间隔本该是 0.05–0.15 秒。
+#[test]
+fn optimistic_submission_spends_exactly_one_request() {
+    let server = MockServer::scripted(vec![MockResponse::ok("选课成功")]);
+    let client = server.client();
+    let result = runtime()
+        .block_on(client.elect_lesson("0", "2002", Some(2), crate::eams::ConfirmMode::Optimistic))
+        .expect("submission must succeed");
+    assert!(matches!(result, ElectResult::Success { .. }));
+    let requests = server.requests(1);
+    assert_eq!(requests.len(), 1, "burst submission must not verify");
+    assert!(
+        requests[0].contains("batchOperator"),
+        "the single request must be the submission itself"
+    );
+}
+
+// 常规模式仍然做二次确认——只是不再占着提交闸门做。
+#[test]
+fn verifying_submission_still_confirms_but_outside_the_gate() {
+    let data = "var lessonJSONs=[{id:2003,no:'X.1',name:'其他课',teachers:'王老师',stdCount:1,limitCount:9}];";
+    let server = MockServer::scripted(vec![
+        MockResponse::ok("选课成功"),
+        MockResponse::ok(data),
+        MockResponse::ok("window.lessonId2Counts={'2003':{sc:1,lc:9}}"),
+    ]);
+    let client = server.client();
+    let result = runtime()
+        .block_on(client.elect_lesson("0", "2002", Some(2), crate::eams::ConfirmMode::Verify))
+        .expect("submission must succeed");
+    match result {
+        ElectResult::Success { detail } => {
+            assert!(detail.contains("已二次确认"), "got {detail}");
+        }
+        other => panic!("expected a confirmed success, got {other:?}"),
+    }
+    let requests = server.requests(3);
+    assert!(requests[0].contains("batchOperator"));
+    assert!(requests[1].contains("data.action"));
+}
+
 #[test]
 fn every_fixture_prefix_is_panic_free() {
     for (name, source) in [
@@ -319,7 +364,7 @@ fn mock_server_covers_rate_limit_oversized_count_failure_and_submit_confirmation
     ]);
     let client = submitted.client();
     let result = runtime()
-        .block_on(client.elect_lesson("0", "2002", Some(2)))
+        .block_on(client.elect_lesson("0", "2002", Some(2), crate::eams::ConfirmMode::Verify))
         .unwrap();
     assert!(matches!(result, ElectResult::Success { detail } if detail.contains("已二次确认")));
     let submit_requests = submitted.requests(3).join("\n");
