@@ -238,6 +238,8 @@ pub struct CourseApp {
     toast: Option<(f64, String, bool)>,
     /// 待展示的吐司队列。同一帧里来多条告警时逐条显示，而不是互相覆盖。
     toast_queue: std::collections::VecDeque<(String, bool)>,
+    /// 待确认的退课目标（lesson_id）。退课不可逆，必须二次确认。
+    confirm_drop: Option<String>,
     /// 验证码输入框内容；提交时取走交给 LoginRequest。
     captcha_input: Option<String>,
     /// 验证码输入框的实时内容。
@@ -305,6 +307,7 @@ impl CourseApp {
             catalog_view: CatalogView::default(),
             toast: None,
             toast_queue: std::collections::VecDeque::new(),
+            confirm_drop: None,
             captcha_input: None,
             captcha_text: String::new(),
             captcha_texture: None,
@@ -893,6 +896,8 @@ impl CourseApp {
                             );
                         });
 
+                        ui.add_space(10.0);
+                        self.show_elected_panel(ui, running);
                         ui.add_space(10.0);
                         self.show_network_diagnostics(ui);
 
@@ -1891,6 +1896,50 @@ impl CourseApp {
                     });
                 });
         }
+        // F-05：退课不可逆——名额立刻放给别人，且未必抢得回来。
+        if let Some(lesson_id) = self.confirm_drop.clone() {
+            let course = self
+                .state
+                .elected
+                .lock()
+                .iter()
+                .find(|lesson| lesson.id == lesson_id)
+                .map(|lesson| format!("{} · {}", lesson.no, lesson.name))
+                .unwrap_or_else(|| lesson_id.clone());
+            egui::Window::new("确认退课")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(root_ui.ctx(), |ui| {
+                    ui.set_min_width(400.0);
+                    ui.label(
+                        RichText::new(format!("即将退掉：{course}"))
+                            .size(BODY_SIZE)
+                            .color(pal().text),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "退课不可逆：名额会立刻放给别人，未必还能抢回来。请确认这不是你要保留的课。",
+                        )
+                        .size(CAPTION_SIZE)
+                        .color(pal().red),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(quiet_button("取消", 72.0)).clicked() {
+                            self.confirm_drop = None;
+                        }
+                        if ui.add(soft_danger_button("确认退课", 96.0)).clicked() {
+                            self.confirm_drop = None;
+                            worker::drop_lesson(
+                                self.state.clone(),
+                                self.cfg.profile_id.clone(),
+                                lesson_id.clone(),
+                            );
+                        }
+                    });
+                });
+        }
         // F-01：教务在连续登录失败若干次后强制上验证码。此前没有任何获取或
         // 提交验证码的路径，一旦触发工具就永久卡死——而 login() 最多重试 4 次，
         // 恰好容易把学校推到这个阈值上。不做 OCR，一次性手填即可。
@@ -2348,6 +2397,97 @@ impl CourseApp {
 
     fn status_is_error(&self) -> bool {
         self.status.showing_error()
+    }
+
+    /// 「我的已选课程」面板。
+    ///
+    /// F-04：此前完全没有这个视图——用户无从知道自己到底选上了什么，
+    /// 「抢到了才发现和已有课冲突」是高频痛点。
+    /// F-05：退课入口也在这里，且只在这里（不可逆操作不该有自动化路径）。
+    fn show_elected_panel(&mut self, ui: &mut egui::Ui, running: bool) {
+        let elected = self.state.elected.lock().clone();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("我的已选课程")
+                    .size(BODY_SIZE)
+                    .strong()
+                    .color(pal().text),
+            );
+            ui.add_space(8.0);
+            if ui.add(quiet_button("刷新已选", 88.0)).clicked() {
+                worker::refresh_elected(self.state.clone(), self.cfg.profile_id.clone());
+            }
+            ui.label(
+                RichText::new(
+                    "不同教务版本的接口差异很大：探测每次登录最多做一次，失败也会记住，不会反复打请求。",
+                )
+                .size(CAPTION_SIZE)
+                .color(pal().muted),
+            );
+        });
+        ui.add_space(6.0);
+
+        if elected.is_empty() {
+            ui.label(
+                RichText::new("尚未获取。点击「刷新已选」拉取。")
+                    .size(CAPTION_SIZE)
+                    .color(pal().muted),
+            );
+            return;
+        }
+
+        // 冲突检测：与监控目标比对课程名。没有时间字段的教务版本上，
+        // 这至少能挡住「同一门课的不同教学班」和重复选课。
+        let watched: HashSet<String> = self.cfg.watch_serials.iter().cloned().collect();
+        let mut drop_request: Option<String> = None;
+        for lesson in &elected {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} · {}", lesson.no, lesson.name))
+                        .size(META_SIZE)
+                        .color(pal().text),
+                );
+                if !lesson.teachers.is_empty() {
+                    ui.label(
+                        RichText::new(&lesson.teachers)
+                            .size(CAPTION_SIZE)
+                            .color(pal().muted),
+                    );
+                }
+                // 已选中的课还挂在监控里 = 白打请求，值得提醒。
+                if watched.contains(&lesson.no) {
+                    ui.label(
+                        RichText::new("已在监控列表中（可移除）")
+                            .size(CAPTION_SIZE)
+                            .color(pal().amber),
+                    );
+                }
+                // 与另一门已选课重名：多半是同一门课的不同教学班。
+                let same_name = elected
+                    .iter()
+                    .filter(|other| other.name == lesson.name && other.id != lesson.id)
+                    .count();
+                if same_name > 0 {
+                    ui.label(
+                        RichText::new("与另一已选课程同名，请确认是否重复")
+                            .size(CAPTION_SIZE)
+                            .color(pal().red),
+                    );
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!running, soft_danger_button("退课", 72.0))
+                        .on_hover_text("退课不可逆：名额会立刻放给别人")
+                        .clicked()
+                    {
+                        drop_request = Some(lesson.id.clone());
+                    }
+                });
+            });
+        }
+        if let Some(lesson_id) = drop_request {
+            self.confirm_drop = Some(lesson_id);
+        }
     }
 
     /// 键盘快捷键。

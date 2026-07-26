@@ -228,6 +228,55 @@ fn a_third_party_drop_does_not_reject_our_own_success() {
     server.requests(3);
 }
 
+// F-05：退课复用选课的 batchOperator 端点，只是 optype=false——不引入任何
+// 新的端点猜测，也仍然过提交闸门与令牌桶。
+#[test]
+fn dropping_a_course_uses_the_same_endpoint_with_optype_false() {
+    let server = MockServer::scripted(vec![MockResponse::ok("退课成功")]);
+    let client = server.client();
+    let result = runtime()
+        .block_on(client.drop_lesson("0", "2002"))
+        .expect("drop must complete");
+    assert!(matches!(result, ElectResult::Success { .. }));
+
+    let request = server.requests(1).join("\n");
+    assert!(request.contains("batchOperator.action"), "{request}");
+    assert!(request.contains("optype=false"), "{request}");
+    // operator0 的第二段是「是否选中」，退课必须是 false。
+    assert!(
+        request.contains("2002%3Afalse%3A0") || request.contains("2002:false:0"),
+        "{request}"
+    );
+}
+
+// F-04：端点探测每会话最多一次，失败也记住——绝不能形成
+// 「失败 → 重新探测 → 压力更大」的正反馈环（档案 A-04）。
+#[test]
+fn elected_endpoint_probe_never_repeats_after_failing() {
+    // 全部候选都返回无法解析的内容。
+    let server = MockServer::scripted(vec![
+        MockResponse::ok("<html>nope</html>"),
+        MockResponse::ok("<html>nope</html>"),
+        MockResponse::ok("<html>nope</html>"),
+        MockResponse::ok("<html>nope</html>"),
+        MockResponse::ok("<html>nope</html>"),
+    ]);
+    let client = server.client();
+    let runtime = runtime();
+    assert!(runtime.block_on(client.fetch_elected_lessons("0")).is_err());
+    let after_probe = server.requests(4).len();
+    assert_eq!(after_probe, 4, "the probe should try each candidate once");
+
+    // 第二次调用必须一个请求都不打。
+    let error = runtime
+        .block_on(client.fetch_elected_lessons("0"))
+        .expect_err("must stay failed");
+    assert!(
+        format!("{error:#}").contains("不再重试"),
+        "the refusal must explain itself, got {error:#}"
+    );
+}
+
 // G-02：冲刺窗口内一次提交只准打一个请求。
 //
 // 原实现一次提交要 3 个 RTT + 50ms，且三个请求全部走最高优先级——目标 A 的

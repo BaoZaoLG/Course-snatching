@@ -65,6 +65,7 @@ impl EamsClient {
             governor,
             catalog_strategy: Mutex::new(None),
             strategy_changes: Mutex::new(Vec::new()),
+            elected_endpoint: Mutex::new(None),
         })
     }
 

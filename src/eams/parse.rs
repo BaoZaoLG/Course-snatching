@@ -40,7 +40,9 @@ fn is_hard_reject_text(text: &str) -> bool {
 /// 查看」这类常见文案含「稍后」，先判繁忙会把成功当成可重试，目标留在
 /// pending 里重复提交。
 fn has_strong_success_text(text: &str) -> bool {
-    ["已经选过", "已选过", "选课成功", "操作成功"]
+    // 「退课成功」在这里是因为退课复用同一个 batchOperator 端点与同一个
+    // 分类器（F-05）；它不可能出现在选课失败的响应里，加进来是安全的。
+    ["已经选过", "已选过", "选课成功", "操作成功", "退课成功"]
         .iter()
         .any(|marker| text.contains(marker))
 }

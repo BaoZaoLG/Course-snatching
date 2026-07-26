@@ -335,6 +335,94 @@ pub fn keepalive(state: Arc<SharedState>, notify_enabled: bool, sound_enabled: b
     });
 }
 
+/// 手动刷新「我的已选课程」。
+///
+/// 只由界面按钮触发。端点探测每会话最多一次且失败也记住（见
+/// `EamsClient::fetch_elected_lessons`），所以它既不会进抢课主循环，
+/// 也不会因为反复点击造成请求放大。
+pub fn refresh_elected(state: Arc<SharedState>, profile_preference: String) {
+    let client = state.client.lock().clone();
+    let profile = if profile_preference.trim().is_empty() {
+        state.profile_id.lock().clone()
+    } else {
+        profile_preference.trim().to_string()
+    };
+    let Some(client) = client else {
+        state.log(LogLevel::Warn, "请先登录");
+        state.set_message("请先登录");
+        return;
+    };
+    let session = state.session_token();
+    spawn_task(async move {
+        let result = client.fetch_elected_lessons(&profile).await;
+        if !state.is_current_session(session) {
+            return;
+        }
+        match result {
+            Ok(list) => {
+                let count = list.len();
+                *state.elected.lock() = list;
+                state.log(LogLevel::Success, format!("已选课程 {count} 门"));
+                state.set_message(format!("已选课程 {count} 门"));
+            }
+            Err(error) => {
+                if is_auth_error(&error) {
+                    state.clear_session("登录失效，请重新登录");
+                }
+                state.log(LogLevel::Warn, format!("获取已选课程失败：{error:#}"));
+            }
+        }
+    });
+}
+
+/// 退课。
+///
+/// 只由用户在已选课程列表里显式点击触发——退课不可逆，名额立刻放给别人，
+/// 不该有任何自动化路径。
+pub fn drop_lesson(state: Arc<SharedState>, profile_preference: String, lesson_id: String) {
+    let client = state.client.lock().clone();
+    let profile = if profile_preference.trim().is_empty() {
+        state.profile_id.lock().clone()
+    } else {
+        profile_preference.trim().to_string()
+    };
+    let Some(client) = client else {
+        state.log(LogLevel::Warn, "请先登录");
+        return;
+    };
+    if state.running.load(Ordering::Acquire) {
+        state.log(LogLevel::Warn, "抢课运行期间不允许退课");
+        state.set_message("抢课运行期间不允许退课");
+        return;
+    }
+    let session = state.session_token();
+    spawn_task(async move {
+        let result = client.drop_lesson(&profile, &lesson_id).await;
+        if !state.is_current_session(session) {
+            return;
+        }
+        match result {
+            Ok(crate::eams::ElectResult::Success { detail }) => {
+                state.log(LogLevel::Success, format!("退课成功：{detail}"));
+                state.set_message("退课成功");
+                // 退完立刻刷新已选列表，别让界面停在旧状态。
+                refresh_elected(state.clone(), profile);
+            }
+            Ok(other) => {
+                let detail = format!("{other:?}");
+                state.log(LogLevel::Warn, format!("退课未成功：{detail}"));
+                state.set_message("退课未成功");
+            }
+            Err(error) => {
+                if is_auth_error(&error) {
+                    state.clear_session("登录失效，请重新登录");
+                }
+                state.log(LogLevel::Error, format!("退课失败：{error:#}"));
+            }
+        }
+    });
+}
+
 pub fn logout(state: &SharedState) {
     state.running.store(false, Ordering::Release);
     state.stopping.store(false, Ordering::Release);

@@ -102,6 +102,8 @@ pub struct SharedState {
     pub(crate) credentials: Mutex<Option<super::session::SessionCredentials>>,
     /// 界面唤醒回调：状态一变就叫醒 UI，取代固定频率的无条件重绘。
     repaint_waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// 「我的已选课程」。只在用户手动刷新时填充，永不进抢课主循环。
+    pub elected: Mutex<Vec<Lesson>>,
     /// 待用户输入的验证码：图片字节。多数 EAMS 在连续登录失败若干次后强制
     /// 上验证码，此前工具在这种情况下会永久卡死。
     pub(crate) pending_captcha: Mutex<Option<Vec<u8>>>,
@@ -131,6 +133,7 @@ impl SharedState {
             latest_config: Mutex::new(None),
             credentials: Mutex::new(None),
             repaint_waker: Mutex::new(None),
+            elected: Mutex::new(Vec::new()),
             pending_captcha: Mutex::new(None),
             logs: Mutex::new(VecDeque::new()),
             lessons: Mutex::new(Vec::new()),

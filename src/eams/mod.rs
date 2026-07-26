@@ -111,6 +111,12 @@ pub struct EamsClient {
     catalog_strategy: Mutex<Option<parse::CatalogStrategy>>,
     /// 待上报的策略变化提示（换版预警）。
     strategy_changes: Mutex<Vec<String>>,
+    /// 「已选课程」端点的探测结果。
+    ///
+    /// `None` = 尚未探测；`Some(None)` = 探测过且都不行（本会话不再重试）；
+    /// `Some(Some(path))` = 命中的那个。三态就是为了让「失败」也被记住——
+    /// 否则每次点击都会把候选表重打一遍。
+    elected_endpoint: Mutex<Option<Option<String>>>,
 }
 
 impl EamsClient {
@@ -143,6 +149,117 @@ impl EamsClient {
     /// 而不是回调，避免为了一条提示把两层耦合起来。
     pub fn take_strategy_notices(&self) -> Vec<String> {
         std::mem::take(&mut *self.strategy_changes.lock())
+    }
+
+    /// 拉取「我的已选课程」。
+    ///
+    /// 端点在不同教务版本里差异很大，所以这里的探测受三条硬约束——档案 A-04
+    /// 指出的「解析失败清缓存 → 下一轮重新探测 → 压力更大」正反馈环，绝不能
+    /// 在这里复现：
+    ///
+    /// 1. **只由用户手动触发**，永远不进抢课主循环；
+    /// 2. **每个会话最多探测一次**，命中哪个端点会被记住；
+    /// 3. **失败也记住**，不会每次点击都把候选表重打一遍。
+    pub async fn fetch_elected_lessons(&self, profile_id: &str) -> Result<Vec<Lesson>> {
+        let pid = validate_numeric_id(profile_id, "profileId", true)?;
+
+        // 先把探测结果复制出来：parking_lot 的 guard 不能跨 await 持有
+        // （`if let` 的 scrutinee 临时值会活到整个块结束）。
+        let cached = self.elected_endpoint.lock().clone();
+        // 已知失败：直接说清楚，不再打任何请求。
+        if matches!(cached, Some(None)) {
+            bail!("本教务系统未找到可用的「已选课程」接口（本次会话不再重试）");
+        }
+        // 已知可用：只打那一个。
+        if let Some(Some(path)) = cached {
+            let text = self
+                .get_text_with_priority(&path, RequestPriority::Refresh)
+                .await?;
+            return parse_catalog_with_strategy(&text)
+                .map(|(lessons, _)| lessons)
+                .context("已选课程列表解析失败");
+        }
+
+        // 首次：按候选表探测一轮，然后把结果（成功或失败）记死。
+        const CANDIDATES: [&str; 4] = [
+            "stdElectCourse!queryStdCount.action",
+            "stdElectCourse!defaultPage.action",
+            "stdElectCourse!innerIndex.action",
+            "stdElectCourse.action",
+        ];
+        let mut last_error: Option<anyhow::Error> = None;
+        for candidate in CANDIDATES {
+            let path = if pid == "0" {
+                candidate.to_string()
+            } else {
+                format!("{candidate}?profileId={pid}")
+            };
+            match self
+                .get_text_with_priority(&path, RequestPriority::Refresh)
+                .await
+            {
+                Ok(text) => {
+                    if let Ok((lessons, _)) = parse_catalog_with_strategy(&text) {
+                        if !lessons.is_empty() {
+                            *self.elected_endpoint.lock() = Some(Some(path));
+                            return Ok(lessons);
+                        }
+                    }
+                }
+                Err(error) => {
+                    // 登录失效要立刻上报，不要被当成「这个端点不行」继续试。
+                    if is_auth_error(&error) {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        // 记住失败，之后不再探测。
+        *self.elected_endpoint.lock() = Some(None);
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!("本教务系统未找到可用的「已选课程」接口（本次会话不再重试）")
+        }))
+    }
+
+    /// 退课。
+    ///
+    /// 与选课走同一个 `batchOperator` 端点，只是 `optype=false`——也就是说
+    /// 它不引入任何新的端点猜测。仍然过提交闸门与令牌桶：退课同样是写操作，
+    /// 没有理由绕开治理。
+    ///
+    /// 故意**不**做自动化：退课是不可逆的（名额立刻放给别人），只由用户在
+    /// 已选课程列表里显式点击触发。
+    pub async fn drop_lesson(&self, profile_id: &str, lesson_id: &str) -> Result<ElectResult> {
+        let pid = validate_numeric_id(profile_id, "profileId", true)?;
+        let lesson_id = validate_numeric_id(lesson_id, "lessonId", false)?;
+
+        let mut url = self.url("stdElectCourse!batchOperator.action")?;
+        if pid != "0" {
+            url.query_pairs_mut().append_pair("profileId", pid);
+        }
+        let mut referer = self.url("stdElectCourse!defaultPage.action")?;
+        if pid != "0" {
+            referer
+                .query_pairs_mut()
+                .append_pair("electionProfile.id", pid);
+        }
+        // operator0 的第二段是「是否选中」：退课就是 false。
+        let operator = format!("{lesson_id}:false:0");
+        let form = [("optype", "false"), ("operator0", operator.as_str())];
+        let text = {
+            let _guard = self.governor.enter_submission().await;
+            self.send_text_with_priority(
+                self.http
+                    .post(url)
+                    .header(REFERER, referer.as_str())
+                    .form(&form),
+                "退课",
+                RequestPriority::Submission,
+            )
+            .await?
+        };
+        Ok(classify_elect_response(&text))
     }
 
     /// 当前命中的解析策略标签，供诊断包如实记录。
