@@ -296,6 +296,9 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     b_open.cmp(&a_open)
                 });
             }
+            // 检测段只判断「该不该提交」，把要提交的目标攒起来；
+            // 提交段在循环之后统一并发发出。
+            let mut ready: Vec<(String, Lesson)> = Vec::new();
             for serial in serials {
                 if !state.is_current_run(generation) {
                     break;
@@ -477,27 +480,57 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     Some(&lesson),
                 );
 
-                // 冲刺窗口内跳过二次确认：那两个请求正好花在最需要速度的时刻，
-                // 而它们要回答的问题下一轮目录刷新本来就会回答。
-                let confirm_mode = if tokio::time::Instant::now() < burst_deadline
-                    && burst_secs > 0
-                    && !burst_aborted_by_circuit
-                {
-                    crate::eams::ConfirmMode::Optimistic
-                } else {
-                    crate::eams::ConfirmMode::Verify
-                };
-                // 与刷新一致：提交等待也要能被停止请求穿透。
-                let elect_result = tokio::select! {
+                ready.push((serial.clone(), lesson));
+            }
+
+            // ── 提交段：检测与提交解耦，有界并发 ──────────────────────
+            //
+            // 原实现一轮里 N 个目标严格顺序提交，且底层闸门是单许可信号量——
+            // 即使上层改成并发也会被重新串行化。教务高峰 RTT 常在 300–800ms，
+            // 第 5 个目标的 POST 要晚 1.5–4 秒才发出，而抢课是零和的先到先得，
+            // 这个延迟直接决定成败。
+            //
+            // 并发度由 governor 的 submission_gate 决定（默认 3），令牌桶与
+            // 熔断在其下兜底：放开的是「同时在途的提交数」，不是速率上限。
+            // 结果按原优先级顺序回放，保证日志与看板的顺序仍然可预期。
+            let confirm_mode = if tokio::time::Instant::now() < burst_deadline
+                && burst_secs > 0
+                && !burst_aborted_by_circuit
+            {
+                crate::eams::ConfirmMode::Optimistic
+            } else {
+                crate::eams::ConfirmMode::Verify
+            };
+            let mut submitted: Vec<(String, Lesson, anyhow::Result<ElectResult>)> = Vec::new();
+            if !ready.is_empty() {
+                let mut set = tokio::task::JoinSet::new();
+                for (index, (serial, lesson)) in ready.into_iter().enumerate() {
+                    let client = client.clone();
+                    let profile = profile.clone();
+                    set.spawn(async move {
+                        let result = client
+                            .elect_lesson(
+                                &profile,
+                                &lesson.id,
+                                lesson.seat.selected(),
+                                confirm_mode,
+                            )
+                            .await;
+                        (index, serial, lesson, result)
+                    });
+                }
+                // 停止请求必须能穿透整批在途提交，而不是等它们各自跑完。
+                submitted = tokio::select! {
                     biased;
-                    () = run_cancelled(&state, generation) => break 'run,
-                    result = client.elect_lesson(
-                        &profile,
-                        &lesson.id,
-                        lesson.seat.selected(),
-                        confirm_mode,
-                    ) => result,
+                    () = run_cancelled(&state, generation) => {
+                        set.abort_all();
+                        break 'run;
+                    }
+                    collected = collect_submissions(&mut set) => collected,
                 };
+            }
+
+            for (serial, lesson, elect_result) in submitted {
                 match elect_result {
                     Ok(ElectResult::Success { detail }) => {
                         consecutive_submission_errors = 0;
@@ -893,6 +926,28 @@ fn worker_error_kind(reported: BackendErrorKind, message: &str) -> BackendErrorK
     }
 }
 
+/// 收齐一轮的并发提交结果，并按原优先级顺序回放。
+///
+/// 顺序很重要：日志、看板与「连续失败计数」都按目标优先级读起来才可预期，
+/// 不该因为哪个请求先回来而变。
+async fn collect_submissions(
+    set: &mut tokio::task::JoinSet<(usize, String, Lesson, anyhow::Result<ElectResult>)>,
+) -> Vec<(String, Lesson, anyhow::Result<ElectResult>)> {
+    let mut collected = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        // JoinError 只可能来自取消或提交任务自身 panic：前者由 select! 处理，
+        // 后者不该让整轮结果一起丢掉。
+        if let Ok(item) = joined {
+            collected.push(item);
+        }
+    }
+    collected.sort_by_key(|(index, ..)| *index);
+    collected
+        .into_iter()
+        .map(|(_, serial, lesson, result)| (serial, lesson, result))
+        .collect()
+}
+
 fn is_network_error(kind: BackendErrorKind) -> bool {
     matches!(
         kind,
@@ -985,6 +1040,54 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
+
+    // G-03：多目标必须并发提交，而不是一个等一个。
+    //
+    // 顺便补上档案指出的覆盖缺口——此前所有用例的 watch_serials 都只有一个
+    // 序号，多目标场景零覆盖。这里两个目标都有余量，两次提交都应成功，且
+    // 结果按原优先级顺序回放。
+    #[test]
+    fn multiple_ready_targets_are_submitted_and_all_succeed() {
+        let data = "var lessonJSONs=[\
+            {id:371644,no:'MT.001',name:'甲',teachers:'张老师',stdCount:1,limitCount:9},\
+            {id:371645,no:'MT.002',name:'乙',teachers:'李老师',stdCount:2,limitCount:9}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:1,lc:9},'371645':{sc:2,lc:9}}";
+        let base = serve_sequence(vec![
+            "<html>elect page</html>",
+            data,
+            counts,
+            // 两个目标的提交并发发出，响应内容相同，顺序无关。
+            "选课成功",
+            "选课成功",
+        ]);
+        let state = prepared_state(&base);
+        let cfg = AppConfig {
+            base_url: base.clone(),
+            profile_id: "0".into(),
+            watch_serials: vec!["MT.001".into(), "MT.002".into()],
+            interval_seconds: 0.5,
+            timeout_seconds: 5,
+            max_consecutive_errors: 2,
+            ..Default::default()
+        };
+        start_grab(state.clone(), cfg);
+        wait_until_stopped(&state);
+
+        let watch = state.watch.lock().clone();
+        assert_eq!(watch.len(), 2, "both targets must be tracked: {watch:?}");
+        for row in &watch {
+            assert_eq!(
+                row.state,
+                WatchState::Success,
+                "every ready target must be submitted: {watch:?}"
+            );
+        }
+        let logs = log_messages(&state);
+        assert!(
+            logs.iter().any(|m| m.contains("全部目标完成")),
+            "run must finish cleanly, got {logs:?}"
+        );
+    }
 
     #[test]
     fn poll_delay_is_bounded() {

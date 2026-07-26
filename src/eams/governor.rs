@@ -6,6 +6,22 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
+/// 同时在途的选课提交数上限。
+///
+/// 单许可（原值）虽然过于保守，但它确实是当时唯一防止提交风暴的机制，
+/// 所以放开时必须明确：这里放开的是「同时在途的提交数」，速率上限仍由
+/// 令牌桶承担，熔断与 hard cooldown 在其下不可绕过（见 governor 的三条
+/// 并发不变式测试）。取 3 是因为教务高峰 RTT 常在 300–800ms，3 路并发
+/// 已能把「第 5 个目标晚 1.5–4 秒才发出」压到亚秒级，再高只是徒增被风控
+/// 识别的概率。
+const SUBMISSION_CONCURRENCY: usize = 3;
+
+// 退回单许可等于把 G-03 的并发提交整个作废，编译期就挡住。
+const _: () = assert!(
+    SUBMISSION_CONCURRENCY > 1,
+    "serial submission is the bug G-03 fixed"
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestPriority {
     Submission,
@@ -198,7 +214,7 @@ impl RequestGovernor {
             policy,
             notify: Notify::new(),
             refresh_gate: Arc::new(Semaphore::new(1)),
-            submission_gate: Arc::new(Semaphore::new(1)),
+            submission_gate: Arc::new(Semaphore::new(SUBMISSION_CONCURRENCY)),
         }
     }
 
@@ -966,11 +982,18 @@ mod tests {
     }
 
     #[test]
+    // 刷新闸门仍是独占的（一次全量刷新不该和另一次重叠）；提交闸门放宽到
+    // SUBMISSION_CONCURRENCY——放开的是「同时在途的提交数」，速率上限仍由
+    // 令牌桶承担。两个闸门相互独立。
     fn refresh_and_submission_gates_are_independent_but_each_is_exclusive() {
         runtime().block_on(async {
             let governor = Arc::new(RequestGovernor::with_policy(test_policy()));
             let refresh = governor.enter_refresh().await;
-            let submission = governor.enter_submission().await;
+            // 占满提交闸门的全部许可。
+            let mut submissions = Vec::new();
+            for _ in 0..SUBMISSION_CONCURRENCY {
+                submissions.push(governor.enter_submission().await);
+            }
 
             let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel(1);
             let refresh_governor = governor.clone();
@@ -987,16 +1010,41 @@ mod tests {
 
             tokio::time::sleep(Duration::from_millis(5)).await;
             assert!(refresh_rx.try_recv().is_err());
-            assert!(submission_rx.try_recv().is_err());
+            assert!(
+                submission_rx.try_recv().is_err(),
+                "the {SUBMISSION_CONCURRENCY}th+1 submission must still queue"
+            );
 
-            // Releasing a refresh must not release a waiting submission. The two
-            // single-permit gates can therefore protect one full refresh and one
-            // complete submission at the same time.
+            // 释放刷新许可不得连带放行排队中的提交：两个闸门是独立的。
             drop(refresh);
             refresh_rx.recv().await.unwrap();
             assert!(submission_rx.try_recv().is_err());
-            drop(submission);
+            drop(submissions.pop());
             submission_rx.recv().await.unwrap();
+        });
+    }
+
+    // G-03 的边界：提交并发度必须恰好是 SUBMISSION_CONCURRENCY，
+    // 既不该退回单许可（那样并发提交等于没做），也不该无上限。
+    #[test]
+    fn submission_gate_admits_exactly_the_configured_concurrency() {
+        runtime().block_on(async {
+            let governor = Arc::new(RequestGovernor::with_policy(test_policy()));
+            let mut held = Vec::new();
+            for index in 0..SUBMISSION_CONCURRENCY {
+                let permit =
+                    tokio::time::timeout(Duration::from_millis(200), governor.enter_submission())
+                        .await;
+                assert!(
+                    permit.is_ok(),
+                    "submission #{index} should not have queued behind the others"
+                );
+                held.push(permit.unwrap());
+            }
+            // 再多一个必须排队。
+            let extra =
+                tokio::time::timeout(Duration::from_millis(80), governor.enter_submission()).await;
+            assert!(extra.is_err(), "submission concurrency must stay bounded");
         });
     }
 
