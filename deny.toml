@@ -22,10 +22,12 @@ yanked = "deny"
 unmaintained = "workspace"
 
 [licenses]
+# 只列依赖图里真实出现的许可证。cargo-deny 会对「允许了但没用上」的条目
+# 发警告——留着无用条目等于把白名单变成许愿单，将来真出现新许可证时也就
+# 没人会去看它。
 allow = [
     "MIT",
     "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
@@ -34,7 +36,11 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "BSL-1.0",
-    "OpenSSL",
+    # epaint_default_fonts 打包的内置字体：
+    #   (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0
+    # 两者都是标准的开源字体许可证，允许随软件分发。
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 confidence-threshold = 0.9
 
