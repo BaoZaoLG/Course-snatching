@@ -328,6 +328,59 @@ pub(crate) fn outline_toggle(ui: &mut egui::Ui, on: &mut bool, text: &str) {
     }
 }
 
+/// 无边框的次要按钮。
+///
+/// 这个形状此前在 app/mod.rs 里被内联写了四遍（清空/导出/诊断包/含原始页面），
+/// 而 theme 里已经有 quiet_button 与 soft_danger_button，独缺它。
+pub(crate) fn ghost_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(text).size(META_SIZE).color(pal().muted))
+        .fill(Color32::TRANSPARENT)
+        .stroke(egui::Stroke::NONE)
+        .corner_radius(8.0)
+        .min_size(Vec2::new(0.0, CONTROL_H))
+}
+
+/// 统一的二次确认对话框。
+///
+/// 界面里有五处几乎逐字重复的确认框（退出登录、清空日志、移除监控、开抢、
+/// 导出原始页面）。抽出来之后，「危险操作必须二次确认」这条规则有了唯一的
+/// 实现，新增确认框也不必再复制一遍布局。
+///
+/// 返回 `Some(true)` 表示用户确认，`Some(false)` 表示取消，`None` 表示还在等。
+pub(crate) fn confirm_dialog(
+    ctx: &egui::Context,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui),
+    confirm_label: &str,
+    danger: bool,
+) -> Option<bool> {
+    let mut outcome = None;
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_min_width(400.0);
+            body(ui);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add(quiet_button("取消", 72.0)).clicked() {
+                    outcome = Some(false);
+                }
+                let confirmed = if danger {
+                    ui.add(soft_danger_button(confirm_label, 96.0)).clicked()
+                } else {
+                    ui.add(primary_button(confirm_label, pal().blue, 96.0))
+                        .clicked()
+                };
+                if confirmed {
+                    outcome = Some(true);
+                }
+            });
+        });
+    outcome
+}
+
 pub(crate) fn icon_button<'a>(text: &'a str, _tooltip: &'a str) -> egui::Button<'a> {
     egui::Button::new(RichText::new(text).size(15.0).color(pal().muted))
         .fill(Color32::TRANSPARENT)

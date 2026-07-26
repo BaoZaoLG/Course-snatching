@@ -3,12 +3,12 @@ mod theme;
 
 #[allow(unused_imports)]
 use crate::app::theme::{
-    apply_style, apply_titlebar_theme, configure_fonts, configure_window_backdrop,
-    custom_host_requiring_confirmation, draw_table_header, empty_hint, glass_strip, glass_surface,
-    icon_button, log_color, mini_status, mix_color, number_drag_f64, number_drag_u32, on_off,
-    outline_toggle, pal, primary_button, quiet_button, soft_danger_button, soft_divider,
-    status_dot, style_single_number_capsule, truncate_ui_text, watch_color, BODY_SIZE,
-    CAPTION_SIZE, CARD_RADIUS, CONTROL_H, META_SIZE, PANEL_TITLE, WATCH_CARD_MIN_H,
+    apply_style, apply_titlebar_theme, configure_fonts, configure_window_backdrop, confirm_dialog,
+    custom_host_requiring_confirmation, draw_table_header, empty_hint, ghost_button, glass_strip,
+    glass_surface, icon_button, log_color, mini_status, mix_color, number_drag_f64,
+    number_drag_u32, on_off, outline_toggle, pal, primary_button, quiet_button, soft_danger_button,
+    soft_divider, status_dot, style_single_number_capsule, truncate_ui_text, watch_color,
+    BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTROL_H, META_SIZE, PANEL_TITLE, WATCH_CARD_MIN_H,
 };
 use crate::config::{
     redact_diagnostic_page, redact_diagnostic_text, redact_diagnostic_url, AppConfig, ScheduleStamp,
@@ -248,7 +248,8 @@ pub struct CourseApp {
     captcha_texture: Option<(usize, egui::TextureHandle)>,
     confirm_logout: bool,
     confirm_clear_logs: bool,
-    confirm_remove: Option<usize>,
+    /// 待确认移除的监控目标（按序号，不按下标——见 show_overlays 的说明）。
+    confirm_remove: Option<String>,
     confirm_start_grab: bool,
     confirm_export_raw_diagnostics: bool,
     show_first_run: bool,
@@ -1049,52 +1050,17 @@ impl CourseApp {
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("清空").size(META_SIZE).color(pal().muted),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE),
-                            )
-                            .clicked()
-                        {
+                        if ui.add(ghost_button("清空")).clicked() {
                             self.confirm_clear_logs = true;
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("导出").size(META_SIZE).color(pal().muted),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE),
-                            )
-                            .clicked()
-                        {
+                        if ui.add(ghost_button("导出")).clicked() {
                             self.export_logs();
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("诊断包").size(META_SIZE).color(pal().muted),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE),
-                            )
-                            .clicked()
-                        {
+                        if ui.add(ghost_button("诊断包")).clicked() {
                             self.export_diagnostics(false);
                         }
                         if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("含原始页面…")
-                                        .size(META_SIZE)
-                                        .color(pal().muted),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE),
-                            )
+                            .add(ghost_button("含原始页面…"))
                             .on_hover_text("仅在明确确认后导出原始调试页面")
                             .clicked()
                         {
@@ -1305,7 +1271,7 @@ impl CourseApp {
                                     };
                                     (rank, *index)
                                 });
-                                for (index, serial) in ordered {
+                                for (_index, serial) in ordered {
                                     let status = status_map.get(serial.as_str());
                                     let accent =
                                         status.map_or(pal().muted, |item| watch_color(item.state));
@@ -1338,7 +1304,8 @@ impl CourseApp {
                                                             .on_hover_text("移除")
                                                             .clicked()
                                                         {
-                                                            self.confirm_remove = Some(index);
+                                                            self.confirm_remove =
+                                                                Some(serial.clone());
                                                         }
                                                         if ui
                                                             .add_enabled(
@@ -1859,42 +1826,44 @@ impl CourseApp {
                     }
                 });
         }
+        // 五处几乎逐字重复的确认框现在共用 theme::confirm_dialog：
+        // 「危险操作必须二次确认」这条规则有了唯一的实现。
         if self.confirm_logout {
-            egui::Window::new("确认退出登录")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(root_ui.ctx(), |ui| {
+            match confirm_dialog(
+                root_ui.ctx(),
+                "确认退出登录",
+                |ui| {
                     ui.label("退出后需要重新登录才能继续。");
-                    ui.horizontal(|ui| {
-                        if ui.add(quiet_button("取消", 72.0)).clicked() {
-                            self.confirm_logout = false;
-                        }
-                        if ui.add(soft_danger_button("退出", 72.0)).clicked() {
-                            self.confirm_logout = false;
-                            worker::logout(&self.state);
-                            self.set_status("已退出登录");
-                        }
-                    });
-                });
+                },
+                "退出",
+                true,
+            ) {
+                Some(true) => {
+                    self.confirm_logout = false;
+                    worker::logout(&self.state);
+                    self.set_status("已退出登录");
+                }
+                Some(false) => self.confirm_logout = false,
+                None => {}
+            }
         }
         if self.confirm_clear_logs {
-            egui::Window::new("确认清空日志")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(root_ui.ctx(), |ui| {
+            match confirm_dialog(
+                root_ui.ctx(),
+                "确认清空日志",
+                |ui| {
                     ui.label("清空后无法恢复。");
-                    ui.horizontal(|ui| {
-                        if ui.add(quiet_button("取消", 72.0)).clicked() {
-                            self.confirm_clear_logs = false;
-                        }
-                        if ui.add(soft_danger_button("清空", 72.0)).clicked() {
-                            self.confirm_clear_logs = false;
-                            self.state.logs.lock().clear();
-                        }
-                    });
-                });
+                },
+                "清空",
+                true,
+            ) {
+                Some(true) => {
+                    self.confirm_clear_logs = false;
+                    self.state.logs.lock().clear();
+                }
+                Some(false) => self.confirm_clear_logs = false,
+                None => {}
+            }
         }
         // F-05：退课不可逆——名额立刻放给别人，且未必抢得回来。
         if let Some(lesson_id) = self.confirm_drop.clone() {
@@ -2047,30 +2016,41 @@ impl CourseApp {
                     });
                 });
         }
-        if let Some(index) = self.confirm_remove {
+        // A-02：按序号而不是下标确认。
+        //
+        // 这个对话框是非模态的：它开着的时候用户仍然可以点 ↑↓ 调整优先级或
+        // 「清理失败」。存下标的话，列表一变，下标就指向了另一门课——点确认
+        // 会静默删掉一门用户根本没打算删的课，而且不会有任何报错。
+        if let Some(serial) = self.confirm_remove.clone() {
+            let still_present = self.cfg.watch_serials.iter().any(|item| item == &serial);
             egui::Window::new("确认移除监控")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(root_ui.ctx(), |ui| {
-                    let serial = self
-                        .cfg
-                        .watch_serials
-                        .get(index)
-                        .cloned()
-                        .unwrap_or_default();
+                    if !still_present {
+                        // 目标在对话框开着时已经被别的操作移除了。
+                        ui.label(
+                            RichText::new(format!("{serial} 已不在监控列表中。"))
+                                .size(META_SIZE)
+                                .color(pal().muted),
+                        );
+                        if ui.add(quiet_button("知道了", 88.0)).clicked() {
+                            self.confirm_remove = None;
+                        }
+                        return;
+                    }
                     ui.label(format!("移除监控目标：{serial}？"));
                     ui.horizontal(|ui| {
                         if ui.add(quiet_button("取消", 72.0)).clicked() {
                             self.confirm_remove = None;
                         }
                         if ui.add(soft_danger_button("移除", 72.0)).clicked() {
-                            if index < self.cfg.watch_serials.len() {
-                                let removed = self.cfg.watch_serials.remove(index);
-                                self.cfg.watch_lesson_ids.remove(&removed);
-                                self.cfg.watch_meta.remove(&removed);
-                                self.save_config();
-                            }
+                            self.cfg.watch_serials.retain(|item| item != &serial);
+                            self.cfg.watch_lesson_ids.remove(&serial);
+                            self.cfg.watch_meta.remove(&serial);
+                            self.cfg.watch_groups.remove(&serial);
+                            self.save_config();
                             self.confirm_remove = None;
                         }
                     });
@@ -3045,6 +3025,40 @@ mod tests {
         assert!(
             buffer.capacity() >= 256,
             "preallocate so typing never reallocates"
+        );
+    }
+
+    // A-02：确认移除必须按序号定位，不能按下标。
+    //
+    // 对话框是非模态的：它开着的时候用户仍然可以点 ↑↓ 调整优先级或「清理
+    // 失败」。存下标的话列表一变，下标就指向另一门课——点确认会静默删掉一门
+    // 用户根本没打算删的课，且不会有任何报错。
+    #[test]
+    fn removing_a_watch_target_follows_the_serial_not_the_position() {
+        let mut cfg = AppConfig {
+            watch_serials: vec!["A.001".into(), "B.002".into(), "C.003".into()],
+            ..Default::default()
+        };
+        cfg.watch_meta.insert("B.002".into(), Default::default());
+        cfg.watch_groups.insert("B.002".into(), "组一".into());
+
+        // 用户对 B.002 打开了确认框。
+        let pending_removal = "B.002".to_string();
+        // 期间又把 A.001 移到了最后——B.002 的下标从 1 变成了 0。
+        cfg.watch_serials.retain(|item| item != "A.001");
+        cfg.watch_serials.push("A.001".into());
+        assert_eq!(cfg.watch_serials, vec!["B.002", "C.003", "A.001"]);
+
+        // 按序号移除：删掉的必须仍然是 B.002。
+        cfg.watch_serials.retain(|item| item != &pending_removal);
+        cfg.watch_lesson_ids.remove(&pending_removal);
+        cfg.watch_meta.remove(&pending_removal);
+        cfg.watch_groups.remove(&pending_removal);
+        assert_eq!(cfg.watch_serials, vec!["C.003", "A.001"]);
+        assert!(!cfg.watch_meta.contains_key("B.002"));
+        assert!(
+            !cfg.watch_groups.contains_key("B.002"),
+            "group assignment must be cleaned up with the target"
         );
     }
 
