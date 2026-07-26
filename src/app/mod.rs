@@ -59,6 +59,10 @@ struct RedactedPages {
     unreadable: usize,
 }
 
+/// 课程搜索框的固定 Id：Ctrl+F 要能把焦点移过去。
+static SEARCH_FIELD_ID: std::sync::LazyLock<egui::Id> =
+    std::sync::LazyLock::new(|| egui::Id::new("catalog_search_field"));
+
 /// 单条吐司的展示时长（秒）。
 const TOAST_SECONDS: f64 = 4.5;
 
@@ -379,6 +383,7 @@ impl eframe::App for CourseApp {
                 self.toast = Some((now_time + TOAST_SECONDS, text, success));
             }
         }
+        self.handle_shortcuts(root_ui, logged, running, logging_in, refreshing);
         let now = root_ui.ctx().input(|i| i.time);
         if logged && !running && !logging_in && !refreshing && now - self.last_keepalive > 180.0 {
             self.last_keepalive = now;
@@ -1440,6 +1445,8 @@ impl CourseApp {
                         ui.add_sized(
                             [240.0, CONTROL_H],
                             egui::TextEdit::singleline(&mut self.filter)
+                                // 固定 Id：Ctrl+F 要能把焦点移到这里。
+                                .id(SEARCH_FIELD_ID.with("catalog_search"))
                                 .hint_text("搜索 序号 / 名称 / 教师")
                                 .vertical_align(Align::Center),
                         );
@@ -2171,6 +2178,78 @@ impl CourseApp {
 
     fn status_is_error(&self) -> bool {
         self.status.showing_error()
+    }
+
+    /// 键盘快捷键。
+    ///
+    /// 抢课场景对手速敏感，而此前全程只有一处回车绑定：开抢、停止、刷新都
+    /// 只能用鼠标点。这几个键是有意选的——都不与文本输入冲突（输入框有焦点
+    /// 时 egui 会先消费按键），且都对应「此刻最想立刻做的那件事」。
+    fn handle_shortcuts(
+        &mut self,
+        ui: &egui::Ui,
+        logged: bool,
+        running: bool,
+        logging_in: bool,
+        refreshing: bool,
+    ) {
+        // 有文本框正在编辑时不抢按键，否则会在搜索框里按 F5 就触发刷新。
+        if ui.ctx().memory(|memory| memory.focused().is_some()) {
+            // Ctrl+F 例外：它的目的就是把焦点移到搜索框。
+            let focus_search =
+                ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
+            if focus_search {
+                ui.ctx().memory_mut(|memory| {
+                    memory.request_focus(SEARCH_FIELD_ID.with("catalog_search"));
+                });
+            }
+            return;
+        }
+
+        let (refresh, start, stop, focus_search) = ui.input_mut(|input| {
+            (
+                input.consume_key(egui::Modifiers::NONE, egui::Key::F5),
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
+            )
+        });
+
+        if focus_search {
+            ui.ctx().memory_mut(|memory| {
+                memory.request_focus(SEARCH_FIELD_ID.with("catalog_search"));
+            });
+        }
+        if refresh && logged && !running && !logging_in && !refreshing {
+            self.set_status("正在刷新课程…（F5）");
+            self.state.set_message("正在刷新课程…");
+            worker::refresh_lessons(self.state.clone(), self.cfg.profile_id.clone());
+        }
+        if start && logged && !running && !logging_in {
+            // 与按钮同一条路径：仍然要过开抢前确认，不能让快捷键绕过它。
+            self.confirm_start_grab = true;
+        }
+        if stop {
+            // Esc 先关弹窗；没有弹窗才停止抢课——否则用户按 Esc 关确认框会
+            // 顺手把正在跑的任务停掉。
+            let had_modal = self.confirm_logout
+                || self.confirm_clear_logs
+                || self.confirm_start_grab
+                || self.confirm_export_raw_diagnostics
+                || self.confirm_remove.is_some()
+                || self.result_summary.is_some();
+            if had_modal {
+                self.confirm_logout = false;
+                self.confirm_clear_logs = false;
+                self.confirm_start_grab = false;
+                self.confirm_export_raw_diagnostics = false;
+                self.confirm_remove = None;
+                self.result_summary = None;
+            } else if running {
+                worker::stop_grab(&self.state);
+                self.set_status("正在停止…（Esc）");
+            }
+        }
     }
 
     /// 清空密码输入缓冲，并连带清掉 egui 侧的输入状态。
