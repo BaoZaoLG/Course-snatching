@@ -8,7 +8,7 @@ mod state;
 mod time;
 
 pub use monitor::{start_grab, stop_grab};
-pub use schedule::{arm_schedule, cancel_schedule_arm};
+pub use schedule::{arm_schedule, cancel_schedule_arm, schedule_decision, ScheduleAction};
 pub use session::{keepalive, login_and_fetch, logout, refresh_lessons, LoginRequest};
 #[allow(unused_imports)]
 pub use state::{LogItem, LogLevel, SharedState, WatchState, WatchStatus};

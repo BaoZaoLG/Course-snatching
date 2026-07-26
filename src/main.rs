@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod eams;
 mod notify;
+mod single_instance;
 mod worker;
 
 use app::CourseApp;
@@ -35,6 +36,12 @@ fn install_panic_report() {
 }
 
 fn main() -> eframe::Result<()> {
+    // 单实例守护要在建窗口、读写配置之前：第二个进程会把网络治理翻倍
+    // 绕过，并与第一个进程互相覆盖配置和会话状态。
+    let Some(_instance) = single_instance::acquire() else {
+        single_instance::focus_existing_and_notify(APP_TITLE);
+        return Ok(());
+    };
     install_panic_report();
     let icon = load_icon();
     let options = eframe::NativeOptions {

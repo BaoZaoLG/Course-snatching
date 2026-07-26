@@ -3,24 +3,61 @@ mod theme;
 
 #[allow(unused_imports)]
 use crate::app::theme::{
-    apply_style, configure_fonts, configure_window_backdrop, custom_host_requiring_confirmation,
-    draw_table_header, empty_hint, glass_strip, glass_surface, icon_button, log_color, mini_status,
-    mix_color, number_drag_f64, number_drag_u32, on_off, outline_toggle, primary_button,
-    quiet_button, soft_danger_button, soft_divider, status_dot, style_single_number_capsule,
-    truncate_ui_text, watch_color, AMBER, BLUE, BODY_SIZE, CAPTION_SIZE, CARD_RADIUS, CONTROL_H,
-    DISABLED_FILL, FOG, GLASS, GLASS_SOFT, GLASS_STRONG, GREEN, HEADER_FILL, LINE, META_SIZE,
-    MUTED, PANEL_TITLE, QUIET_FILL, QUIET_HOVER, RED, ROW_ALT, ROW_HOVER, ROW_LINE, TEXT,
-    WATCH_CARD_MIN_H,
+    apply_style, apply_titlebar_theme, configure_fonts, configure_window_backdrop,
+    custom_host_requiring_confirmation, draw_table_header, empty_hint, glass_strip, glass_surface,
+    icon_button, log_color, mini_status, mix_color, number_drag_f64, number_drag_u32, on_off,
+    outline_toggle, pal, primary_button, quiet_button, soft_danger_button, soft_divider,
+    status_dot, style_single_number_capsule, truncate_ui_text, watch_color, BODY_SIZE,
+    CAPTION_SIZE, CARD_RADIUS, CONTROL_H, META_SIZE, PANEL_TITLE, WATCH_CARD_MIN_H,
 };
-use crate::config::{redact_diagnostic_text, redact_diagnostic_url, AppConfig, ScheduleStamp};
+use crate::config::{
+    redact_diagnostic_page, redact_diagnostic_text, redact_diagnostic_url, AppConfig, ScheduleStamp,
+};
 use crate::eams::{CircuitStatus, Lesson, NetworkSnapshot};
 use crate::worker::{self, LogLevel, SharedState, WatchState};
 use eframe::egui::{self, Align, Align2, Color32, Layout, RichText, Sense, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 // Page / surface tokens — solid fills only, avoid translucent color stacking.
+
+/// 读取调试目录里的原始页面并逐份脱敏后才允许进入诊断包：抹掉
+/// 凭据/会话值，含选课提交表单的页面整份丢弃（`redact_diagnostic_page`
+/// 返回 None）。返回（可导出页面, 被整份排除的页面数）。
+fn collect_redacted_debug_pages(dir: &std::path::Path) -> RedactedPages {
+    let mut collected = RedactedPages::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return collected;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 读不出（二进制/权限/竞态删除）的一律跳过：诊断导出不得中断。
+        // 但要单独计数，别让接收方以为目录里本来就没有这些页面。
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            collected.unreadable += 1;
+            continue;
+        };
+        match redact_diagnostic_page(&name, &content) {
+            Some(redacted) => {
+                collected.pages.insert(name, redacted);
+            }
+            None => collected.submissions += 1,
+        }
+    }
+    collected
+}
+
+/// 诊断包里的原始页面收集结果。两个计数分开报告：一个是按隐私策略
+/// 主动排除的，一个是根本没读成的。
+#[derive(Default)]
+struct RedactedPages {
+    pages: std::collections::BTreeMap<String, String>,
+    /// 含选课提交表单、按策略整份排除的页面数。
+    submissions: usize,
+    /// 读取失败而跳过的页面数。
+    unreadable: usize,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LogFilter {
@@ -50,6 +87,8 @@ pub struct CourseApp {
     was_logged_in: bool,
     confirmed_custom_host: Option<String>,
     window_backdrop_attempted: bool,
+    /// 已推给系统标题栏的深浅色，`None` 表示还没设过。
+    titlebar_dark: Option<bool>,
     log_filter: LogFilter,
     catalog_sort: CatalogSort,
     toast: Option<(f64, String, bool)>,
@@ -60,10 +99,6 @@ pub struct CourseApp {
     confirm_export_raw_diagnostics: bool,
     show_first_run: bool,
     last_keepalive: f64,
-    /// 已触发过的定时开抢键：YYYY-MM-DD HH:MM:SS
-    schedule_fired_for: Option<String>,
-    /// Key currently armed in worker precise waiter.
-    schedule_armed_for: Option<String>,
     was_running: bool,
     result_summary: Option<String>,
 }
@@ -101,6 +136,7 @@ impl CourseApp {
             was_logged_in: false,
             confirmed_custom_host: None,
             window_backdrop_attempted: false,
+            titlebar_dark: None,
             log_filter: LogFilter::All,
             catalog_sort: CatalogSort::Default,
             toast: None,
@@ -111,8 +147,6 @@ impl CourseApp {
             confirm_export_raw_diagnostics: false,
             show_first_run,
             last_keepalive: 0.0,
-            schedule_fired_for: None,
-            schedule_armed_for: None,
             was_running: false,
             result_summary: None,
         }
@@ -124,6 +158,12 @@ impl eframe::App for CourseApp {
         if !self.window_backdrop_attempted {
             self.window_backdrop_attempted = true;
             configure_window_backdrop(frame);
+        }
+        // 每帧比对而不是在勾选处调用：这样切换、导入配置、启动三条路径
+        // 都能把标题栏拉到同一个主题上。
+        if self.titlebar_dark != Some(self.cfg.dark_mode) {
+            self.titlebar_dark = Some(self.cfg.dark_mode);
+            apply_titlebar_theme(frame, self.cfg.dark_mode);
         }
 
         let ctx = root_ui.ctx().clone();
@@ -240,7 +280,7 @@ impl eframe::App for CourseApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        FOG.to_normalized_gamma_f32()
+        pal().fog.to_normalized_gamma_f32()
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -273,9 +313,9 @@ impl CourseApp {
         egui::Panel::top("header")
             .frame(
                 egui::Frame::NONE
-                    .fill(Color32::WHITE)
+                    .fill(pal().glass_strong)
                     .inner_margin(egui::Margin::symmetric(16, 12))
-                    .stroke(egui::Stroke::new(1.0, LINE)),
+                    .stroke(egui::Stroke::new(1.0, pal().line)),
             )
             .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
@@ -283,17 +323,17 @@ impl CourseApp {
                     ui.spacing_mut().item_spacing.x = 8.0;
 
                     let (label, color) = if stopping {
-                        ("正在停止", AMBER)
+                        ("正在停止", pal().amber)
                     } else if running {
-                        ("抢课中", GREEN)
+                        ("抢课中", pal().green)
                     } else if logging_in {
-                        ("登录中", AMBER)
+                        ("登录中", pal().amber)
                     } else if refreshing {
-                        ("刷新中", AMBER)
+                        ("刷新中", pal().amber)
                     } else if logged {
-                        ("已登录", BLUE)
+                        ("已登录", pal().blue)
                     } else {
-                        ("未登录", MUTED)
+                        ("未登录", pal().muted)
                     };
                     let detail = self.status_line.trim().to_string();
                     let show_detail = !detail.is_empty() && detail != label;
@@ -304,13 +344,13 @@ impl CourseApp {
                             RichText::new("Course-snatching")
                                 .size(20.0)
                                 .strong()
-                                .color(TEXT),
+                                .color(pal().text),
                         );
                         ui.label(
                             RichText::new("选课助手")
                                 .size(META_SIZE)
                                 .strong()
-                                .color(BLUE),
+                                .color(pal().blue),
                         );
                         ui.add_space(6.0);
                         status_dot(ui, color, running);
@@ -319,21 +359,21 @@ impl CourseApp {
                             ui.label(
                                 RichText::new(format!("·  轮次 {active_pid}"))
                                     .size(META_SIZE)
-                                    .color(MUTED),
+                                    .color(pal().muted),
                             );
                         }
                         if lesson_count > 0 {
                             ui.label(
                                 RichText::new(format!("·  {lesson_count} 门"))
                                     .size(META_SIZE)
-                                    .color(MUTED),
+                                    .color(pal().muted),
                             );
                         }
                         if watch_count > 0 {
                             ui.label(
                                 RichText::new(format!("·  监控 {watch_count}"))
                                     .size(META_SIZE)
-                                    .color(MUTED),
+                                    .color(pal().muted),
                             );
                         }
                     });
@@ -342,13 +382,15 @@ impl CourseApp {
                     if show_detail {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             egui::Frame::NONE
-                                .fill(HEADER_FILL)
-                                .stroke(egui::Stroke::new(1.0, LINE))
+                                .fill(pal().header_fill)
+                                .stroke(egui::Stroke::new(1.0, pal().line))
                                 .corner_radius(8.0)
                                 .inner_margin(egui::Margin::symmetric(12, 6))
                                 .show(ui, |ui| {
                                     ui.set_max_width(420.0);
-                                    ui.label(RichText::new(detail).size(META_SIZE).color(TEXT));
+                                    ui.label(
+                                        RichText::new(detail).size(META_SIZE).color(pal().text),
+                                    );
                                 });
                         });
                     }
@@ -392,7 +434,7 @@ impl CourseApp {
                     if ui
                         .add_enabled(
                             !logging_in && !running,
-                            primary_button(login_label, BLUE, 84.0),
+                            primary_button(login_label, pal().blue, 84.0),
                         )
                         .clicked()
                     {
@@ -422,7 +464,7 @@ impl CourseApp {
 
                     soft_divider(ui, CONTROL_H);
 
-                    ui.label(RichText::new("间隔").size(META_SIZE).color(MUTED));
+                    ui.label(RichText::new("间隔").size(META_SIZE).color(pal().muted));
                     if number_drag_f64(
                         ui,
                         &mut self.cfg.interval_seconds,
@@ -450,7 +492,10 @@ impl CourseApp {
                     }
 
                     if ui
-                        .add_enabled(!running && logged, primary_button("开始抢课", GREEN, 100.0))
+                        .add_enabled(
+                            !running && logged,
+                            primary_button("开始抢课", pal().green, 100.0),
+                        )
                         .clicked()
                     {
                         self.confirm_start_grab = true;
@@ -466,7 +511,12 @@ impl CourseApp {
 
                     if logged
                         && ui
-                            .add_enabled(!running && !logging_in, quiet_button("退出", 56.0))
+                            .add_enabled(
+                                // 刷新中退出会让在途任务把旧账号数据写回：
+                                // 会话代际已兜底，这里从交互上直接杜绝。
+                                !running && !logging_in && !refreshing,
+                                quiet_button("退出", 56.0),
+                            )
                             .clicked()
                     {
                         self.confirm_logout = true;
@@ -518,10 +568,10 @@ impl CourseApp {
                                 RichText::new("连接设置")
                                     .size(BODY_SIZE)
                                     .strong()
-                                    .color(TEXT),
+                                    .color(pal().text),
                             );
                             ui.add_space(12.0);
-                            ui.label(RichText::new("教务地址").size(META_SIZE).color(MUTED));
+                            ui.label(RichText::new("教务地址").size(META_SIZE).color(pal().muted));
                             let base = ui.add_sized(
                                 [350.0, CONTROL_H],
                                 egui::TextEdit::singleline(&mut self.cfg.base_url)
@@ -541,7 +591,7 @@ impl CourseApp {
                                 }
                             }
                             ui.add_space(8.0);
-                            ui.label(RichText::new("选课轮次").size(META_SIZE).color(MUTED));
+                            ui.label(RichText::new("选课轮次").size(META_SIZE).color(pal().muted));
                             let profile = ui.add_sized(
                                 [124.0, CONTROL_H],
                                 egui::TextEdit::singleline(&mut self.cfg.profile_id)
@@ -563,7 +613,7 @@ impl CourseApp {
                             ui.label(
                                 RichText::new("留空自动探测")
                                     .size(CAPTION_SIZE)
-                                    .color(MUTED),
+                                    .color(pal().muted),
                             );
                         });
 
@@ -581,9 +631,9 @@ impl CourseApp {
                                 RichText::new("仅排障时开启，文件可能包含个人信息")
                                     .size(CAPTION_SIZE)
                                     .color(if self.cfg.debug_dump_enabled {
-                                        RED
+                                        pal().red
                                     } else {
-                                        MUTED
+                                        pal().muted
                                     }),
                             );
                             if let Some(host) =
@@ -638,10 +688,14 @@ impl CourseApp {
                                 RichText::new("运行参数")
                                     .size(BODY_SIZE)
                                     .strong()
-                                    .color(TEXT),
+                                    .color(pal().text),
                             );
                             ui.add_space(8.0);
-                            ui.label(RichText::new("连续错误上限").size(META_SIZE).color(MUTED));
+                            ui.label(
+                                RichText::new("连续错误上限")
+                                    .size(META_SIZE)
+                                    .color(pal().muted),
+                            );
                             dirty |= number_drag_u32(
                                 ui,
                                 &mut self.cfg.max_consecutive_errors,
@@ -653,7 +707,7 @@ impl CourseApp {
                             )
                             .changed();
                             ui.add_space(14.0);
-                            ui.label(RichText::new("界面缩放").size(META_SIZE).color(MUTED));
+                            ui.label(RichText::new("界面缩放").size(META_SIZE).color(pal().muted));
                             let mut scale = f64::from(self.cfg.ui_scale);
                             if number_drag_f64(ui, &mut scale, true, 0.9..=1.5, 0.05, 2, "", 64.0)
                                 .changed()
@@ -666,7 +720,7 @@ impl CourseApp {
                             ui.label(
                                 RichText::new("连续失败达到上限后自动停止")
                                     .size(CAPTION_SIZE)
-                                    .color(MUTED),
+                                    .color(pal().muted),
                             );
                         });
 
@@ -710,7 +764,7 @@ impl CourseApp {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(12.0, 4.0);
             for item in items {
-                ui.label(RichText::new(item).size(CAPTION_SIZE).color(MUTED));
+                ui.label(RichText::new(item).size(CAPTION_SIZE).color(pal().muted));
             }
         });
     }
@@ -731,7 +785,7 @@ impl CourseApp {
                 RichText::new("网络诊断")
                     .size(BODY_SIZE)
                     .strong()
-                    .color(TEXT),
+                    .color(pal().text),
             );
             ui.label(
                 RichText::new(format!(
@@ -739,13 +793,13 @@ impl CourseApp {
                     network.total_rate_limits, network.consecutive_errors, circuit, last_error,
                 ))
                 .size(CAPTION_SIZE)
-                .color(MUTED),
+                .color(pal().muted),
             );
         });
         ui.label(
             RichText::new("请求预算、服务器冷却和熔断保护始终生效，关闭自动降速不会绕过这些保护。")
                 .size(CAPTION_SIZE)
-                .color(MUTED),
+                .color(pal().muted),
         );
     }
 
@@ -754,14 +808,14 @@ impl CourseApp {
             .exact_size(34.0 + 160.0 * reveal)
             .frame(
                 egui::Frame::NONE
-                    .fill(Color32::WHITE)
+                    .fill(pal().glass_strong)
                     .inner_margin(egui::Margin {
                         left: 16,
                         right: 16,
                         top: 8,
                         bottom: 10,
                     })
-                    .stroke(egui::Stroke::new(1.0, LINE)),
+                    .stroke(egui::Stroke::new(1.0, pal().line)),
             )
             .show(root_ui, |ui| {
                 ui.horizontal(|ui| {
@@ -770,14 +824,14 @@ impl CourseApp {
                         RichText::new("运行日志")
                             .strong()
                             .size(PANEL_TITLE)
-                            .color(TEXT),
+                            .color(pal().text),
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("清空").size(META_SIZE).color(MUTED),
+                                    RichText::new("清空").size(META_SIZE).color(pal().muted),
                                 )
                                 .fill(Color32::TRANSPARENT)
                                 .stroke(egui::Stroke::NONE),
@@ -789,7 +843,7 @@ impl CourseApp {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("导出").size(META_SIZE).color(MUTED),
+                                    RichText::new("导出").size(META_SIZE).color(pal().muted),
                                 )
                                 .fill(Color32::TRANSPARENT)
                                 .stroke(egui::Stroke::NONE),
@@ -801,7 +855,7 @@ impl CourseApp {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("诊断包").size(META_SIZE).color(MUTED),
+                                    RichText::new("诊断包").size(META_SIZE).color(pal().muted),
                                 )
                                 .fill(Color32::TRANSPARENT)
                                 .stroke(egui::Stroke::NONE),
@@ -813,7 +867,9 @@ impl CourseApp {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new("含原始页面…").size(META_SIZE).color(MUTED),
+                                    RichText::new("含原始页面…")
+                                        .size(META_SIZE)
+                                        .color(pal().muted),
                                 )
                                 .fill(Color32::TRANSPARENT)
                                 .stroke(egui::Stroke::NONE),
@@ -868,7 +924,7 @@ impl CourseApp {
                                         ui.spacing_mut().item_spacing = Vec2::new(7.0, 2.0);
                                         ui.label(
                                             RichText::new(&item.time)
-                                                .color(MUTED)
+                                                .color(pal().muted)
                                                 .monospace()
                                                 .size(CAPTION_SIZE),
                                         );
@@ -881,7 +937,7 @@ impl CourseApp {
                                         ui.label(
                                             RichText::new(&item.message)
                                                 .size(META_SIZE)
-                                                .color(TEXT),
+                                                .color(pal().text),
                                         );
                                     });
                                     ui.add_space(2.0);
@@ -897,12 +953,16 @@ impl CourseApp {
             .resizable(true)
             .default_size(320.0)
             .size_range(300.0..=380.0)
-            .frame(egui::Frame::NONE.fill(FOG).inner_margin(egui::Margin {
-                left: 12,
-                right: 6,
-                top: 10,
-                bottom: 12,
-            }))
+            .frame(
+                egui::Frame::NONE
+                    .fill(pal().fog)
+                    .inner_margin(egui::Margin {
+                        left: 12,
+                        right: 6,
+                        top: 10,
+                        bottom: 12,
+                    }),
+            )
             .show(root_ui, |ui| {
                 glass_surface(ui, true, |ui| {
                     ui.horizontal(|ui| {
@@ -912,13 +972,13 @@ impl CourseApp {
                                 RichText::new("监控目标")
                                     .strong()
                                     .size(PANEL_TITLE)
-                                    .color(TEXT),
+                                    .color(pal().text),
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.label(
                                     RichText::new(format!("{watch_count} 门"))
                                         .size(META_SIZE)
-                                        .color(MUTED),
+                                        .color(pal().muted),
                                 );
                             });
                         });
@@ -1027,10 +1087,10 @@ impl CourseApp {
                                 for (index, serial) in ordered {
                                     let status = status_map.get(serial.as_str());
                                     let accent =
-                                        status.map_or(MUTED, |item| watch_color(item.state));
+                                        status.map_or(pal().muted, |item| watch_color(item.state));
                                     egui::Frame::NONE
-                                        .fill(GLASS_SOFT)
-                                        .stroke(egui::Stroke::new(1.0, LINE))
+                                        .fill(pal().glass_soft)
+                                        .stroke(egui::Stroke::new(1.0, pal().line))
                                         .corner_radius(CARD_RADIUS)
                                         .inner_margin(egui::Margin::symmetric(12, 10))
                                         .show(ui, |ui| {
@@ -1044,7 +1104,7 @@ impl CourseApp {
                                                         .monospace()
                                                         .size(BODY_SIZE)
                                                         .strong()
-                                                        .color(TEXT),
+                                                        .color(pal().text),
                                                 );
                                                 ui.with_layout(
                                                     Layout::right_to_left(Align::Center),
@@ -1100,12 +1160,12 @@ impl CourseApp {
                                                 RichText::new(name)
                                                     .size(BODY_SIZE)
                                                     .strong()
-                                                    .color(TEXT),
+                                                    .color(pal().text),
                                             );
                                             ui.label(
                                                 RichText::new(teachers)
                                                     .size(CAPTION_SIZE)
-                                                    .color(MUTED),
+                                                    .color(pal().muted),
                                             );
                                             ui.add_space(4.0);
                                             if let Some(item) = status {
@@ -1115,7 +1175,7 @@ impl CourseApp {
                                                         ui.label(
                                                             RichText::new(&item.capacity)
                                                                 .size(META_SIZE)
-                                                                .color(MUTED),
+                                                                .color(pal().muted),
                                                         );
                                                     }
                                                     if item.checks > 0 {
@@ -1125,7 +1185,7 @@ impl CourseApp {
                                                                 item.checks
                                                             ))
                                                             .size(CAPTION_SIZE)
-                                                            .color(MUTED),
+                                                            .color(pal().muted),
                                                         );
                                                     }
                                                     if !item.last_check.is_empty() {
@@ -1135,7 +1195,7 @@ impl CourseApp {
                                                                 item.last_check
                                                             ))
                                                             .size(CAPTION_SIZE)
-                                                            .color(MUTED),
+                                                            .color(pal().muted),
                                                         );
                                                     }
                                                 });
@@ -1148,17 +1208,17 @@ impl CourseApp {
                                                 ui.label(
                                                     RichText::new(detail)
                                                         .size(CAPTION_SIZE)
-                                                        .color(MUTED),
+                                                        .color(pal().muted),
                                                 );
                                             } else {
                                                 ui.horizontal(|ui| {
-                                                    mini_status(ui, "等待", MUTED);
+                                                    mini_status(ui, "等待", pal().muted);
                                                 });
                                                 ui.add_space(3.0);
                                                 ui.label(
                                                     RichText::new("开始抢课后显示实时状态")
                                                         .size(CAPTION_SIZE)
-                                                        .color(MUTED),
+                                                        .color(pal().muted),
                                                 );
                                             }
                                         });
@@ -1172,12 +1232,16 @@ impl CourseApp {
 
     fn show_course_catalog(&mut self, root_ui: &mut egui::Ui, running: bool, lesson_count: usize) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(FOG).inner_margin(egui::Margin {
-                left: 6,
-                right: 12,
-                top: 10,
-                bottom: 12,
-            }))
+            .frame(
+                egui::Frame::NONE
+                    .fill(pal().fog)
+                    .inner_margin(egui::Margin {
+                        left: 6,
+                        right: 12,
+                        top: 10,
+                        bottom: 12,
+                    }),
+            )
             .show(root_ui, |ui| {
                 glass_surface(ui, true, |ui| {
                     ui.horizontal(|ui| {
@@ -1187,7 +1251,7 @@ impl CourseApp {
                             RichText::new("可选课程")
                                 .strong()
                                 .size(PANEL_TITLE)
-                                .color(TEXT),
+                                .color(pal().text),
                         );
                         ui.add_sized(
                             [240.0, CONTROL_H],
@@ -1226,7 +1290,7 @@ impl CourseApp {
                             ui.label(
                                 RichText::new(format!("共 {lesson_count}"))
                                     .size(META_SIZE)
-                                    .color(MUTED),
+                                    .color(pal().muted),
                             );
                         });
                     });
@@ -1311,7 +1375,7 @@ impl CourseApp {
                                     let base = if index % 2 == 0 {
                                         Color32::TRANSPARENT
                                     } else {
-                                        ROW_ALT
+                                        pal().row_alt
                                     };
                                     let hover = ui.ctx().animate_bool_with_time(
                                         ui.id().with(("course_row", &lesson.id)),
@@ -1321,12 +1385,12 @@ impl CourseApp {
                                     ui.painter().rect_filled(
                                         row_rect,
                                         0.0,
-                                        mix_color(base, ROW_HOVER, hover),
+                                        mix_color(base, pal().row_hover, hover),
                                     );
                                     ui.painter().hline(
                                         row_rect.x_range(),
                                         row_rect.bottom(),
-                                        egui::Stroke::new(1.0, ROW_LINE),
+                                        egui::Stroke::new(1.0, pal().row_line),
                                     );
 
                                     let mut x = row_rect.left();
@@ -1343,7 +1407,7 @@ impl CourseApp {
                                         Align2::LEFT_CENTER,
                                         &lesson.no,
                                         egui::FontId::monospace(BODY_SIZE),
-                                        TEXT,
+                                        pal().text,
                                     );
                                     let name_show = truncate_ui_text(&lesson.name, 22);
                                     ui.painter().text(
@@ -1351,21 +1415,21 @@ impl CourseApp {
                                         Align2::LEFT_CENTER,
                                         name_show,
                                         egui::FontId::proportional(BODY_SIZE),
-                                        TEXT,
+                                        pal().text,
                                     );
                                     ui.painter().text(
                                         columns[2].left_center() + Vec2::new(8.0, 0.0),
                                         Align2::LEFT_CENTER,
                                         &lesson.teachers,
                                         egui::FontId::proportional(META_SIZE),
-                                        MUTED,
+                                        pal().muted,
                                     );
                                     let capacity_color = if lesson.has_seat() {
-                                        GREEN
+                                        pal().green
                                     } else if !lesson.capacity_known() {
-                                        MUTED
+                                        pal().muted
                                     } else {
-                                        RED
+                                        pal().red
                                     };
                                     ui.painter().text(
                                         columns[3].left_center() + Vec2::new(8.0, 0.0),
@@ -1399,15 +1463,15 @@ impl CourseApp {
                                         0.12,
                                     );
                                     let fill = if already {
-                                        DISABLED_FILL
+                                        pal().disabled_fill
                                     } else {
-                                        mix_color(QUIET_FILL, QUIET_HOVER, button_hover)
+                                        mix_color(pal().quiet_fill, pal().quiet_hover, button_hover)
                                     };
                                     ui.painter().rect_filled(button_rect, 8.0, fill);
                                     ui.painter().rect_stroke(
                                         button_rect,
                                         8.0,
-                                        egui::Stroke::new(1.0, LINE),
+                                        egui::Stroke::new(1.0, pal().line),
                                         egui::StrokeKind::Inside,
                                     );
                                     ui.painter().text(
@@ -1415,7 +1479,7 @@ impl CourseApp {
                                         Align2::CENTER_CENTER,
                                         button_text,
                                         egui::FontId::proportional(META_SIZE),
-                                        if already { MUTED } else { BLUE },
+                                        if already { pal().muted } else { pal().blue },
                                     );
                                     if !running
                                         && !already
@@ -1432,7 +1496,7 @@ impl CourseApp {
                                             "当前筛选 {shown} 条，仅显示前 800 条"
                                         ))
                                         .size(12.0)
-                                        .color(MUTED),
+                                        .color(pal().muted),
                                     );
                                 }
                             }
@@ -1451,19 +1515,22 @@ impl CourseApp {
                 .show(root_ui.ctx(), |ui| {
                     egui::Frame::NONE
                         .fill(if ok {
-                            Color32::from_rgb(232, 245, 238)
+                            pal().success_fill
                         } else {
-                            Color32::from_rgb(252, 240, 239)
+                            pal().danger_fill
                         })
-                        .stroke(egui::Stroke::new(1.0, if ok { GREEN } else { RED }))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            if ok { pal().green } else { pal().red },
+                        ))
                         .corner_radius(10.0)
                         .inner_margin(egui::Margin::symmetric(14, 10))
                         .show(ui, |ui| {
                             ui.set_max_width(560.0);
                             ui.label(RichText::new(text).size(META_SIZE).color(if ok {
-                                GREEN
+                                pal().green
                             } else {
-                                RED
+                                pal().red
                             }));
                         });
                 });
@@ -1483,10 +1550,13 @@ impl CourseApp {
                     ui.label(
                         RichText::new("请仅用于本人账号，合理控制请求频率，遵守学校规定。")
                             .size(CAPTION_SIZE)
-                            .color(MUTED),
+                            .color(pal().muted),
                     );
                     ui.add_space(10.0);
-                    if ui.add(primary_button("知道了", BLUE, 100.0)).clicked() {
+                    if ui
+                        .add(primary_button("知道了", pal().blue, 100.0))
+                        .clicked()
+                    {
                         self.show_first_run = false;
                         self.cfg.first_run_ack = true;
                         self.save_config();
@@ -1537,11 +1607,11 @@ impl CourseApp {
                 .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(root_ui.ctx(), |ui| {
                     ui.set_min_width(430.0);
-                    ui.label("原始调试页面可能含个人信息，仅应发送给你信任的支持人员。");
+                    ui.label("原始调试页面会先脱敏（抹掉常见的 Cookie/密码/令牌字段，含选课提交表单的页面整份排除），但脱敏不保证覆盖全部，页面仍可能含姓名、学号与你的课表，仅应发送给你信任的支持人员。");
                     ui.label(
                         RichText::new("默认诊断包不会包含这些内容。")
                             .size(CAPTION_SIZE)
-                            .color(MUTED),
+                            .color(pal().muted),
                     );
                     ui.horizontal(|ui| {
                         if ui.add(quiet_button("取消", 72.0)).clicked() {
@@ -1596,7 +1666,7 @@ impl CourseApp {
                         RichText::new(format!("监控目标 {} 门", targets.len()))
                             .strong()
                             .size(BODY_SIZE)
-                            .color(TEXT),
+                            .color(pal().text),
                     );
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical()
@@ -1613,7 +1683,7 @@ impl CourseApp {
                                 ui.label(
                                     RichText::new(format!("· {serial}  {name}"))
                                         .size(META_SIZE)
-                                        .color(TEXT),
+                                        .color(pal().text),
                                 );
                             }
                         });
@@ -1629,7 +1699,7 @@ impl CourseApp {
                             on_off(self.cfg.monitor_only),
                         ))
                         .size(META_SIZE)
-                        .color(MUTED),
+                        .color(pal().muted),
                     );
                     ui.label(
                         RichText::new(format!(
@@ -1638,20 +1708,20 @@ impl CourseApp {
                             on_off(self.cfg.sound_enabled),
                         ))
                         .size(META_SIZE)
-                        .color(MUTED),
+                        .color(pal().muted),
                     );
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new("开抢自检")
                             .strong()
                             .size(META_SIZE)
-                            .color(TEXT),
+                            .color(pal().text),
                     );
                     for (ok, line) in self.preflight_checks() {
                         ui.label(
                             RichText::new(format!("{} {}", if ok { "✓" } else { "!" }, line))
                                 .size(META_SIZE)
-                                .color(if ok { GREEN } else { AMBER }),
+                                .color(if ok { pal().green } else { pal().amber }),
                         );
                     }
                     ui.add_space(12.0);
@@ -1661,7 +1731,7 @@ impl CourseApp {
                         }
                         let can_start = self.preflight_checks().iter().all(|(ok, _)| *ok);
                         if ui
-                            .add_enabled(can_start, primary_button("确认开始", GREEN, 110.0))
+                            .add_enabled(can_start, primary_button("确认开始", pal().green, 110.0))
                             .clicked()
                         {
                             self.confirm_start_grab = false;
@@ -1678,10 +1748,13 @@ impl CourseApp {
                 .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(root_ui.ctx(), |ui| {
                     ui.set_min_width(420.0);
-                    ui.label(RichText::new(&summary).size(META_SIZE).color(TEXT));
+                    ui.label(RichText::new(&summary).size(META_SIZE).color(pal().text));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.add(primary_button("知道了", BLUE, 100.0)).clicked() {
+                        if ui
+                            .add(primary_button("知道了", pal().blue, 100.0))
+                            .clicked()
+                        {
                             self.result_summary = None;
                         }
                         if ui.add(quiet_button("导出摘要", 100.0)).clicked() {
@@ -1748,21 +1821,10 @@ impl CourseApp {
             })
             .collect::<Vec<_>>();
         let network = self.state.network_snapshot();
-        let raw_pages = if include_raw_pages {
-            std::fs::read_dir(AppConfig::debug_dir())
-                .ok()
-                .into_iter()
-                .flatten()
-                .filter_map(|entry| entry.ok())
-                .filter_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    std::fs::read_to_string(entry.path())
-                        .ok()
-                        .map(|content| (name, content))
-                })
-                .collect::<std::collections::BTreeMap<_, _>>()
+        let collected = if include_raw_pages {
+            collect_redacted_debug_pages(&AppConfig::debug_dir())
         } else {
-            std::collections::BTreeMap::new()
+            RedactedPages::default()
         };
         let base_url = redact_diagnostic_url(&self.cfg.base_url);
         let document = serde_json::json!({
@@ -1786,15 +1848,40 @@ impl CourseApp {
                 "monitor_only": self.cfg.monitor_only,
                 "target_count": self.cfg.watch_serials.len(),
                 "raw_pages_included": include_raw_pages,
+                // 让接收方知道包里少了东西，而不是以为调试目录本来就这么点内容。
+                "raw_pages_excluded_submissions": collected.submissions,
+                "raw_pages_unreadable": collected.unreadable,
             },
             "logs": logs,
-            "raw_debug_pages": raw_pages,
+            "raw_debug_pages": collected.pages,
         });
         match serde_json::to_vec_pretty(&document)
             .and_then(|body| std::fs::write(&path, body).map_err(serde_json::Error::io))
         {
-            Ok(()) => self.status_line = format!("诊断包已导出：{}", path.display()),
+            Ok(()) => {
+                self.status_line = format!(
+                    "诊断包已导出：{}{}",
+                    path.display(),
+                    Self::export_raw_page_note(collected.submissions, collected.unreadable)
+                )
+            }
             Err(error) => self.status_line = format!("导出诊断包失败：{error}"),
+        }
+    }
+
+    /// 导出说明要如实告知包内容不完整：按策略排除的与读不出的分开讲。
+    fn export_raw_page_note(submissions: usize, unreadable: usize) -> String {
+        let mut parts = Vec::new();
+        if submissions > 0 {
+            parts.push(format!("已整份排除 {submissions} 份提交表单"));
+        }
+        if unreadable > 0 {
+            parts.push(format!("{unreadable} 份页面读取失败已跳过"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", parts.join("，"))
         }
     }
 
@@ -1828,6 +1915,9 @@ impl CourseApp {
             match AppConfig::import_from(&path) {
                 Ok(cfg) => {
                     self.cfg = cfg;
+                    // 导入也要发布运行配置：否则已在待命的定时开抢到点仍会
+                    // 用导入前的旧监控目标开抢。
+                    self.state.publish_config(self.cfg.clone());
                     self.filter = self.cfg.filter.clone();
                     self.only_available = self.cfg.only_available;
                     apply_style(ctx, self.cfg.dark_mode);
@@ -1859,6 +1949,8 @@ impl CourseApp {
     }
 
     fn save_config(&mut self) {
+        // 同步最新运行配置：定时开抢到点用它开抢，而不是 arm 时刻的快照。
+        self.state.publish_config(self.cfg.clone());
         if let Err(error) = self.cfg.save() {
             let message = format!("配置保存失败：{error:#}");
             self.status_line = message.clone();
@@ -1908,7 +2000,7 @@ impl CourseApp {
             worker::LoginRequest {
                 base_url: self.cfg.base_url.clone(),
                 username: self.cfg.username.clone(),
-                password: self.password.clone(),
+                password: Zeroizing::new(self.password.clone()),
                 profile_preference: pref,
                 timeout: self.cfg.timeout_seconds,
                 auto_fetch: self.cfg.auto_fetch_on_login,
@@ -2182,6 +2274,66 @@ mod tests {
                 });
             });
         });
+    }
+
+    // [#1] 诊断包导出的原始页面必须经过 redact_diagnostic_page：
+    // 曾经这里直读文件，脱敏函数是死代码，凭据会原样进包。
+    #[test]
+    fn exported_raw_debug_pages_are_redacted_and_submissions_dropped() {
+        let dir = std::env::temp_dir().join(format!(
+            "cs-diag-pages-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("login.html"),
+            "Set-Cookie: JSESSIONID=abc123\n<input name=\"password\" value=\"hunter2\">\n?token=tk_live_1",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("submit.html"),
+            "optype=true&operator0=371644:true:0&lesson=371644",
+        )
+        .unwrap();
+
+        let collected = collect_redacted_debug_pages(&dir);
+
+        assert_eq!(
+            collected.submissions, 1,
+            "submission form must be dropped wholesale"
+        );
+        assert_eq!(collected.unreadable, 0);
+        assert_eq!(collected.pages.len(), 1);
+        assert!(!collected.pages.contains_key("submit.html"));
+        let login = &collected.pages["login.html"];
+        for secret in ["abc123", "hunter2", "tk_live_1"] {
+            assert!(!login.contains(secret), "diagnostic leaked {secret}");
+        }
+        assert!(login.contains("[已隐藏]"));
+
+        // 排除数量必须出现在导出说明里，避免接收方误以为包是完整的。
+        let note = CourseApp::export_raw_page_note(collected.submissions, collected.unreadable);
+        assert!(
+            note.contains('1') && note.contains("提交表单"),
+            "got {note}"
+        );
+        assert!(CourseApp::export_raw_page_note(0, 0).is_empty());
+        // 读不出的页面也要如实报告，不能算进“提交表单”。
+        let skipped = CourseApp::export_raw_page_note(0, 2);
+        assert!(skipped.contains('2') && !skipped.contains("提交表单"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 目录不存在时导出照常进行（只是没有原始页面），不能 panic。
+    #[test]
+    fn missing_debug_dir_yields_no_pages() {
+        let collected =
+            collect_redacted_debug_pages(&std::env::temp_dir().join("cs-diag-absent-dir"));
+        assert!(collected.pages.is_empty());
+        assert_eq!(collected.submissions, 0);
+        assert_eq!(collected.unreadable, 0);
     }
 
     #[test]

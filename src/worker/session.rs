@@ -10,7 +10,9 @@ use zeroize::Zeroizing;
 pub struct LoginRequest {
     pub base_url: String,
     pub username: String,
-    pub password: String,
+    /// 自动清零包装：无论哪条路径（早退、初始化失败、正常登录）drop
+    /// 时都会抹掉堆上的明文密码。
+    pub password: Zeroizing<String>,
     pub profile_preference: String,
     pub timeout: u64,
     pub auto_fetch: bool,
@@ -32,6 +34,8 @@ pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
         return;
     }
     state.logged_in.store(false, Ordering::Release);
+    // 新登录开启新会话：作废上一会话仍在途的刷新/保活任务的回写。
+    state.invalidate_session_tasks();
     *state.client.lock() = None;
     state.lessons.lock().clear();
     state.set_message("正在登录…");
@@ -42,7 +46,6 @@ pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
 
     spawn_task(async move {
         let _guard = ActivityGuard::new(state.clone(), Activity::Login);
-        let password = Zeroizing::new(password);
         let client = match EamsClient::new(&base_url, timeout, debug_dump_enabled) {
             Ok(client) => Arc::new(client),
             Err(error) => {
@@ -164,9 +167,16 @@ pub fn refresh_lessons(state: Arc<SharedState>, profile_preference: String) {
         format!("刷新课程，使用 profileId={profile}"),
     );
     state.set_message("正在刷新课程…");
+    let session = state.session_token();
     spawn_task(async move {
         let _guard = ActivityGuard::new(state.clone(), Activity::Refresh);
-        match client.fetch_lessons(&profile).await {
+        let result = client.fetch_lessons(&profile).await;
+        // 会话代际校验：请求期间用户已退出/重新登录时静默丢弃整个结果，
+        // 既不把旧账号课表写回新会话，也不让陈旧的失效判定误杀新会话。
+        if !state.is_current_session(session) {
+            return;
+        }
+        match result {
             Ok(list) => {
                 let count = list.len();
                 *state.lessons.lock() = list;
@@ -201,8 +211,15 @@ pub fn keepalive(state: Arc<SharedState>, notify_enabled: bool, sound_enabled: b
     if profile.is_empty() {
         return;
     }
+    let session = state.session_token();
     spawn_task(async move {
-        match client.fetch_lessons_for_keepalive(&profile).await {
+        let result = client.fetch_lessons_for_keepalive(&profile).await;
+        // 陈旧保活（期间退出或重新登录）不得写回旧课表，更不得因旧
+        // 会话的失效判定 clear_session 注销刚登录的新会话。
+        if !state.is_current_session(session) {
+            return;
+        }
+        match result {
             Ok(Some(list)) => {
                 *state.lessons.lock() = list;
                 state.touch();
@@ -228,6 +245,7 @@ pub fn logout(state: &SharedState) {
     state.running.store(false, Ordering::Release);
     state.stopping.store(false, Ordering::Release);
     state.run_generation.fetch_add(1, Ordering::AcqRel);
+    state.invalidate_session_tasks();
     state.logged_in.store(false, Ordering::Release);
     *state.client.lock() = None;
     state.lessons.lock().clear();
@@ -247,7 +265,8 @@ fn mask_account(username: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::mask_account;
+    use super::*;
+    use std::time::Duration;
 
     // 直接测生产实现：脱敏是隐私相关逻辑，不能靠测试侧复制品假覆盖。
     #[test]
@@ -256,5 +275,145 @@ mod tests {
         assert_eq!(mask_account("a"), "*");
         assert_eq!(mask_account("ab"), "a*");
         assert_eq!(mask_account("student01"), "s***1");
+    }
+
+    // [38] 密码字段必须保持自动清零包装：早退等任何路径 drop 时都会
+    // 抹掉堆上明文。类型断言防止回退成裸 String。
+    #[test]
+    fn login_request_password_stays_zeroizing() {
+        let request = LoginRequest {
+            base_url: String::new(),
+            username: String::new(),
+            password: Zeroizing::new("secret".into()),
+            profile_preference: String::new(),
+            timeout: 5,
+            auto_fetch: false,
+            debug_dump_enabled: false,
+        };
+        let _typed: &Zeroizing<String> = &request.password;
+    }
+
+    #[test]
+    fn refresh_updates_lessons_for_current_session() {
+        let data = "var lessonJSONs=[{id:371644,no:'RF.001',name:'Rust',teachers:'张老师',stdCount:1,limitCount:2}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:1,lc:2}}";
+        let base = serve_sequence_delayed(
+            vec!["<html>elect page</html>", data, counts],
+            Duration::ZERO,
+        );
+        let state = prepared_state(&base);
+        refresh_lessons(state.clone(), String::new());
+        wait_refresh_done(&state);
+        assert_eq!(state.lessons.lock().len(), 1);
+        assert!(state.worker_message.lock().contains("刷新完成"));
+    }
+
+    #[test]
+    fn stale_refresh_result_is_discarded_after_logout() {
+        let data = "var lessonJSONs=[{id:371644,no:'RF.002',name:'Rust',teachers:'张老师',stdCount:1,limitCount:2}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:1,lc:2}}";
+        let base = serve_sequence_delayed(
+            vec!["<html>elect page</html>", data, counts],
+            Duration::from_millis(200),
+        );
+        let state = prepared_state(&base);
+        refresh_lessons(state.clone(), String::new());
+        assert!(state.refreshing.load(Ordering::Acquire));
+        // 刷新在途时退出登录：会话代际推进，旧任务的结果必须整体作废。
+        logout(&state);
+        wait_refresh_done(&state);
+        assert!(
+            state.lessons.lock().is_empty(),
+            "stale refresh wrote lessons back after logout"
+        );
+        assert_eq!(state.worker_message.lock().clone(), "已退出登录");
+        let logs = log_messages(&state);
+        assert!(
+            !logs
+                .iter()
+                .any(|m| m.contains("刷新完成") || m.contains("刷新失败")),
+            "stale refresh must stay silent, got {logs:?}"
+        );
+    }
+
+    #[test]
+    fn stale_keepalive_auth_error_does_not_kill_new_session() {
+        let login_page = r#"<form id="loginForm"><input name="password"></form>"#;
+        let base = serve_sequence_delayed(vec![login_page], Duration::from_millis(300));
+        let state = prepared_state(&base);
+        keepalive(state.clone(), false, false);
+        // 保活在途时退出并完成一次新登录（旧 client 的请求仍会返回登录页）。
+        logout(&state);
+        state.logged_in.store(true, Ordering::Release);
+        *state.client.lock() = Some(Arc::new(
+            EamsClient::new("http://127.0.0.1:9/eams", 5, false).unwrap(),
+        ));
+        // 旧保活返回登录失效后，不得注销新会话。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                state.logged_in.load(Ordering::Acquire),
+                "stale keepalive cleared the new session"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(state.client.lock().is_some());
+        let logs = log_messages(&state);
+        assert!(
+            !logs.iter().any(|m| m.contains("会话保活发现登录失效")),
+            "stale keepalive must stay silent, got {logs:?}"
+        );
+    }
+
+    fn log_messages(state: &SharedState) -> Vec<String> {
+        state
+            .logs
+            .lock()
+            .iter()
+            .map(|l| l.message.clone())
+            .collect()
+    }
+
+    fn prepared_state(base: &str) -> Arc<SharedState> {
+        let state = SharedState::new();
+        state.logged_in.store(true, Ordering::Release);
+        *state.profile_id.lock() = "0".into();
+        *state.client.lock() = Some(Arc::new(EamsClient::new(base, 5, false).unwrap()));
+        state
+    }
+
+    fn wait_refresh_done(state: &SharedState) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.refreshing.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !state.refreshing.load(Ordering::Acquire),
+            "refresh task did not finish in time"
+        );
+    }
+
+    /// 与 monitor.rs 的 serve_sequence 同款手写 TCP mock，多一个响应前
+    /// 延迟参数，用于制造“任务在途时会话已更替”的时序。
+    fn serve_sequence_delayed(responses: Vec<&'static str>, delay: Duration) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                std::thread::sleep(delay);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{address}/eams")
     }
 }

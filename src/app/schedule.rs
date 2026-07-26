@@ -1,29 +1,25 @@
 use super::CourseApp;
 use crate::app::theme::{
-    number_drag_f64, number_drag_u32, quiet_button, AMBER, BLUE, CAPTION_SIZE, GLASS_SOFT, LINE,
-    META_SIZE, MUTED, TEXT,
+    number_drag_f64, number_drag_u32, pal, quiet_button, CAPTION_SIZE, META_SIZE,
 };
 use crate::config::{days_in_month, ScheduleStamp};
-use crate::worker::{self, LogLevel};
+use crate::worker;
 use eframe::egui::{self, RichText, Vec2};
 
 impl CourseApp {
     pub(super) fn maybe_trigger_schedule(&mut self, logged: bool, running: bool, logging_in: bool) {
-        // If a precise arm already started the run, mark the key fired so we don't double-trigger.
+        // 触发权在 worker 的精确待命任务（arm_schedule 是唯一 fire 点）：
+        // UI 帧循环只按配置与共享状态决定重新待命、取消或标记过期。
+        // 运行期间不动待命状态——手动开抢绝不能把定时键误标成已触发。
         if running {
-            if let Some(key) = self.schedule_armed_for.take() {
-                self.schedule_fired_for = Some(key);
-            }
             return;
         }
         if !self.cfg.schedule_enabled || !logged || logging_in {
             worker::cancel_schedule_arm(&self.state);
-            self.schedule_armed_for = None;
             return;
         }
         if self.cfg.cleaned_watch().is_empty() {
             worker::cancel_schedule_arm(&self.state);
-            self.schedule_armed_for = None;
             return;
         }
         let Some(stamp) = ScheduleStamp::parse(&self.cfg.schedule_time) else {
@@ -35,32 +31,21 @@ impl CourseApp {
             return;
         };
         let key = stamp.display();
-        if self.schedule_fired_for.as_deref() == Some(key.as_str()) {
-            return;
-        }
+        let fired = self.state.schedule_fired_matches(&key);
+        let armed = self.state.schedule_armed_matches(&key);
         let now = worker::local_now_seconds();
-        // Missed the window (e.g. app opened long after the target) — mark expired, don't fire.
-        if now > target_secs + 30 {
-            self.schedule_fired_for = Some(key);
-            worker::cancel_schedule_arm(&self.state);
-            return;
-        }
-        if now >= target_secs {
-            self.schedule_fired_for = Some(key.clone());
-            self.schedule_armed_for = None;
-            worker::cancel_schedule_arm(&self.state);
-            self.state
-                .log(LogLevel::Info, format!("定时开抢触发：{key}"));
-            self.status_line = format!("定时开抢已触发（{key}）");
-            self.start_grab();
-            return;
-        }
-        // Precise background arm once per key (avoid re-arming every UI frame).
-        if self.schedule_armed_for.as_deref() != Some(key.as_str()) {
-            self.schedule_armed_for = Some(key.clone());
-            worker::arm_schedule(self.state.clone(), self.cfg.clone(), target_secs);
-            let remain = target_secs - now;
-            self.status_line = format!("定时精准确待命，约 {remain}s 后开抢");
+        match worker::schedule_decision(now, target_secs, fired, armed) {
+            // Missed the window (e.g. app opened long after the target) — mark expired, don't fire.
+            worker::ScheduleAction::MarkExpired => {
+                self.state.mark_schedule_expired(&key);
+            }
+            // 到点但未过宽限期时同样走 Arm：arm_schedule 的立即分支会开抢。
+            worker::ScheduleAction::Arm => {
+                let remain = (target_secs - now).max(0);
+                worker::arm_schedule(self.state.clone(), self.cfg.clone(), key, target_secs);
+                self.status_line = format!("定时精准待命，约 {remain}s 后开抢");
+            }
+            worker::ScheduleAction::Noop => {}
         }
     }
 
@@ -76,8 +61,8 @@ impl CourseApp {
         });
 
         egui::Frame::NONE
-            .fill(GLASS_SOFT)
-            .stroke(egui::Stroke::new(1.0, LINE))
+            .fill(pal().glass_soft)
+            .stroke(egui::Stroke::new(1.0, pal().line))
             .corner_radius(10.0)
             .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
@@ -90,7 +75,7 @@ impl CourseApp {
                     ui.label(
                         RichText::new("到点自动开始（需已登录且有监控目标）")
                             .size(CAPTION_SIZE)
-                            .color(MUTED),
+                            .color(pal().muted),
                     );
                 });
 
@@ -99,7 +84,7 @@ impl CourseApp {
                     RichText::new("开抢时刻")
                         .size(META_SIZE)
                         .strong()
-                        .color(TEXT),
+                        .color(pal().text),
                 );
                 ui.add_space(6.0);
 
@@ -196,13 +181,13 @@ impl CourseApp {
                             worker::now_stamp()
                         ))
                         .size(CAPTION_SIZE)
-                        .color(MUTED),
+                        .color(pal().muted),
                     );
                 });
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("开抢冲刺").size(META_SIZE).color(MUTED));
+                    ui.label(RichText::new("开抢冲刺").size(META_SIZE).color(pal().muted));
                     let mut burst = self.cfg.open_burst_seconds as f64;
                     if number_drag_f64(ui, &mut burst, true, 0.0..=120.0, 1.0, 0, "秒", 72.0)
                         .changed()
@@ -213,7 +198,7 @@ impl CourseApp {
                     ui.label(
                         RichText::new("开始后前 N 秒去掉轮询正抖动，首轮不等待")
                             .size(CAPTION_SIZE)
-                            .color(MUTED),
+                            .color(pal().muted),
                     );
                 });
 
@@ -235,7 +220,11 @@ impl CourseApp {
                         ui.label(
                             RichText::new(hint)
                                 .size(CAPTION_SIZE)
-                                .color(if now < target { BLUE } else { AMBER }),
+                                .color(if now < target {
+                                    pal().blue
+                                } else {
+                                    pal().amber
+                                }),
                         );
                     }
                 }
@@ -243,11 +232,14 @@ impl CourseApp {
 
         if dirty {
             if let Some(valid) = stamp.validated() {
-                self.cfg.schedule_time = valid.display();
-                // Re-arm when user changes the target.
-                self.schedule_fired_for = None;
-                self.schedule_armed_for = None;
-                worker::cancel_schedule_arm(&self.state);
+                let next = valid.display();
+                // 只有开抢时刻真的改了才重置去重键。否则在宽限期内动一下
+                // 「定时开抢」开关就会解除去重，同一时刻二次开抢。
+                if next != self.cfg.schedule_time {
+                    self.cfg.schedule_time = next;
+                    self.state.clear_schedule_fired();
+                    worker::cancel_schedule_arm(&self.state);
+                }
             }
         }
         dirty

@@ -846,6 +846,47 @@ mod tests {
         assert!(stamp.to_local_seconds().unwrap() > 0);
     }
 
+    // days_from_civil 是手写历法算法，必须有已知日期的数值断言兜底；
+    // 基准：东八区本地秒 = Unix 秒 + 8*3600（与 worker::local_now_seconds 一致）。
+    #[test]
+    fn to_local_seconds_matches_known_utc8_instants() {
+        let epoch = ScheduleStamp {
+            year: 1970,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        };
+        assert_eq!(epoch.to_local_seconds(), Some(0));
+        // 闰日：2024-02-29 08:00:00 UTC+8 == 2024-02-29T00:00:00Z == Unix 1_709_164_800。
+        let leap_day = ScheduleStamp {
+            year: 2024,
+            month: 2,
+            day: 29,
+            hour: 8,
+            minute: 0,
+            second: 0,
+        };
+        assert_eq!(leap_day.to_local_seconds(), Some(1_709_164_800 + 8 * 3600));
+        // 闰日翌日 2024-03-01 00:00:00 UTC+8 == 2024-02-29T16:00:00Z == Unix 1_709_222_400。
+        let after_leap = ScheduleStamp {
+            year: 2024,
+            month: 3,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        };
+        assert_eq!(
+            after_leap.to_local_seconds(),
+            Some(1_709_222_400 + 8 * 3600)
+        );
+        // 平年没有 2/29；闰年有。
+        assert!(ScheduleStamp::parse("2025-02-29 08:00:00").is_none());
+        assert!(ScheduleStamp::parse("2024-02-29 08:00:00").is_some());
+    }
+
     #[test]
     fn normalize_keeps_only_valid_lesson_ids_for_active_serials() {
         let mut cfg = AppConfig {

@@ -1,4 +1,5 @@
 use super::time::now_hms;
+use crate::config::AppConfig;
 use crate::eams::{EamsClient, Lesson, NetworkSnapshot};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -88,6 +89,15 @@ pub struct SharedState {
     pub(crate) run_owner: AtomicU64,
     /// Bumped to cancel an armed scheduled start.
     pub(crate) schedule_arm_generation: AtomicU64,
+    /// 会话代际：登录开始/退出/清会话时自增。刷新与保活等后台任务完成
+    /// 时据此丢弃陈旧结果，避免旧账号数据写回新会话或误杀新会话。
+    pub(crate) session_generation: AtomicU64,
+    /// 当前精确待命的定时开抢键（YYYY-MM-DD HH:MM:SS）。
+    pub(crate) schedule_armed_key: Mutex<Option<String>>,
+    /// 已触发或已确认过期的定时开抢键：同一时刻只触发一次。
+    pub(crate) schedule_fired_key: Mutex<Option<String>>,
+    /// UI 最近一次保存的运行配置：定时到点开抢读取它而非 arm 时刻快照。
+    pub(crate) latest_config: Mutex<Option<AppConfig>>,
     pub logs: Mutex<VecDeque<LogItem>>,
     pub lessons: Mutex<Vec<Lesson>>,
     pub watch: Mutex<Vec<WatchStatus>>,
@@ -108,6 +118,10 @@ impl SharedState {
             run_generation: AtomicU64::new(0),
             run_owner: AtomicU64::new(0),
             schedule_arm_generation: AtomicU64::new(0),
+            session_generation: AtomicU64::new(0),
+            schedule_armed_key: Mutex::new(None),
+            schedule_fired_key: Mutex::new(None),
+            latest_config: Mutex::new(None),
             logs: Mutex::new(VecDeque::new()),
             lessons: Mutex::new(Vec::new()),
             watch: Mutex::new(Vec::new()),
@@ -141,9 +155,86 @@ impl SharedState {
         self.running.store(false, Ordering::Release);
         self.stopping.store(false, Ordering::Release);
         self.run_generation.fetch_add(1, Ordering::AcqRel);
+        self.invalidate_session_tasks();
         *self.client.lock() = None;
         self.lessons.lock().clear();
         self.set_message(message);
+    }
+
+    /// 当前会话代际，配合 `is_current_session` 保护后台任务的回写。
+    pub(crate) fn session_token(&self) -> u64 {
+        self.session_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_current_session(&self, token: u64) -> bool {
+        self.session_generation.load(Ordering::Acquire) == token
+    }
+
+    /// 会话更替（登录开始/退出/清会话）：作废在途 refresh/keepalive 的回写。
+    pub(crate) fn invalidate_session_tasks(&self) {
+        self.session_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 登记新的定时待命：自增代际使旧待命任务退出、记录键，返回持有代际。
+    pub(crate) fn begin_schedule_arm(&self, key: &str) -> u64 {
+        let mut armed = self.schedule_armed_key.lock();
+        let arm_gen = self.schedule_arm_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *armed = Some(key.to_string());
+        arm_gen
+    }
+
+    /// 取消定时待命：代际自增并清空 armed 键。
+    pub(crate) fn cancel_schedule_arm(&self) {
+        let mut armed = self.schedule_armed_key.lock();
+        self.schedule_arm_generation.fetch_add(1, Ordering::AcqRel);
+        *armed = None;
+    }
+
+    /// 待命被手动开抢/登录打断时解除（不标记 fired，之后可重新待命）。
+    /// 仅在代际未被新待命/取消接管时清键，避免误清接管方的状态。
+    pub(crate) fn disarm_schedule_if_current(&self, arm_gen: u64) {
+        let mut armed = self.schedule_armed_key.lock();
+        if self.schedule_arm_generation.load(Ordering::Acquire) == arm_gen {
+            *armed = None;
+        }
+    }
+
+    /// 到点认领触发权：代际仍属当前待命则解除待命并把该键标记为已触发。
+    /// 返回 false 表示已被取消或新的待命接管，调用方必须放弃开抢。
+    pub(crate) fn claim_schedule_fire(&self, key: &str, arm_gen: u64) -> bool {
+        let mut armed = self.schedule_armed_key.lock();
+        if self.schedule_arm_generation.load(Ordering::Acquire) != arm_gen {
+            return false;
+        }
+        *armed = None;
+        *self.schedule_fired_key.lock() = Some(key.to_string());
+        true
+    }
+
+    /// 错过触发窗口：解除待命并把该键标记为已触发（过期不补抢）。
+    pub(crate) fn mark_schedule_expired(&self, key: &str) {
+        let mut armed = self.schedule_armed_key.lock();
+        self.schedule_arm_generation.fetch_add(1, Ordering::AcqRel);
+        *armed = None;
+        *self.schedule_fired_key.lock() = Some(key.to_string());
+    }
+
+    /// 用户修改开抢时刻后重置 fired 去重键，让新时刻可以再次触发。
+    pub(crate) fn clear_schedule_fired(&self) {
+        *self.schedule_fired_key.lock() = None;
+    }
+
+    pub(crate) fn schedule_armed_matches(&self, key: &str) -> bool {
+        self.schedule_armed_key.lock().as_deref() == Some(key)
+    }
+
+    pub(crate) fn schedule_fired_matches(&self, key: &str) -> bool {
+        self.schedule_fired_key.lock().as_deref() == Some(key)
+    }
+
+    /// 发布最新运行配置：定时到点开抢用它，而不是 arm 时刻的快照。
+    pub(crate) fn publish_config(&self, cfg: AppConfig) {
+        *self.latest_config.lock() = Some(cfg);
     }
 
     /// Returns the current in-memory network health for the active session.
