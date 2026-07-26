@@ -6,8 +6,8 @@
 
 use super::monitor::start_grab;
 use super::runtime::spawn_task;
-use super::time::local_now_millis;
-use super::{local_now_seconds, LogLevel, SharedState};
+use super::time::{server_now_millis, server_now_seconds};
+use super::{LogLevel, SharedState};
 use crate::config::AppConfig;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -71,7 +71,7 @@ pub fn arm_schedule(state: Arc<SharedState>, cfg: AppConfig, key: String, target
     let arm_gen = state.begin_schedule_arm(&key);
     // fire 时读取的配置基线；之后每次保存配置都会覆盖（见 save_config）。
     state.publish_config(cfg.clone());
-    let now = local_now_seconds();
+    let now = server_now_seconds();
     if now >= target_local_secs {
         // Already due — fire immediately, worker-side, but only inside the grace window.
         if !within_schedule_grace(now, target_local_secs) {
@@ -92,7 +92,7 @@ pub fn arm_schedule(state: Arc<SharedState>, cfg: AppConfig, key: String, target
         // 单调时钟基线：用它识别墙钟跳变（休眠唤醒、系统对时），墙钟自己
         // 没法区分「睡了两小时」和「时间被改了」。
         let mut last_monotonic = Instant::now();
-        let mut last_wall = local_now_seconds();
+        let mut last_wall = server_now_seconds();
         loop {
             if state.schedule_arm_generation.load(Ordering::Acquire) != arm_gen {
                 // 已被取消或新的待命接管：armed 键由接管方维护，不能动。
@@ -104,7 +104,7 @@ pub fn arm_schedule(state: Arc<SharedState>, cfg: AppConfig, key: String, target
                 state.disarm_schedule_if_current(arm_gen);
                 return;
             }
-            let now = local_now_seconds();
+            let now = server_now_seconds();
             let monotonic_elapsed = last_monotonic.elapsed().as_secs() as i64;
             let wall_elapsed = now - last_wall;
             if (wall_elapsed - monotonic_elapsed).abs() > CLOCK_JUMP_TOLERANCE_SECS {
@@ -139,7 +139,7 @@ pub fn arm_schedule(state: Arc<SharedState>, cfg: AppConfig, key: String, target
         }
         // 唤醒后必须复查宽限期：休眠跨过目标时刻时 tokio 定时器会立刻到期，
         // 不检查就会在错过数小时后突然开抢。
-        let woke_at = local_now_seconds();
+        let woke_at = server_now_seconds();
         if !within_schedule_grace(woke_at, target_local_secs) {
             expire_schedule(&state, &key, woke_at - target_local_secs);
             return;
@@ -147,7 +147,7 @@ pub fn arm_schedule(state: Arc<SharedState>, cfg: AppConfig, key: String, target
         if !state.claim_schedule_fire(&key, arm_gen) {
             return;
         }
-        let deviation_ms = local_now_millis() - target_local_secs * 1000;
+        let deviation_ms = server_now_millis() - target_local_secs * 1000;
         state.log(
             LogLevel::Info,
             format!("精确定时触发（偏差 {deviation_ms:+}ms）"),
@@ -207,9 +207,64 @@ mod tests {
         );
     }
 
+    /// 定时相关的测试共用一个进程级墙钟偏移，必须串行执行并在进入时复位，
+    /// 否则会互相污染。
+    fn clock_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::worker::time::reset_test_clock();
+        guard
+    }
+
+    // T-02 + G-05：真实场景是「合盖休眠两小时后唤醒」。以前只能靠真实等待，
+    // 根本测不了；现在拨墙钟即可确定性复现——唤醒后必须判过期，而不是补抢。
+    #[test]
+    fn waiter_that_wakes_past_the_grace_window_expires_instead_of_firing() {
+        let _guard = clock_guard();
+        let base = serve_nothing();
+        let state = prepared_state(&base);
+        let key = "2026-01-01 08:00:00";
+        // 目标在 5 秒后：待命任务进入等待循环。
+        arm_schedule(
+            state.clone(),
+            test_config(&base, "SLEEP.001"),
+            key.into(),
+            server_now_seconds() + 5,
+        );
+        assert!(state.schedule_armed_matches(key), "must be armed first");
+
+        // 模拟休眠两小时后唤醒：墙钟一次性跳过目标时刻并远超宽限期。
+        crate::worker::time::advance_test_clock(2 * 3600 * 1000);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !state.schedule_fired_matches(key) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !state.running.load(Ordering::Acquire),
+            "must not start a grab hours after the target"
+        );
+        assert!(
+            state.schedule_fired_matches(key),
+            "must be marked expired so it never fires later"
+        );
+        let logs = state
+            .logs
+            .lock()
+            .iter()
+            .map(|item| item.message.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            logs.iter().any(|m| m.contains("已过期未触发")),
+            "user must be told why it did not fire, got {logs:?}"
+        );
+        crate::worker::time::reset_test_clock();
+    }
+
     // G-05：宽限期语义必须只有一处实现，UI 与待命任务共用。
     #[test]
     fn grace_window_boundaries_are_shared_with_the_ui_decision() {
+        let _guard = clock_guard();
         let target = 1_000_000_i64;
         assert!(within_schedule_grace(target - 1, target));
         assert!(within_schedule_grace(target, target));
@@ -229,6 +284,7 @@ mod tests {
     // 半夜三点突然开始抢一门早上八点该抢的课，比不抢更糟。
     #[test]
     fn arm_past_the_grace_window_expires_instead_of_firing() {
+        let _guard = clock_guard();
         let base = serve_nothing();
         let state = prepared_state(&base);
         let key = "2026-01-01 08:00:00";
@@ -236,7 +292,7 @@ mod tests {
             state.clone(),
             test_config(&base, "LATE.001"),
             key.into(),
-            local_now_seconds() - SCHEDULE_GRACE_SECS - 5,
+            server_now_seconds() - SCHEDULE_GRACE_SECS - 5,
         );
         assert!(
             !state.running.load(Ordering::Acquire),
@@ -259,6 +315,7 @@ mod tests {
 
     #[test]
     fn overdue_arm_fires_immediately_and_marks_fired() {
+        let _guard = clock_guard();
         let base = serve_nothing();
         let state = prepared_state(&base);
         let key = "2026-01-01 08:00:00";
@@ -266,7 +323,7 @@ mod tests {
             state.clone(),
             test_config(&base, "DUE.001"),
             key.into(),
-            local_now_seconds() - 5,
+            server_now_seconds() - 5,
         );
         // 立即触发分支是同步的：返回时 run 已开始、fired 已标记、待命解除。
         assert!(state.running.load(Ordering::Acquire));
@@ -281,6 +338,7 @@ mod tests {
 
     #[test]
     fn waiter_fires_at_target_with_latest_config() {
+        let _guard = clock_guard();
         let base = serve_nothing();
         let state = prepared_state(&base);
         let key = "2026-01-01 08:00:00";
@@ -288,7 +346,7 @@ mod tests {
             state.clone(),
             test_config(&base, "OLD.001"),
             key.into(),
-            local_now_seconds() + 2,
+            server_now_seconds() + 2,
         );
         assert!(state.schedule_armed_matches(key));
         // arm 之后用户继续修改配置：到点必须用最新配置而不是 arm 快照。
@@ -315,13 +373,14 @@ mod tests {
 
     #[test]
     fn manual_run_during_armed_wait_disarms_without_firing() {
+        let _guard = clock_guard();
         let state = crate::worker::SharedState::new();
         let key = "2026-01-01 08:00:00";
         arm_schedule(
             state.clone(),
             AppConfig::default(),
             key.into(),
-            local_now_seconds() + 30,
+            server_now_seconds() + 30,
         );
         assert!(state.schedule_armed_matches(key));
         // 定时待命期间手动开抢：待命任务必须退出且不得把该键标成 fired，
@@ -339,20 +398,26 @@ mod tests {
         state.running.store(false, Ordering::Release);
         // 运行结束后 UI 决策必须重新待命。
         assert_eq!(
-            schedule_decision(local_now_seconds(), local_now_seconds() + 20, false, false),
+            schedule_decision(
+                server_now_seconds(),
+                server_now_seconds() + 20,
+                false,
+                false
+            ),
             ScheduleAction::Arm
         );
     }
 
     #[test]
     fn cancelled_arm_never_fires() {
+        let _guard = clock_guard();
         let state = crate::worker::SharedState::new();
         let key = "2026-01-01 08:00:00";
         let cfg = AppConfig {
             watch_serials: vec!["CXL.001".into()],
             ..Default::default()
         };
-        arm_schedule(state.clone(), cfg, key.into(), local_now_seconds() + 1);
+        arm_schedule(state.clone(), cfg, key.into(), server_now_seconds() + 1);
         assert!(state.schedule_armed_matches(key));
         cancel_schedule_arm(&state);
         assert!(!state.schedule_armed_matches(key));

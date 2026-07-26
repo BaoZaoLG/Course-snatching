@@ -36,6 +36,8 @@ pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
     state.logged_in.store(false, Ordering::Release);
     // 新登录开启新会话：作废上一会话仍在途的刷新/保活任务的回写。
     state.invalidate_session_tasks();
+    // 可能换了教务地址，旧的时钟偏移不再有意义；重新登录会立刻用新样本对上。
+    crate::eams::clock::ClockSync::global().reset();
     *state.client.lock() = None;
     state.lessons.lock().clear();
     state.set_message("正在登录…");

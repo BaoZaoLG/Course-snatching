@@ -1,6 +1,7 @@
 //! 教务系统客户端：登录、课程拉取、选课提交。
 
 mod backoff;
+pub mod clock;
 /// 统一退避（decorrelated jitter）。worker 层的兜底退避也用它，避免三处
 /// 各写一份确定性阶梯造成重试雪崩。
 pub fn backoff_for_attempt(attempt: u32) -> std::time::Duration {

@@ -89,6 +89,8 @@ impl EamsClient {
         priority: RequestPriority,
     ) -> Result<(Url, String)> {
         let permit = self.governor.acquire(priority).await;
+        // 对时是被动的：每个响应都带 Date 头，零额外请求。
+        let sent_at = std::time::Instant::now();
         let result = async {
             let response = request.send().await.map_err(|error| {
                 // 被拦下的 SSO 跳转 = 会话过期，必须走登录失效分支而不是网络重试。
@@ -102,6 +104,16 @@ impl EamsClient {
                     source: Some(Box::new(error)),
                 }
             })?;
+            // 一收到响应头就对时：此刻的 Instant 离服务器生成 Date 最近，
+            // 读体、解码、解析都会污染 RTT 估计。
+            super::clock::ClockSync::global().observe(
+                sent_at,
+                std::time::Instant::now(),
+                response
+                    .headers()
+                    .get(reqwest::header::DATE)
+                    .and_then(|value| value.to_str().ok()),
+            );
             let status = response.status();
             let final_url = response.url().clone();
             let retry_after_secs = parse_retry_after_secs(response.headers());

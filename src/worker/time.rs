@@ -2,11 +2,7 @@
 use std::time::SystemTime;
 
 pub fn local_now_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0) as i64
-        + 8 * 3600
+    local_now_millis().div_euclid(1000)
 }
 
 /// 东八区本地毫秒。定时触发偏差必须用毫秒精度衡量——整秒精度下
@@ -17,6 +13,53 @@ pub fn local_now_millis() -> i64 {
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
         + 8 * 3600 * 1000
+        + test_clock_offset_ms()
+}
+
+/// 服务器视角的东八区毫秒。
+///
+/// 定时开抢一律用它：Windows 大约每周才同步一次时间，本机偏差 3–10 秒
+/// 非常常见，而抢课场景下 3 秒偏差等于必输。未对时时它等于本机时间。
+pub fn server_now_millis() -> i64 {
+    crate::eams::clock::ClockSync::global().server_unix_millis()
+        + 8 * 3600 * 1000
+        + test_clock_offset_ms()
+}
+
+/// 服务器视角的东八区秒。
+pub fn server_now_seconds() -> i64 {
+    server_now_millis().div_euclid(1000)
+}
+
+/// 测试用的墙钟偏移。
+///
+/// 定时逻辑要能测「休眠跨过目标时刻后唤醒」「系统对时导致墙钟跳变」这类
+/// 场景，而真实等待既慢又不确定。生产构建里这个函数是常量 0，会被完全
+/// 优化掉；只有测试能拨动它。
+#[cfg(test)]
+pub(crate) fn test_clock_offset_ms() -> i64 {
+    TEST_CLOCK_OFFSET_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn test_clock_offset_ms() -> i64 {
+    0
+}
+
+#[cfg(test)]
+static TEST_CLOCK_OFFSET_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// 把墙钟往前拨 `millis` 毫秒（可为负）。仅测试可用。
+#[cfg(test)]
+pub(crate) fn advance_test_clock(millis: i64) {
+    TEST_CLOCK_OFFSET_MS.fetch_add(millis, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 复位测试时钟。测试之间必须复位，否则会互相污染。
+#[cfg(test)]
+pub(crate) fn reset_test_clock() {
+    TEST_CLOCK_OFFSET_MS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub(crate) fn local_seconds() -> i64 {

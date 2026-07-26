@@ -33,7 +33,7 @@ impl CourseApp {
         let key = stamp.display();
         let fired = self.state.schedule_fired_matches(&key);
         let armed = self.state.schedule_armed_matches(&key);
-        let now = worker::local_now_seconds();
+        let now = worker::server_now_seconds();
         match worker::schedule_decision(now, target_secs, fired, armed) {
             // Missed the window (e.g. app opened long after the target) — mark expired, don't fire.
             worker::ScheduleAction::MarkExpired => {
@@ -205,7 +205,7 @@ impl CourseApp {
                 if self.cfg.schedule_enabled {
                     ui.add_space(4.0);
                     if let Some(target) = stamp.to_local_seconds() {
-                        let now = worker::local_now_seconds();
+                        let now = worker::server_now_seconds();
                         let hint = if now < target {
                             let wait = target - now;
                             let h = wait / 3600;
@@ -225,6 +225,30 @@ impl CourseApp {
                                 } else {
                                     pal().amber
                                 }),
+                        );
+                        // 对时状态必须如实说：定时开抢的全部价值建立在
+                        // 「本机时间等于服务器时间」上，没对上就别让用户
+                        // 以为倒计时是准的。
+                        let clock = crate::eams::clock::ClockSync::global().snapshot();
+                        let (clock_text, clock_color) = if clock.synced {
+                            (
+                                format!(
+                                    "已与教务服务器对时，偏差 {:+}ms（基于 {}ms 往返）",
+                                    clock.offset_ms, clock.best_rtt_ms
+                                ),
+                                pal().muted,
+                            )
+                        } else {
+                            (
+                                "尚未与服务器对时，倒计时按本机时间估算；登录或刷新一次即可对时"
+                                    .to_string(),
+                                pal().amber,
+                            )
+                        };
+                        ui.label(
+                            RichText::new(clock_text)
+                                .size(CAPTION_SIZE)
+                                .color(clock_color),
                         );
                     }
                 }
