@@ -1,16 +1,81 @@
-# Cargo audit exceptions
+# 安全说明
 
-`Cargo.lock` currently contains `quick-xml 0.39.4` only through the Linux/Wayland
-build-time dependency `wayland-scanner`. The application is a Windows-only binary,
-and `cargo tree --target x86_64-pc-windows-msvc -i quick-xml@0.39.4` confirms that
-the crate is not part of the Windows build or shipped executable.
+这是一个处理教务系统账号密码的桌面工具。下面写清楚它防什么、不防什么，
+以及怎么报告问题——把边界说明白，比含糊承诺「安全」更有用。
 
-The Windows audit script therefore ignores these two advisories only after asserting
-that the vulnerable crate is absent from the Windows dependency tree:
+## 报告漏洞
 
-- RUSTSEC-2026-0194
-- RUSTSEC-2026-0195
+请通过 GitHub 的 **Security → Report a vulnerability**（私密漏洞报告）提交，
+不要开公开 issue。若该功能不可用，可在仓库主页联系维护者。
 
-Remove the exceptions as soon as upstream Wayland dependencies move to
-`quick-xml >= 0.41.0`. If the crate ever enters the Windows tree, the script fails
-before invoking the ignored audit.
+请尽量附上：影响版本、复现步骤、你观察到的实际影响。收到后会尽快确认；
+修复发布前请不要公开细节。
+
+**请不要**在报告中附带真实账号、密码或未脱敏的教务页面。需要样本时，
+用「导出诊断包」生成的文件即可（见下文）。
+
+## 威胁模型
+
+### 防的
+
+| 风险 | 措施 |
+|---|---|
+| 凭据写进磁盘 | 密码从不落盘。配置文件里只有账号名，没有密码 |
+| 会话 Cookie 随调试页面泄露 | 原始调试页面**落盘时**就脱敏；含选课提交表单的页面整份不写 |
+| 日志/诊断包泄露凭据 | 脱敏在日志写入端完成，「导出日志」与「导出诊断包」两个出口结果一致 |
+| 崩溃报告泄露服务器文本 | panic 报告落盘前统一脱敏，并有 30 天年龄上限 |
+| 凭据跟着跳转跑到第三方 | 重定向白名单只允许同源；跳到统一身份认证的会话过期跳转会被识别为登录失效而非放行 |
+| 把学校服务器打崩 / 被封 IP | 进程级、按 origin 共享的令牌桶 + 四级优先级 + 熔断；服务器下发的 Retry-After 绝不被截短；退避带 decorrelated jitter，避免所有客户端同时重试 |
+| 多开绕过上述治理 | 单实例守护（命名互斥体） |
+| 注入 | 所有拼进 URL / 表单的 id 都过数字校验 |
+| 超大响应 / 解压炸弹 | 流式截断 + Content-Length 预检 |
+| 配置被降级破坏 | 配置带 schema 版本；读到更高版本时只读运行、拒绝覆盖写；未知字段原样保留 |
+
+### 不防的
+
+这些是明确的边界，不是疏漏：
+
+- **内存取证。** 运行期间内存里有密码（输入缓冲、以及开启「会话过期自动
+  重新登录」时保留的一份）和与账号等价的会话 Cookie。缓冲用 `Zeroizing`
+  且预分配以减少残留副本，但 egui 文本框自带的撤销历史应用层够不着，
+  进程被强杀或 panic 时清理代码也不会执行。能读取本进程内存的攻击者
+  可以拿到凭据。
+- **本机上的其他程序。** 配置与调试文件按当前用户权限存放在 `%APPDATA%`，
+  没有额外加密。同一账户下运行的程序可以读到。
+- **恶意的教务服务器。** 我们信任所配置的教务地址。它可以返回任意内容；
+  解析层做了健壮性处理（不 panic、有大小上限），但不做内容可信性判断。
+- **你自己发出去的诊断包。** 诊断包会脱敏常见的凭据/会话字段，但仍可能
+  含姓名、学号与你的课表。只发给你信任的人。
+- **抢课结果。** 这只是一个自动化工具，不保证抢到课，也不绕过学校的任何
+  选课规则。
+
+### 隐私相关的数据落点
+
+| 路径 | 内容 | 保留策略 |
+|---|---|---|
+| `%APPDATA%\Course-snatching\config.toml` | 账号名与偏好，**无密码** | 长期 |
+| `%APPDATA%\Course-snatching\debug\` | 脱敏后的原始页面（仅在你手动开启调试转储时） | 10 份 / 20MB / 7 天 |
+| `%APPDATA%\Course-snatching\crash\` | 脱敏后的崩溃报告 | 3 份 / 30 天 |
+
+## 依赖审计
+
+`cargo-deny` 按 `x86_64-pc-windows-msvc` 目标裁剪依赖图（见 `deny.toml`），
+因此不需要忽略任何公告——历史上曾长期 `--ignore` 的两条
+（RUSTSEC-2026-0194 / RUSTSEC-2026-0195）来自 `quick-xml`，它经
+`wayland-scanner` 进入 `Cargo.lock`，但 Windows 目标根本不编译它。
+
+`scripts/audit.ps1` 另外保留一条兜底断言：一旦 `quick-xml` 真的进入 Windows
+构建树，脚本直接失败。这条断言的意义在于——`ignore` 列表一旦养成习惯，
+将来真正该管的公告也会被顺手放过。
+
+## 发布产物的可信度
+
+Release 产物带 GitHub 的 build provenance 与 CycloneDX SBOM attestation，
+可用 `gh attestation verify` 校验。`.sha256` 只能检测传输损坏，防不了
+流水线被污染，所以不要只看它。
+
+Authenticode 签名默认关闭：签名步骤在 `scripts/package.ps1` 里，设置
+`COURSE_SNATCHING_SIGN_THUMBPRINT` 后生效。**未签名的产物会触发 Windows
+SmartScreen 警告**——对一个要求用户输入教务密码的工具来说，这是实打实的
+信任成本，建议正式分发前申请证书（开源项目可考虑 SignPath 或
+Azure Trusted Signing，申请有周期，建议提前一个版本启动）。

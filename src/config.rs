@@ -161,7 +161,9 @@ impl Default for AppConfig {
 impl AppConfig {
     /// 用户配置放在 roaming AppData，避免安装目录无写权限，也避免和发布文件混在一起。
     pub fn path() -> PathBuf {
-        if let Some(dir) = std::env::var_os("APPDATA") {
+        // APPDATA 为空串时 PathBuf::from("") 会让配置落到当前工作目录——
+        // 对一个双击运行的桌面程序来说那可能是任何地方。空值按「没有」处理。
+        if let Some(dir) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
             return PathBuf::from(dir)
                 .join("Course-snatching")
                 .join("config.toml");
@@ -235,6 +237,9 @@ impl AppConfig {
                     Ok(_) => format!("，原文件已备份到 {}", backup.display()),
                     Err(copy_error) => format!("，且备份失败：{copy_error}"),
                 };
+                // 损坏备份此前不参与任何轮转：配置一直坏着的话，每次启动都会
+                // 再堆一份内容相同的 config.invalid-*.toml。
+                let _ = retain_invalid_backups(path.parent().unwrap_or(Path::new(".")));
                 (
                     Self::default(),
                     Some(format!(
@@ -860,6 +865,33 @@ fn civil_from_days_cfg(days: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m as u32, d as u32)
+}
+
+/// 保留最近若干份损坏配置备份。
+///
+/// 只保留最新的几份即可定位问题；配置长期损坏时，无限堆积的备份既没用又
+/// 让用户以为程序在乱写文件。
+fn retain_invalid_backups(dir: &Path) -> io::Result<()> {
+    const KEEP: usize = 3;
+    let mut backups = fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("config.invalid-")
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((entry.path(), modified))
+        })
+        .collect::<Vec<_>>();
+    backups.sort_by_key(|(_, modified)| *modified);
+    let excess = backups.len().saturating_sub(KEEP);
+    for (path, _) in backups.into_iter().take(excess) {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
 }
 
 fn invalid_backup_path(path: &Path) -> PathBuf {

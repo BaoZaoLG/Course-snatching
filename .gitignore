@@ -6,6 +6,10 @@
 /*.rar
 /.tools/
 *.tmp
+# 原子保存失败时留下的备份，以及配置损坏时的快照。
+*.bak
+/config.invalid-*.toml
+/sbom.cdx.json
 /dist/
 *.log
 
