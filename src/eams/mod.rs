@@ -3,6 +3,39 @@
 mod backoff;
 pub mod clock;
 
+/// 供模糊测试使用的解析入口。
+///
+/// `parse.rs` 有 24 处 `Regex::new` 与 `Html::parse_document`，输入全部来自
+/// 远端 HTML，是整个项目最脆弱、最不可控的一层。这些函数签名都是
+/// `&str -> _`，接入 fuzz 的成本极低——单独开一个受控的公开面，好过为了
+/// fuzz 把整个 parse 模块公开出去。
+///
+/// 不变式只有一条：**不许 panic**。返回 Err 完全可以接受。
+pub mod fuzz_api {
+    /// 对所有解析入口喂同一段输入。任何一个 panic 都是缺陷。
+    pub fn parse_all(text: &str) {
+        let _ = super::parse::parse_lessons_json(text);
+        let _ = super::parse::parse_lessons_from_page(text);
+        let _ = super::parse::parse_lessons_js_like(text);
+        let _ = super::parse::parse_lessons_by_regex(text);
+        let _ = super::parse::parse_lessons_from_html_table(text);
+        let _ = super::parse::classify_elect_response(text);
+        let _ = super::parse::js_like_to_json(text);
+        let _ = super::parse::summarize_html(text);
+        let _ = super::parse::extract_password_salt(text);
+        let _ = super::parse::extract_login_error(text);
+        let _ = super::parse::extract_all_profile_ids(text);
+        let _ = super::parse::extract_profiles_detailed(text);
+        let _ = super::parse::body_looks_like_login_page(text);
+        let _ = super::parse::normalize_base(text);
+    }
+
+    /// 字节流入口：字符集解码同样在远端输入的第一线。
+    pub fn decode_body(content_type: Option<&str>, bytes: &[u8]) {
+        let _ = super::parse::decode_body(content_type, bytes);
+    }
+}
+
 /// 提交后等服务端状态落定的时间。
 ///
 /// 这段等待原先发生在提交闸门内部，等于白白占用最高优先级的独占许可。
@@ -314,7 +347,11 @@ impl EamsClient {
             .map(|(lessons, _complete)| lessons)
     }
 
-    pub(crate) async fn fetch_lessons_for_monitoring(
+    /// 一轮监控用的目录 + 人数拉取。
+    ///
+    /// `pub` 是为了让 `tests/request_budget.rs` 能断言单轮请求预算——那条
+    /// 断言挡的是「解析失败清缓存 → 下一轮重新探测」这类请求放大的正反馈环。
+    pub async fn fetch_lessons_for_monitoring(
         &self,
         profile_id: &str,
     ) -> Result<(Vec<Lesson>, bool)> {

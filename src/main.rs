@@ -1,15 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(linker_messages)]
 
-mod app;
-mod config;
-mod eams;
-mod notify;
-mod single_instance;
-mod worker;
-
-use app::CourseApp;
-use config::AppConfig;
+// 逻辑全在 lib 里（见 src/lib.rs 的说明）；这里只负责窗口启动与 panic 报告。
+use course_snatching::app::CourseApp;
+use course_snatching::config::AppConfig;
+use course_snatching::single_instance;
 use eframe::egui;
 use std::sync::Arc;
 

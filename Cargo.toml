@@ -24,6 +24,12 @@ include = [
     "/scripts/**",
 ]
 
+# lib 存在的目的是解锁 tests/ 集成测试、fuzz/ 目标与文档测试，
+# 不是为了对外提供 API。
+[lib]
+name = "course_snatching"
+path = "src/lib.rs"
+
 [[bin]]
 name = "Course-snatching"
 path = "src/main.rs"
