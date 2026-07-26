@@ -402,7 +402,17 @@ impl RequestGovernor {
             }
         }
 
+        // 半开探针只对「链路层面的失败」负责。
+        //
+        // 拿到干净的 HTTP 200、只是业务被拒（选课失败）或登录失效，恰恰证明
+        // 链路是通的——把它们算作探针失败会白白重开 60s 熔断，正好卡在恢复
+        // 的那一刻。
+        let link_level_failure = !matches!(
+            kind,
+            BackendErrorKind::Business | BackendErrorKind::AuthExpired | BackendErrorKind::Parse
+        );
         let half_open_failed = permit.half_open_probe
+            && link_level_failure
             && matches!(
                 state.circuit,
                 Circuit::HalfOpen { probe_id: Some(id) } if id == permit.id
@@ -462,10 +472,15 @@ impl RequestGovernor {
         advice
     }
 
+    /// 只读快照。
+    ///
+    /// 界面每帧都会调它，所以这里**不能**有状态机副作用：`advance_circuit`
+    /// 会推进熔断状态并清掉 hard cooldown，把它放在这里等于让熔断的推进
+    /// 频率由渲染帧率决定——窗口最小化时推进变慢，高刷屏上推进变快。
+    /// 状态推进只发生在 `acquire`（真正要发请求的时刻）。
     pub fn snapshot(&self) -> NetworkSnapshot {
         let now = Instant::now();
         let mut state = self.state.lock();
-        self.advance_circuit(&mut state, now);
         self.prune_request_events(&mut state, now);
         let denominator = state
             .first_request_at
@@ -482,11 +497,7 @@ impl RequestGovernor {
                 .map(|until| until.saturating_duration_since(now))
                 .unwrap_or(Duration::ZERO),
             last_error_kind: state.last_error_kind,
-            circuit_status: match state.circuit {
-                Circuit::Closed => CircuitStatus::Closed,
-                Circuit::Open { .. } => CircuitStatus::Open,
-                Circuit::HalfOpen { .. } => CircuitStatus::HalfOpen,
-            },
+            circuit_status: Self::circuit_view(&state, now),
         }
     }
 
@@ -523,6 +534,21 @@ impl RequestGovernor {
         if matches!(state.circuit, Circuit::Open { until } if now >= until) {
             state.circuit = Circuit::HalfOpen { probe_id: None };
             state.hard_cooldown_until = None;
+        }
+    }
+
+    /// `advance_circuit` 的只读版本：报告「如果此刻去 acquire，熔断会处于
+    /// 什么状态」，但不真的推进它。
+    ///
+    /// 界面每帧都取快照，让状态机的推进频率由渲染帧率决定是错的（窗口最小化
+    /// 时推进变慢、高刷屏上变快）。推进只发生在 `acquire`。
+    fn circuit_view(state: &GovernorState, now: Instant) -> CircuitStatus {
+        match state.circuit {
+            Circuit::Closed => CircuitStatus::Closed,
+            // 冷却已到期：下一次 acquire 就会转半开，快照如实这么报告。
+            Circuit::Open { until } if now >= until => CircuitStatus::HalfOpen,
+            Circuit::Open { .. } => CircuitStatus::Open,
+            Circuit::HalfOpen { .. } => CircuitStatus::HalfOpen,
         }
     }
 
@@ -1070,23 +1096,49 @@ mod tests {
     }
 
     #[test]
-    fn any_failed_half_open_probe_restarts_the_cooldown() {
+    // A-03：半开探针只对「链路层面的失败」负责。
+    //
+    // 拿到干净的 HTTP 200、只是业务被拒（选课失败），恰恰证明链路是通的——
+    // 把它算作探针失败会白白重开一整轮熔断，正好卡在恢复的那一刻。
+    // 链路层面的失败（超时/连接/限流/5xx）当然仍要重开。
+    fn business_rejection_does_not_reopen_the_circuit_but_link_failure_does() {
         runtime().block_on(async {
-            let governor = Arc::new(RequestGovernor::with_policy(test_policy()));
-            for _ in 0..3 {
-                let permit = governor.acquire(RequestPriority::Refresh).await;
-                governor.record_failure(
-                    &permit,
-                    BackendErrorKind::RateLimited,
-                    Some(Duration::from_millis(12)),
-                );
+            async fn trip(governor: &Arc<RequestGovernor>) {
+                for _ in 0..3 {
+                    let permit = governor.acquire(RequestPriority::Refresh).await;
+                    governor.record_failure(
+                        &permit,
+                        BackendErrorKind::RateLimited,
+                        Some(Duration::from_millis(12)),
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
 
+            // 业务被拒：探针算通过，熔断关闭。
+            let governor = Arc::new(RequestGovernor::with_policy(test_policy()));
+            trip(&governor).await;
+            let probe = governor.acquire(RequestPriority::Session).await;
+            assert!(probe.half_open_probe);
+            let advice = governor.record_failure(&probe, BackendErrorKind::Business, None);
+            assert_ne!(
+                advice,
+                RetryAdvice::CircuitOpen(Duration::from_millis(45)),
+                "a business rejection over a clean 200 proves the link is healthy"
+            );
+            assert_ne!(
+                governor.snapshot().circuit_status,
+                CircuitStatus::Open,
+                "the circuit must not slam shut right when we are recovering"
+            );
+
+            // 链路失败：仍然重开整轮冷却。
+            let governor = Arc::new(RequestGovernor::with_policy(test_policy()));
+            trip(&governor).await;
             let probe = governor.acquire(RequestPriority::Session).await;
             assert!(probe.half_open_probe);
             assert_eq!(
-                governor.record_failure(&probe, BackendErrorKind::Business, None),
+                governor.record_failure(&probe, BackendErrorKind::Timeout, None),
                 RetryAdvice::CircuitOpen(Duration::from_millis(45))
             );
             let snapshot = governor.snapshot();

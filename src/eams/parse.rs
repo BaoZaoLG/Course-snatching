@@ -186,18 +186,19 @@ pub(crate) fn normalize_base(raw: &str) -> Result<Url> {
     }
     url.set_fragment(None);
     url.set_query(None);
+    // 用户填了路径就原样保留，只补尾部斜杠。
+    //
+    // 此前是「路径不以 /eams 结尾就强行拼上 /eams/」：部署在根路径或
+    // /jwxt/ 的学校会被改写成 /jwxt/eams/ 这种不存在的地址，而用户从浏览器
+    // 地址栏复制过来的恰恰是正确的那个。/eams 只应该作为「用户没填路径时」
+    // 的默认猜测。
     let path = url.path().trim_end_matches('/');
-    if !path.ends_with("/eams") && path != "eams" {
-        let next = if path.is_empty() || path == "/" {
-            "/eams/".to_string()
-        } else {
-            format!("{path}/eams/")
-        };
-        url.set_path(&next);
+    let normalized = if path.is_empty() || path == "/" {
+        "/eams/".to_string()
     } else {
-        let normalized = format!("{path}/");
-        url.set_path(&normalized);
-    }
+        format!("{path}/")
+    };
+    url.set_path(&normalized);
     Ok(url)
 }
 

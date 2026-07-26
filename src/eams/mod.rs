@@ -931,10 +931,30 @@ mod tests {
     #[test]
     fn validates_base_url_security_and_normalization() {
         assert!(normalize_base("http://example.com").is_err());
+        // 没填路径时才猜 /eams/。
         let local = normalize_base("http://127.0.0.1:3000").unwrap();
         assert_eq!(local.path(), "/eams/");
         let secure = normalize_base("https://example.com/eams/").unwrap();
         assert_eq!(secure.as_str(), "https://example.com/eams/");
+
+        // A-04：用户填了路径就原样保留。此前这些会被改写成不存在的地址，
+        // 而它们恰恰是用户从浏览器地址栏复制过来的正确值。
+        assert_eq!(
+            normalize_base("https://jw.example.edu/jwxt")
+                .unwrap()
+                .path(),
+            "/jwxt/",
+            "a school deployed under /jwxt must not be rewritten to /jwxt/eams/"
+        );
+        assert_eq!(
+            normalize_base("https://jw.example.edu/eams/std")
+                .unwrap()
+                .path(),
+            "/eams/std/"
+        );
+        // query/fragment 仍然要去掉，尾斜杠仍然要补。
+        let trimmed = normalize_base("https://jw.example.edu/jwxt?a=1#x").unwrap();
+        assert_eq!(trimmed.as_str(), "https://jw.example.edu/jwxt/");
     }
 
     #[test]
