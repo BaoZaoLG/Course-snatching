@@ -59,6 +59,10 @@ struct RedactedPages {
     unreadable: usize,
 }
 
+/// 监控卡片上「组」输入框的 Id 前缀。
+static GROUP_FIELD_ID: std::sync::LazyLock<egui::Id> =
+    std::sync::LazyLock::new(|| egui::Id::new("watch_group_field"));
+
 /// 课程搜索框的固定 Id：Ctrl+F 要能把焦点移过去。
 static SEARCH_FIELD_ID: std::sync::LazyLock<egui::Id> =
     std::sync::LazyLock::new(|| egui::Id::new("catalog_search_field"));
@@ -1356,6 +1360,66 @@ impl CourseApp {
                                                     .size(CAPTION_SIZE)
                                                     .color(pal().muted),
                                             );
+                                            // F-03：填同一个组名 = 任选其一，
+                                            // 抢到其中一门就撤掉同组其余目标。
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new("组")
+                                                        .size(CAPTION_SIZE)
+                                                        .color(pal().muted),
+                                                );
+                                                let mut group = self
+                                                    .cfg
+                                                    .watch_groups
+                                                    .get(serial.as_str())
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                let response = ui.add_enabled(
+                                                    !running,
+                                                    egui::TextEdit::singleline(&mut group)
+                                                        .id(GROUP_FIELD_ID.with(serial.as_str()))
+                                                        .hint_text("任选其一")
+                                                        .desired_width(88.0)
+                                                        .margin(egui::Margin::symmetric(8, 4)),
+                                                );
+                                                if response.changed() {
+                                                    let trimmed = group.trim().to_string();
+                                                    if trimmed.is_empty() {
+                                                        self.cfg
+                                                            .watch_groups
+                                                            .remove(serial.as_str());
+                                                    } else {
+                                                        self.cfg
+                                                            .watch_groups
+                                                            .insert(serial.clone(), trimmed);
+                                                    }
+                                                    self.save_config();
+                                                }
+                                                if let Some(name) =
+                                                    self.cfg.watch_groups.get(serial.as_str())
+                                                {
+                                                    let siblings =
+                                                        self.cfg.group_siblings(serial.as_str());
+                                                    if !siblings.is_empty() {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "与 {} 任选其一",
+                                                                siblings.join("、")
+                                                            ))
+                                                            .size(CAPTION_SIZE)
+                                                            .color(pal().blue),
+                                                        );
+                                                    } else {
+                                                        ui.label(
+                                                            RichText::new(format!(
+                                                                "组「{name}」暂无其它成员"
+                                                            ))
+                                                            .size(CAPTION_SIZE)
+                                                            .color(pal().muted),
+                                                        );
+                                                    }
+                                                }
+                                            });
                                             ui.add_space(4.0);
                                             if let Some(item) = status {
                                                 ui.horizontal(|ui| {

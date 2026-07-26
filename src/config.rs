@@ -56,6 +56,13 @@ pub struct AppConfig {
     pub watch_lesson_ids: HashMap<String, String>,
     /// 课程序号对应的课程名/教师，便于监控卡片展示。
     pub watch_meta: HashMap<String, WatchMeta>,
+    /// 序号 → 互斥组名。
+    ///
+    /// 同组内「抢到任意一门就够了」：真实需求是「A/B/C 任选其一」或
+    /// 「抢到 A 就撤掉 B」，而 watch_serials 是平铺列表，所有目标彼此独立，
+    /// 抢到 A 之后仍会继续抢 B、C——多占了名额还占着学分。
+    /// 不在这张表里的序号就是独立目标，行为与以前完全一致。
+    pub watch_groups: HashMap<String, String>,
     /// 留空时自动探测；0 表示使用会话默认轮次。
     pub profile_id: String,
     pub timeout_seconds: u64,
@@ -134,6 +141,7 @@ impl Default for AppConfig {
             watch_serials: vec![],
             watch_lesson_ids: HashMap::new(),
             watch_meta: HashMap::new(),
+            watch_groups: HashMap::new(),
             profile_id: String::new(),
             timeout_seconds: 15,
             auto_fetch_on_login: true,
@@ -319,6 +327,13 @@ impl AppConfig {
         });
         self.watch_meta
             .retain(|serial, _| serials.contains(serial.as_str()));
+        // 组名跟着目标走：目标被移除后留着组名只会让下次同名目标莫名其妙
+        // 继承一个旧分组。空组名等于没分组。
+        self.watch_groups
+            .retain(|serial, group| serials.contains(serial.as_str()) && !group.trim().is_empty());
+        for group in self.watch_groups.values_mut() {
+            *group = group.trim().to_string();
+        }
         if !self.ui_scale.is_finite() {
             self.ui_scale = 1.0;
         }
@@ -490,6 +505,22 @@ impl AppConfig {
         fs::write(&path, report)?;
         let _ = retain_files(dir, CRASH_FILE_LIMIT, u64::MAX, Some(CRASH_MAX_AGE_SECS));
         Ok(path)
+    }
+}
+
+impl AppConfig {
+    /// 与 `serial` 同组的其它序号（不含它自己）。
+    ///
+    /// 组是「任选其一」语义：抢到其中任意一门，其余的就该撤掉。
+    pub fn group_siblings(&self, serial: &str) -> Vec<String> {
+        let Some(group) = self.watch_groups.get(serial) else {
+            return Vec::new();
+        };
+        self.watch_groups
+            .iter()
+            .filter(|(other, other_group)| other_group == &group && other.as_str() != serial)
+            .map(|(other, _)| other.clone())
+            .collect()
     }
 }
 

@@ -491,6 +491,27 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     Some(&lesson),
                 );
 
+                // F-03：一轮里同组最多提交一个。
+                //
+                // 组语义必须在这里生效而不是在结果阶段：提交是并发发出的，
+                // 等第一个成功回来时，同组的第二个 POST 早就在路上了——那正是
+                // 「任选其一」要避免的多占名额。本轮没抢到的话，目标仍留在
+                // pending 里，下一轮再试。
+                let already_queued_in_group = cfg
+                    .group_siblings(&serial)
+                    .iter()
+                    .any(|sibling| ready.iter().any(|(queued, _)| queued == sibling));
+                if already_queued_in_group {
+                    update_watch(
+                        &state,
+                        &serial,
+                        WatchState::Checking,
+                        "同组已有目标在提交，本轮跳过",
+                        Some(lesson.capacity_text()),
+                        Some(&lesson),
+                    );
+                    continue;
+                }
                 ready.push((serial.clone(), lesson));
             }
 
@@ -556,6 +577,9 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                         );
                         pending.remove(&serial);
                         succeeded += 1;
+                        // F-03：同组「任选其一」——抢到一门就撤掉同组其余目标，
+                        // 否则会继续抢，多占名额还占着学分。
+                        retire_group_siblings(&state, &cfg, &serial, &mut pending);
                         crate::notify::dispatch_alert(
                             "抢课成功",
                             format!("{serial} · {} · {detail}", lesson.name),
@@ -942,6 +966,36 @@ fn worker_error_kind(reported: BackendErrorKind, message: &str) -> BackendErrorK
     }
 }
 
+/// 抢到某个目标后，撤掉与它同组的其余目标。
+///
+/// 组是「任选其一」语义。此前 watch_serials 是平铺列表、目标彼此独立，
+/// 抢到 A 之后仍会继续抢 B、C——多占名额还占着学分，而这正是「A/B/C 任选
+/// 其一」这个真实需求的反面。
+fn retire_group_siblings(
+    state: &SharedState,
+    cfg: &AppConfig,
+    winner: &str,
+    pending: &mut HashSet<String>,
+) {
+    for sibling in cfg.group_siblings(winner) {
+        if !pending.remove(&sibling) {
+            continue;
+        }
+        state.log(
+            LogLevel::Info,
+            format!("[{sibling}] 同组已抢到 {winner}，不再继续抢"),
+        );
+        update_watch(
+            state,
+            &sibling,
+            WatchState::Stopped,
+            format!("同组已抢到 {winner}"),
+            None,
+            None,
+        );
+    }
+}
+
 /// 会话过期后尝试自动重登。返回 true 表示已恢复，调用方应继续本次 run。
 ///
 /// 没有保留凭据（用户关掉了开关）或连续失败达上限时返回 false，由调用方
@@ -1133,6 +1187,60 @@ mod tests {
             logs.iter().any(|m| m.contains("未保留本次会话凭据")),
             "user must learn why nothing happened, got {logs:?}"
         );
+    }
+
+    // F-03：同组「任选其一」——抢到一门就撤掉同组其余目标。
+    // 平铺列表下抢到 A 之后仍会继续抢 B、C，多占名额还占着学分。
+    #[test]
+    fn winning_one_group_member_retires_the_others() {
+        let data = "var lessonJSONs=[\
+            {id:371644,no:'GRP.001',name:'甲',teachers:'张老师',stdCount:1,limitCount:9},\
+            {id:371645,no:'GRP.002',name:'乙',teachers:'李老师',stdCount:2,limitCount:9}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:1,lc:9},'371645':{sc:2,lc:9}}";
+        // 两个目标都有余量；第一个提交成功后，第二个必须被撤掉而不是也提交。
+        let base = serve_sequence(vec![
+            "<html>elect page</html>",
+            data,
+            counts,
+            "选课成功",
+            "选课成功",
+        ]);
+        let state = prepared_state(&base);
+        let mut cfg = AppConfig {
+            base_url: base.clone(),
+            profile_id: "0".into(),
+            watch_serials: vec!["GRP.001".into(), "GRP.002".into()],
+            interval_seconds: 0.5,
+            timeout_seconds: 5,
+            max_consecutive_errors: 2,
+            ..Default::default()
+        };
+        cfg.watch_groups.insert("GRP.001".into(), "任选其一".into());
+        cfg.watch_groups.insert("GRP.002".into(), "任选其一".into());
+        start_grab(state.clone(), cfg);
+        wait_until_stopped(&state);
+
+        let watch = state.watch.lock().clone();
+        let success = watch
+            .iter()
+            .filter(|row| row.state == WatchState::Success)
+            .count();
+        let retired = watch
+            .iter()
+            .filter(|row| row.detail.contains("同组已抢到"))
+            .count();
+        assert_eq!(success, 1, "exactly one group member should win: {watch:?}");
+        assert_eq!(retired, 1, "the sibling must be retired: {watch:?}");
+    }
+
+    // 没分组时行为必须与以前完全一致：两个目标都要抢。
+    #[test]
+    fn ungrouped_targets_are_unaffected() {
+        let cfg = AppConfig {
+            watch_serials: vec!["A".into(), "B".into()],
+            ..Default::default()
+        };
+        assert!(cfg.group_siblings("A").is_empty());
     }
 
     // G-03：多目标必须并发提交，而不是一个等一个。
