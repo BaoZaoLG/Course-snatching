@@ -75,6 +75,8 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
         let mut consecutive_refresh_failures = 0u32;
         let mut consecutive_network_failures = 0u32;
         let mut consecutive_submission_errors = 0u32;
+        // 本次 run 内连续的自动重登失败次数；成功一次即清零。
+        let mut relogin_failures = 0u32;
         let mut stopped_for_errors = false;
         let requested_interval = cfg.interval_seconds.max(0.05);
         let mut effective_interval = requested_interval;
@@ -142,6 +144,11 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                                 Duration::from_secs_f64(effective_interval.clamp(0.05, 30.0)),
                             )
                             .await;
+                            continue;
+                        }
+                        // 先试自动重登：这是一个「设定时开抢、半夜挂机」的
+                        // 工具，会话在等待期间过期是必然事件而非异常。
+                        if attempt_relogin(&state, &client, &mut relogin_failures).await {
                             continue;
                         }
                         state.log(LogLevel::Error, "登录失效，抢课已停止");
@@ -598,6 +605,11 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     Err(error) => {
                         if is_auth_error(&error) {
                             if confirm_auth_expired(&state, generation, &client).await {
+                                // 提交阶段掉线同样先试自动重登；目标全部保留在
+                                // pending 里，重登成功后下一轮继续。
+                                if attempt_relogin(&state, &client, &mut relogin_failures).await {
+                                    continue;
+                                }
                                 state.log(LogLevel::Error, "登录失效，抢课已停止");
                                 // 同刷新路径：clear_session 会立刻置 running=false，
                                 // 看板必须在那之前终态化。
@@ -926,6 +938,41 @@ fn worker_error_kind(reported: BackendErrorKind, message: &str) -> BackendErrorK
     }
 }
 
+/// 会话过期后尝试自动重登。返回 true 表示已恢复，调用方应继续本次 run。
+///
+/// 没有保留凭据（用户关掉了开关）或连续失败达上限时返回 false，由调用方
+/// 走原来的停机路径——自动重登是尽力而为，绝不能变成无限重试。
+async fn attempt_relogin(
+    state: &Arc<SharedState>,
+    client: &Arc<crate::eams::EamsClient>,
+    failures: &mut u32,
+) -> bool {
+    if *failures >= super::session::MAX_RELOGIN_ATTEMPTS {
+        return false;
+    }
+    *failures += 1;
+    match super::session::try_relogin(state, client, *failures).await {
+        None => {
+            state.log(
+                LogLevel::Warn,
+                "会话已过期，且未保留本次会话凭据，无法自动重登（可在高级设置中开启）",
+            );
+            false
+        }
+        Some(Ok(())) => {
+            *failures = 0;
+            state.logged_in.store(true, Ordering::Release);
+            state.log(LogLevel::Success, "自动重新登录成功，继续抢课");
+            state.set_message("已自动重新登录，继续抢课");
+            true
+        }
+        Some(Err(error)) => {
+            state.log(LogLevel::Error, format!("自动重新登录失败：{error:#}"));
+            false
+        }
+    }
+}
+
 /// 收齐一轮的并发提交结果，并按原优先级顺序回放。
 ///
 /// 顺序很重要：日志、看板与「连续失败计数」都按目标优先级读起来才可预期，
@@ -1040,6 +1087,49 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
+
+    // C-04：自动重登是尽力而为，绝不能变成无限重试——连续失败到上限后必须
+    // 干脆停机并告知用户，而不是继续拿同一份显然不对的凭据反复打服务器。
+    #[test]
+    fn relogin_stops_after_the_attempt_cap_without_touching_the_network() {
+        let state = crate::worker::SharedState::new();
+        let client = Arc::new(EamsClient::new("http://127.0.0.1:9/eams", 5, false).unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut failures = crate::worker::session::MAX_RELOGIN_ATTEMPTS;
+        let resumed = runtime.block_on(attempt_relogin(&state, &client, &mut failures));
+        assert!(!resumed, "must give up once the cap is reached");
+        assert_eq!(
+            failures,
+            crate::worker::session::MAX_RELOGIN_ATTEMPTS,
+            "a refused attempt must not inflate the counter further"
+        );
+        assert!(
+            log_messages(&state).is_empty(),
+            "capped relogin must not even announce an attempt"
+        );
+    }
+
+    // 没有保留凭据时要明确告诉用户为什么没有自动重登，并指出开关在哪。
+    #[test]
+    fn relogin_without_credentials_explains_itself() {
+        let state = crate::worker::SharedState::new();
+        let client = Arc::new(EamsClient::new("http://127.0.0.1:9/eams", 5, false).unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut failures = 0u32;
+        let resumed = runtime.block_on(attempt_relogin(&state, &client, &mut failures));
+        assert!(!resumed);
+        let logs = log_messages(&state);
+        assert!(
+            logs.iter().any(|m| m.contains("未保留本次会话凭据")),
+            "user must learn why nothing happened, got {logs:?}"
+        );
+    }
 
     // G-03：多目标必须并发提交，而不是一个等一个。
     //

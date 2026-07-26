@@ -760,6 +760,25 @@ impl CourseApp {
                             }
                         });
 
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(14.0, 8.0);
+                            let remember = ui.checkbox(
+                                &mut self.cfg.remember_credentials_for_session,
+                                "会话过期时自动重新登录",
+                            );
+                            dirty |= remember.changed();
+                            // 保留凭据是隐私相关的默认开启项，必须让用户看见
+                            // 它到底做了什么、以及边界在哪。
+                            ui.label(
+                                RichText::new(
+                                    "为此会在内存中保留本次登录的账号密码（永不写入磁盘，退出登录或关闭程序即抹除）。\
+                                     关掉后，挂机期间会话一旦过期，抢课会直接停止。",
+                                )
+                                .size(CAPTION_SIZE)
+                                .color(pal().muted),
+                            );
+                        });
+
                         ui.add_space(10.0);
                         self.show_network_diagnostics(ui);
 
@@ -2107,6 +2126,7 @@ impl CourseApp {
                 timeout: self.cfg.timeout_seconds,
                 auto_fetch: self.cfg.auto_fetch_on_login,
                 debug_dump_enabled: self.cfg.debug_dump_enabled,
+                remember_for_relogin: self.cfg.remember_credentials_for_session,
             },
         );
     }

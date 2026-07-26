@@ -75,6 +75,14 @@ pub struct AppConfig {
     pub schedule_time: String,
     /// 开始后前 N 秒进入冲刺：更短间隔、去掉正抖动，抢开课窗口。
     pub open_burst_seconds: u32,
+    /// 是否在本次会话内保留凭据，用于会话过期后自动重登。
+    ///
+    /// 仅内存、永不落盘，退出登录与关闭程序即清空。默认开启：这是一个
+    /// 「设定时开抢、半夜挂机」的工具，会话在等待期间过期是必然事件，
+    /// 关掉它等于定时功能在最常见的情况下不可用；而内存里本来就有一份与
+    /// 账号等价的会话 Cookie，多留一份密码的边际风险有限。想关的用户可以
+    /// 在高级设置里关掉。
+    pub remember_credentials_for_session: bool,
     /// 冲刺期的轮询间隔（秒）。
     ///
     /// 冲刺此前唯一的差别只是去掉 0–10% 的正抖动，也就是最多快 10%——默认
@@ -111,6 +119,7 @@ impl Default for AppConfig {
             schedule_enabled: false,
             schedule_time: default_schedule_time(),
             open_burst_seconds: 20,
+            remember_credentials_for_session: true,
             burst_interval_seconds: 0.2,
         }
     }

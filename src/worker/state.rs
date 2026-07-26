@@ -98,6 +98,8 @@ pub struct SharedState {
     pub(crate) schedule_fired_key: Mutex<Option<String>>,
     /// UI 最近一次保存的运行配置：定时到点开抢读取它而非 arm 时刻快照。
     pub(crate) latest_config: Mutex<Option<AppConfig>>,
+    /// 本次会话保留的登录凭据（仅内存、永不落盘），用于会话过期后自动重登。
+    pub(crate) credentials: Mutex<Option<super::session::SessionCredentials>>,
     pub logs: Mutex<VecDeque<LogItem>>,
     pub lessons: Mutex<Vec<Lesson>>,
     pub watch: Mutex<Vec<WatchStatus>>,
@@ -122,6 +124,7 @@ impl SharedState {
             schedule_armed_key: Mutex::new(None),
             schedule_fired_key: Mutex::new(None),
             latest_config: Mutex::new(None),
+            credentials: Mutex::new(None),
             logs: Mutex::new(VecDeque::new()),
             lessons: Mutex::new(Vec::new()),
             watch: Mutex::new(Vec::new()),
@@ -158,12 +161,19 @@ impl SharedState {
         self.touch();
     }
 
+    /// 清空本次会话保留的凭据。`Zeroizing` 会在 drop 时抹掉堆上的明文。
+    pub(crate) fn forget_credentials(&self) {
+        *self.credentials.lock() = None;
+    }
+
     pub fn clear_session(&self, message: &str) {
         self.logged_in.store(false, Ordering::Release);
         self.running.store(false, Ordering::Release);
         self.stopping.store(false, Ordering::Release);
         self.run_generation.fetch_add(1, Ordering::AcqRel);
         self.invalidate_session_tasks();
+        // 会话到此为止，保留的凭据不再有用途——留着只是白白多一份明文。
+        self.forget_credentials();
         *self.client.lock() = None;
         self.lessons.lock().clear();
         self.set_message(message);

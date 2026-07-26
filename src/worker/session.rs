@@ -17,6 +17,55 @@ pub struct LoginRequest {
     pub timeout: u64,
     pub auto_fetch: bool,
     pub debug_dump_enabled: bool,
+    /// 是否在本次会话内保留凭据，用于会话过期后自动重登。
+    pub remember_for_relogin: bool,
+}
+
+/// 本次会话保留的登录凭据。
+///
+/// 只存在于内存、永不落盘，退出登录与关闭程序时清空。存它的理由是：这是
+/// 一个「设定时开抢、半夜挂机」的工具，会话在等待期间过期是必然事件而非
+/// 异常，而此前 AuthExpired 一律终止整个 run——等于定时功能在最常见的情况
+/// 下不可用。内存里本来就有一份与账号等价的会话 Cookie，多留一份密码的
+/// 边际风险有限，但必须让用户看得见并且能关掉。
+pub struct SessionCredentials {
+    pub username: String,
+    pub password: Zeroizing<String>,
+}
+
+/// 会话过期后的自动重登上限。超过就停机并明确告知，不无限重试。
+pub(super) const MAX_RELOGIN_ATTEMPTS: u32 = 3;
+
+/// 用本次会话保留的凭据重新登录。
+///
+/// 复用同一个 `EamsClient`：它的 cookie jar 会被登录刷新，而 per-origin 的
+/// governor 本来就跨 client 共享——重登绝不能顺手清掉限流与熔断历史。
+///
+/// 返回 `None` 表示没有可用凭据（用户关掉了「保留凭据」或从未成功登录）。
+pub(super) async fn try_relogin(
+    state: &SharedState,
+    client: &EamsClient,
+    attempt: u32,
+) -> Option<anyhow::Result<()>> {
+    // parking_lot 的 guard 不能跨 await 持有；先把凭据复制出来再放锁。
+    let (username, password) = {
+        let guard = state.credentials.lock();
+        let credentials = guard.as_ref()?;
+        (credentials.username.clone(), credentials.password.clone())
+    };
+    if attempt > 1 {
+        // 与其它退避共用 decorrelated jitter：会话集中过期时，所有客户端
+        // 会在同一时刻一起重登。
+        tokio::time::sleep(crate::eams::backoff_for_attempt(attempt - 1)).await;
+    }
+    state.log(
+        LogLevel::Warn,
+        format!(
+            "会话已过期，正在自动重新登录（第 {attempt}/{MAX_RELOGIN_ATTEMPTS} 次）：{}",
+            mask_account(&username)
+        ),
+    );
+    Some(client.login(&username, password.as_str()).await)
 }
 
 pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
@@ -28,6 +77,7 @@ pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
         timeout,
         auto_fetch,
         debug_dump_enabled,
+        remember_for_relogin,
     } = req;
     if state.logging_in.swap(true, Ordering::AcqRel) {
         state.log(LogLevel::Warn, "登录进行中，请稍候…");
@@ -74,6 +124,11 @@ pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
 
         state.logged_in.store(true, Ordering::Release);
         *state.client.lock() = Some(client.clone());
+        // 凭据只在登录成功后保留，且只在用户允许时保留。
+        *state.credentials.lock() = remember_for_relogin.then(|| SessionCredentials {
+            username: username.clone(),
+            password: password.clone(),
+        });
         state.log(LogLevel::Success, "登录成功");
         state.set_message("登录成功");
 
@@ -248,6 +303,7 @@ pub fn logout(state: &SharedState) {
     state.stopping.store(false, Ordering::Release);
     state.run_generation.fetch_add(1, Ordering::AcqRel);
     state.invalidate_session_tasks();
+    state.forget_credentials();
     state.logged_in.store(false, Ordering::Release);
     *state.client.lock() = None;
     state.lessons.lock().clear();
@@ -291,8 +347,50 @@ mod tests {
             timeout: 5,
             auto_fetch: false,
             debug_dump_enabled: false,
+            remember_for_relogin: false,
         };
         let _typed: &Zeroizing<String> = &request.password;
+    }
+
+    // C-04：保留的凭据只在内存、且必须在退出登录时被抹掉。
+    #[test]
+    fn session_credentials_are_dropped_on_logout() {
+        let state = SharedState::new();
+        *state.credentials.lock() = Some(SessionCredentials {
+            username: "student01".into(),
+            password: Zeroizing::new("secret".into()),
+        });
+        assert!(state.credentials.lock().is_some());
+        logout(&state);
+        assert!(
+            state.credentials.lock().is_none(),
+            "logout must not leave credentials in memory"
+        );
+
+        // clear_session（登录失效路径）同样要抹掉。
+        *state.credentials.lock() = Some(SessionCredentials {
+            username: "student01".into(),
+            password: Zeroizing::new("secret".into()),
+        });
+        state.clear_session("登录失效");
+        assert!(state.credentials.lock().is_none());
+    }
+
+    // 没有保留凭据时，自动重登必须干脆地返回「没有凭据」，
+    // 而不是拿空账号去打服务器。
+    #[test]
+    fn relogin_without_credentials_does_not_hit_the_network() {
+        let state = SharedState::new();
+        let client = EamsClient::new("http://127.0.0.1:9/eams", 5, false).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(try_relogin(&state, &client, 1));
+        assert!(
+            outcome.is_none(),
+            "must not attempt a credential-less login"
+        );
     }
 
     #[test]
