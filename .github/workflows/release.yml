@@ -30,12 +30,12 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb2c1c2f695925bacf07f0 # 1.97.1
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1 分支（该 action 用分支而非 tag 发版）
         with:
           components: rustfmt, clippy
       # 发布构建不复用缓存：rust-cache 是可变的、跨 workflow 共享的，一个被
       # 污染的缓存能直接进入用户下载的二进制，也让「可复现构建」无从谈起。
-      - uses: taiki-e/install-action@d125c0a83576d3c0c86ac610c708b38d3565af4e # v2
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
         with:
           tool: cargo-deny
       - name: Release preflight
@@ -60,7 +60,7 @@ jobs:
         with:
           subject-path: "dist/*.zip"
       - name: Attest SBOM
-        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2.2.0
+        uses: actions/attest-sbom@115c3be05ff3974bcbd596578934b3f9ce39bf68 # v2.2.0
         with:
           subject-path: "dist/*.zip"
           sbom-path: "dist/sbom.cdx.json"
