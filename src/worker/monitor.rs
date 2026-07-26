@@ -70,38 +70,20 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
         let _guard = ActivityGuard::for_run(state.clone(), generation);
         let _burst_guard = BurstModeGuard::new(client.clone());
         let mut pending: HashSet<String> = watch.into_iter().collect();
-        let mut succeeded = 0usize;
-        let mut terminal_failures = 0usize;
-        let mut consecutive_refresh_failures = 0u32;
-        let mut consecutive_network_failures = 0u32;
-        let mut consecutive_submission_errors = 0u32;
-        // 本次 run 内连续的自动重登失败次数；成功一次即清零。
-        let mut relogin_failures = 0u32;
-        let mut stopped_for_errors = false;
+        let mut run = RunCounters::new();
         let requested_interval = cfg.interval_seconds.max(0.05);
         let mut effective_interval = requested_interval;
-        // Only relax a previously increased interval after a stable sequence
-        // of complete refreshes, preventing fast/slow oscillation.
-        let mut consecutive_successful_refreshes = 0u32;
         let mut seat_open_prev: HashMap<String, bool> = HashMap::new();
         // 指定教学班连续未在目录中出现的轮数（见 MAX_ID_MISSING_ROUNDS）。
         let mut id_missing_rounds: HashMap<String, u32> = HashMap::new();
-        let burst_secs = cfg.open_burst_seconds.min(120);
-        let burst_deadline =
-            tokio::time::Instant::now() + Duration::from_secs(u64::from(burst_secs));
-        // A circuit-breaker trip ends this sprint permanently; after its
-        // cooldown the worker resumes ordinary monitoring instead.
-        let mut burst_aborted_by_circuit = false;
+        let mut burst = BurstWindow::new(cfg.open_burst_seconds.min(120));
 
         'run: while state.is_current_run(generation) && !pending.is_empty() {
             let round_started = tokio::time::Instant::now();
             if client.circuit_is_open() {
-                burst_aborted_by_circuit = true;
+                burst.aborted_by_circuit = true;
             }
-            let in_burst = burst_secs > 0
-                && !burst_aborted_by_circuit
-                && tokio::time::Instant::now() < burst_deadline;
-            client.set_burst_mode(in_burst);
+            client.set_burst_mode(burst.is_active());
 
             // 停止请求必须能穿透 governor 等待与在途 HTTP：熔断/限流冷却
             // 可达分钟级，取消只影响本地等待，不影响服务器端已收到的请求。
@@ -116,20 +98,19 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
             }
             let catalog = match fetch_result {
                 Ok((list, complete_refresh)) => {
-                    consecutive_refresh_failures = 0;
+                    run.consecutive_refresh_failures = 0;
                     if complete_refresh {
-                        consecutive_network_failures = 0;
-                        consecutive_successful_refreshes =
-                            consecutive_successful_refreshes.saturating_add(1);
+                        run.note_complete_refresh();
                         effective_interval = recovered_interval_after_success(
                             effective_interval,
                             requested_interval,
-                            consecutive_successful_refreshes,
+                            run.consecutive_successful_refreshes,
                             cfg.adaptive_interval,
                         );
                     } else {
-                        consecutive_successful_refreshes = 0;
-                        consecutive_network_failures = client.network_snapshot().consecutive_errors;
+                        run.consecutive_successful_refreshes = 0;
+                        run.consecutive_network_failures =
+                            client.network_snapshot().consecutive_errors;
                     }
                     *state.lessons.lock() = list.clone();
                     enrich_watch_from_lessons(&state, &list);
@@ -152,7 +133,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                         }
                         // 先试自动重登：这是一个「设定时开抢、半夜挂机」的
                         // 工具，会话在等待期间过期是必然事件而非异常。
-                        if attempt_relogin(&state, &client, &mut relogin_failures).await {
+                        if attempt_relogin(&state, &client, &mut run.relogin_failures).await {
                             continue;
                         }
                         state.log(LogLevel::Error, "登录失效，抢课已停止");
@@ -170,18 +151,19 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                         );
                         break;
                     }
-                    consecutive_refresh_failures = consecutive_refresh_failures.saturating_add(1);
+                    run.consecutive_refresh_failures =
+                        run.consecutive_refresh_failures.saturating_add(1);
                     let reported_kind = backend_error_kind(&error);
                     let error_text = format!("{error:#}");
                     let error_kind = worker_error_kind(reported_kind, &error_text);
                     let is_network_failure = is_network_error(error_kind);
                     if is_network_failure {
-                        consecutive_network_failures =
-                            consecutive_network_failures.saturating_add(1);
+                        run.consecutive_network_failures =
+                            run.consecutive_network_failures.saturating_add(1);
                     } else {
-                        consecutive_network_failures = 0;
+                        run.consecutive_network_failures = 0;
                     }
-                    consecutive_successful_refreshes = 0;
+                    run.consecutive_successful_refreshes = 0;
                     if cfg.adaptive_interval && is_network_failure {
                         let old = effective_interval;
                         effective_interval = (effective_interval * 1.6).min(30.0);
@@ -196,15 +178,17 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     let network = client.network_snapshot();
                     let circuit_protecting = circuit_protects(network.circuit_status);
                     if circuit_protecting {
-                        burst_aborted_by_circuit = true;
+                        burst.aborted_by_circuit = true;
                         client.set_burst_mode(false);
                     }
                     state.log(
                         LogLevel::Warn,
                         format!(
-                            "刷新课程失败（{}，连续刷新失败 {consecutive_refresh_failures}/{}，连续网络异常 {consecutive_network_failures}）：{error:#}",
+                            "刷新课程失败（{}，连续刷新失败 {}/{}，连续网络异常 {}）：{error:#}",
                             error_kind.label(),
-                            cfg.max_consecutive_errors
+                            run.consecutive_refresh_failures,
+                            cfg.max_consecutive_errors,
+                            run.consecutive_network_failures
                         ),
                     );
                     for serial in &pending {
@@ -220,15 +204,16 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     // 网络瞬态由不可绕过的 governor 冷却/熔断处理；旧的停止阈值
                     // 继续约束解析或未知程序错误，避免页面改版后无限空转。
                     if !is_network_failure
-                        && consecutive_refresh_failures >= cfg.max_consecutive_errors
+                        && run.consecutive_refresh_failures >= cfg.max_consecutive_errors
                     {
-                        stopped_for_errors = true;
+                        run.stopped_for_errors = true;
                         state.set_message(format!(
-                            "连续刷新失败 {consecutive_refresh_failures} 次，已自动停止"
+                            "连续刷新失败 {} 次，已自动停止",
+                            run.consecutive_refresh_failures
                         ));
                         crate::notify::dispatch_alert(
                             "已自动停止",
-                            format!("连续刷新失败 {consecutive_refresh_failures} 次"),
+                            format!("连续刷新失败 {} 次", run.consecutive_refresh_failures),
                             false,
                             cfg.notify_enabled,
                             cfg.sound_enabled,
@@ -243,7 +228,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     let compatibility_backoff = if reported_kind == BackendErrorKind::Unknown
                         && error_kind == BackendErrorKind::RateLimited
                     {
-                        fixed_network_backoff(consecutive_network_failures)
+                        fixed_network_backoff(run.consecutive_network_failures)
                     } else {
                         Duration::ZERO
                     };
@@ -257,7 +242,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             "服务器限流，{:.1}s 后重试（服务器冷却）",
                             delay.as_secs_f64()
                         ));
-                    } else if burst_aborted_by_circuit {
+                    } else if burst.aborted_by_circuit {
                         state.set_message(format!(
                             "网络保护已启用，{:.1}s 后以普通监控继续",
                             delay.as_secs_f64()
@@ -330,7 +315,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             update_watch(&state, &serial, WatchState::Failed, detail, None, None);
                             state.log(LogLevel::Error, format!("[{serial}] {detail}"));
                             pending.remove(&serial);
-                            terminal_failures += 1;
+                            run.terminal_failures += 1;
                             continue;
                         }
                         None => {
@@ -355,7 +340,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                                 );
                                 state.log(LogLevel::Error, format!("[{serial}] {detail}"));
                                 pending.remove(&serial);
-                                terminal_failures += 1;
+                                run.terminal_failures += 1;
                                 continue;
                             }
                             update_watch(
@@ -406,7 +391,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             );
                             state.log(LogLevel::Error, format!("[{serial}] {detail}"));
                             pending.remove(&serial);
-                            terminal_failures += 1;
+                            run.terminal_failures += 1;
                             continue;
                         }
                     }
@@ -525,9 +510,9 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
             // 并发度由 governor 的 submission_gate 决定（默认 3），令牌桶与
             // 熔断在其下兜底：放开的是「同时在途的提交数」，不是速率上限。
             // 结果按原优先级顺序回放，保证日志与看板的顺序仍然可预期。
-            let confirm_mode = if tokio::time::Instant::now() < burst_deadline
-                && burst_secs > 0
-                && !burst_aborted_by_circuit
+            let confirm_mode = if tokio::time::Instant::now() < burst.deadline
+                && burst.seconds > 0
+                && !burst.aborted_by_circuit
             {
                 crate::eams::ConfirmMode::Optimistic
             } else {
@@ -565,7 +550,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
             for (serial, lesson, elect_result) in submitted {
                 match elect_result {
                     Ok(ElectResult::Success { detail }) => {
-                        consecutive_submission_errors = 0;
+                        run.consecutive_submission_errors = 0;
                         state.log(LogLevel::Success, format!("[{serial}] 成功：{detail}"));
                         update_watch(
                             &state,
@@ -576,7 +561,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             Some(&lesson),
                         );
                         pending.remove(&serial);
-                        succeeded += 1;
+                        run.succeeded += 1;
                         // F-03：同组「任选其一」——抢到一门就撤掉同组其余目标，
                         // 否则会继续抢，多占名额还占着学分。
                         retire_group_siblings(&state, &cfg, &serial, &mut pending);
@@ -589,7 +574,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                         );
                     }
                     Ok(ElectResult::Full { detail }) => {
-                        consecutive_submission_errors = 0;
+                        run.consecutive_submission_errors = 0;
                         state.log(LogLevel::Info, format!("[{serial}] 已满：{detail}"));
                         update_watch(
                             &state,
@@ -602,7 +587,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     }
                     // 瞬态繁忙/结果存疑：非终态，目标保留在 pending 中下一轮重试。
                     Ok(ElectResult::Busy { detail }) => {
-                        consecutive_submission_errors = 0;
+                        run.consecutive_submission_errors = 0;
                         state.log(
                             LogLevel::Warn,
                             format!("[{serial}] 服务器繁忙或结果待确认，下轮重试：{detail}"),
@@ -617,7 +602,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                         );
                     }
                     Ok(ElectResult::Failed { detail }) => {
-                        consecutive_submission_errors = 0;
+                        run.consecutive_submission_errors = 0;
                         state.log(LogLevel::Error, format!("[{serial}] 选课失败：{detail}"));
                         update_watch(
                             &state,
@@ -628,14 +613,15 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             Some(&lesson),
                         );
                         pending.remove(&serial);
-                        terminal_failures += 1;
+                        run.terminal_failures += 1;
                     }
                     Err(error) => {
                         if is_auth_error(&error) {
                             if confirm_auth_expired(&state, generation, &client).await {
                                 // 提交阶段掉线同样先试自动重登；目标全部保留在
                                 // pending 里，重登成功后下一轮继续。
-                                if attempt_relogin(&state, &client, &mut relogin_failures).await {
+                                if attempt_relogin(&state, &client, &mut run.relogin_failures).await
+                                {
                                     continue;
                                 }
                                 state.log(LogLevel::Error, "登录失效，抢课已停止");
@@ -687,22 +673,23 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             None,
                             Some(&lesson),
                         );
-                        consecutive_submission_errors =
-                            consecutive_submission_errors.saturating_add(1);
+                        run.consecutive_submission_errors =
+                            run.consecutive_submission_errors.saturating_add(1);
                         if circuit_protects(client.network_snapshot().circuit_status) {
-                            burst_aborted_by_circuit = true;
+                            burst.aborted_by_circuit = true;
                             client.set_burst_mode(false);
                         }
                         if !network_failure
-                            && consecutive_submission_errors >= cfg.max_consecutive_errors
+                            && run.consecutive_submission_errors >= cfg.max_consecutive_errors
                         {
-                            stopped_for_errors = true;
+                            run.stopped_for_errors = true;
                             state.set_message(format!(
-                                "提交连续失败 {consecutive_submission_errors} 次，已自动停止"
+                                "提交连续失败 {} 次，已自动停止",
+                                run.consecutive_submission_errors
                             ));
                             crate::notify::dispatch_alert(
                                 "已自动停止",
-                                format!("提交连续失败 {consecutive_submission_errors} 次"),
+                                format!("提交连续失败 {} 次", run.consecutive_submission_errors),
                                 false,
                                 cfg.notify_enabled,
                                 cfg.sound_enabled,
@@ -720,21 +707,11 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
             }
             // The first request starts immediately; every subsequent round honours
             // the expected period, counting governor/request time already elapsed.
-            let in_burst = burst_secs > 0
-                && !burst_aborted_by_circuit
-                && !client.circuit_is_open()
-                && tokio::time::Instant::now() < burst_deadline;
+            if client.circuit_is_open() {
+                burst.aborted_by_circuit = true;
+            }
             // 冲刺结束后线性回落，而不是断崖式切回常规间隔。
-            let burst_progress = if in_burst {
-                0.0
-            } else if burst_secs == 0 || burst_aborted_by_circuit {
-                1.0
-            } else {
-                let since_end = tokio::time::Instant::now()
-                    .saturating_duration_since(burst_deadline)
-                    .as_secs_f64();
-                (since_end / BURST_RAMP_SECS).clamp(0.0, 1.0)
-            };
+            let burst_progress = burst.ramp_progress();
             let desired_period = poll_delay_for_mode(
                 effective_interval,
                 cfg.burst_interval_seconds,
@@ -749,7 +726,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
             if !delay.is_zero() {
                 state.set_message(format!(
                     "{}剩余 {} 门，{:.2}s 后继续",
-                    if in_burst {
+                    if burst.is_active() {
                         "冲刺中，"
                     } else {
                         "本轮结束，"
@@ -764,15 +741,15 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
         }
 
         if pending.is_empty() {
-            if terminal_failures == 0 {
+            if run.terminal_failures == 0 {
                 state.log(
                     LogLevel::Success,
-                    format!("全部目标完成，共 {succeeded} 门"),
+                    format!("全部目标完成，共 {} 门", run.succeeded),
                 );
-                state.set_message(format!("全部完成，共 {succeeded} 门"));
+                state.set_message(format!("全部完成，共 {} 门", run.succeeded));
                 crate::notify::dispatch_alert(
                     "全部完成",
-                    format!("成功 {succeeded} 门"),
+                    format!("成功 {} 门", run.succeeded),
                     true,
                     cfg.notify_enabled,
                     cfg.sound_enabled,
@@ -780,15 +757,22 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
             } else {
                 state.log(
                     LogLevel::Warn,
-                    format!("任务结束：成功 {succeeded}，失败/跳过 {terminal_failures}"),
+                    format!(
+                        "任务结束：成功 {}，失败/跳过 {}",
+                        run.succeeded, run.terminal_failures
+                    ),
                 );
                 state.set_message(format!(
-                    "任务结束：成功 {succeeded}，失败/跳过 {terminal_failures}"
+                    "任务结束：成功 {}，失败/跳过 {}",
+                    run.succeeded, run.terminal_failures
                 ));
                 crate::notify::dispatch_alert(
                     "任务结束",
-                    format!("成功 {succeeded}，失败/跳过 {terminal_failures}"),
-                    succeeded > 0,
+                    format!(
+                        "成功 {}，失败/跳过 {}",
+                        run.succeeded, run.terminal_failures
+                    ),
+                    run.succeeded > 0,
                     cfg.notify_enabled,
                     cfg.sound_enabled,
                 );
@@ -797,7 +781,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
             // 登录失效/登出也会走到这里：看板中未终态的行必须标记为已停止，
             // 否则“提交中”等状态会永久停留；状态消息则保持掉线提示不被覆盖。
             mark_pending_stopped(&state, &pending);
-            if !stopped_for_errors && state.logged_in.load(Ordering::Acquire) {
+            if !run.stopped_for_errors && state.logged_in.load(Ordering::Acquire) {
                 state.log(LogLevel::Info, "已停止");
                 state.set_message("已停止");
             }
@@ -963,6 +947,85 @@ fn worker_error_kind(reported: BackendErrorKind, message: &str) -> BackendErrorK
         BackendErrorKind::RateLimited
     } else {
         reported
+    }
+}
+
+/// 一次抢课运行的全部可变状态。
+///
+/// A-01：主循环原先在闭包顶部声明了约 15 个互相牵连的可变量，
+/// 谁在哪个分支被改、改了之后影响哪条判定，全靠读完六百行才能确定。
+/// 收进一个结构体后，「本次运行的状态」有了名字，各分支的读写也能一眼看清。
+struct RunCounters {
+    succeeded: usize,
+    terminal_failures: usize,
+    consecutive_refresh_failures: u32,
+    consecutive_network_failures: u32,
+    consecutive_submission_errors: u32,
+    /// 本次 run 内连续的自动重登失败次数；成功一次即清零。
+    relogin_failures: u32,
+    /// 因连续失败自动停机（区别于正常跑完）。
+    stopped_for_errors: bool,
+    /// 只有连续若干次完整刷新之后才放松已经拉长的间隔，避免快慢震荡。
+    consecutive_successful_refreshes: u32,
+}
+
+impl RunCounters {
+    fn new() -> Self {
+        Self {
+            succeeded: 0,
+            terminal_failures: 0,
+            consecutive_refresh_failures: 0,
+            consecutive_network_failures: 0,
+            consecutive_submission_errors: 0,
+            relogin_failures: 0,
+            stopped_for_errors: false,
+            consecutive_successful_refreshes: 0,
+        }
+    }
+
+    /// 一轮完整刷新成功：网络类失败计数清零，稳定轮数累加。
+    fn note_complete_refresh(&mut self) {
+        self.consecutive_network_failures = 0;
+        self.consecutive_successful_refreshes =
+            self.consecutive_successful_refreshes.saturating_add(1);
+    }
+}
+
+/// 冲刺窗口的状态。
+struct BurstWindow {
+    /// 用户配置的冲刺秒数（0 表示不冲刺）。
+    seconds: u32,
+    deadline: tokio::time::Instant,
+    /// 熔断一旦跳闸就永久结束本次冲刺；冷却结束后回到普通监控。
+    aborted_by_circuit: bool,
+}
+
+impl BurstWindow {
+    fn new(seconds: u32) -> Self {
+        Self {
+            seconds,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(u64::from(seconds)),
+            aborted_by_circuit: false,
+        }
+    }
+
+    /// 此刻是否仍在冲刺窗口内。
+    fn is_active(&self) -> bool {
+        self.seconds > 0 && !self.aborted_by_circuit && tokio::time::Instant::now() < self.deadline
+    }
+
+    /// 从冲刺回落到常规间隔的进度：0.0 = 仍在冲刺，1.0 = 已完全回到常规。
+    fn ramp_progress(&self) -> f64 {
+        if self.is_active() {
+            return 0.0;
+        }
+        if self.seconds == 0 || self.aborted_by_circuit {
+            return 1.0;
+        }
+        let since_end = tokio::time::Instant::now()
+            .saturating_duration_since(self.deadline)
+            .as_secs_f64();
+        (since_end / BURST_RAMP_SECS).clamp(0.0, 1.0)
     }
 }
 
@@ -1145,6 +1208,41 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
+
+    // A-01：主循环的可变状态收进结构体后，这些判定第一次变得可单测。
+    #[test]
+    fn burst_window_reports_activity_and_ramp() {
+        // 未配置冲刺：永远不在冲刺中，且直接就是常规间隔。
+        let none = BurstWindow::new(0);
+        assert!(!none.is_active());
+        assert_eq!(none.ramp_progress(), 1.0);
+
+        // 配置了冲刺且刚开始：在冲刺中，回落进度为 0。
+        let active = BurstWindow::new(30);
+        assert!(active.is_active());
+        assert_eq!(active.ramp_progress(), 0.0);
+
+        // 熔断跳闸会永久结束本次冲刺，即使窗口还没到。
+        let mut tripped = BurstWindow::new(30);
+        tripped.aborted_by_circuit = true;
+        assert!(!tripped.is_active());
+        assert_eq!(
+            tripped.ramp_progress(),
+            1.0,
+            "a tripped circuit must fall straight back to the normal interval"
+        );
+    }
+
+    #[test]
+    fn complete_refresh_clears_network_failures_and_counts_stability() {
+        let mut run = RunCounters::new();
+        run.consecutive_network_failures = 3;
+        run.note_complete_refresh();
+        assert_eq!(run.consecutive_network_failures, 0);
+        assert_eq!(run.consecutive_successful_refreshes, 1);
+        run.note_complete_refresh();
+        assert_eq!(run.consecutive_successful_refreshes, 2);
+    }
 
     // C-04：自动重登是尽力而为，绝不能变成无限重试——连续失败到上限后必须
     // 干脆停机并告知用户，而不是继续拿同一份显然不对的凭据反复打服务器。
