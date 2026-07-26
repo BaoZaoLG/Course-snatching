@@ -33,7 +33,10 @@ impl EamsClient {
                     }
                     last_error = Some(error);
                     if attempt < 4 {
-                        tokio::time::sleep(Duration::from_millis(1200 * attempt as u64)).await;
+                        // 与另外两处退避共用 decorrelated jitter：开抢瞬间被限流的
+                        // 学生会同时进入登录重试，确定性的 1.2/2.4/3.6s 阶梯会让
+                        // 他们整齐地再撞一次。
+                        tokio::time::sleep(super::backoff_for_attempt(attempt)).await;
                     }
                 }
             }

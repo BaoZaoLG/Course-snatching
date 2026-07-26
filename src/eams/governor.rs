@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +35,6 @@ struct GovernorPolicy {
     circuit_cooldown: Duration,
     retry_min: Duration,
     retry_max: Duration,
-    jitter_fraction: f64,
 }
 
 impl Default for GovernorPolicy {
@@ -51,7 +50,6 @@ impl Default for GovernorPolicy {
             // 与解析层 parse_retry_after_secs 的 300s 上限保持一致：服务器
             // 明确要求的冷却绝不能被治理层截断后提前重试（易升级封禁）。
             retry_max: Duration::from_secs(300),
-            jitter_fraction: 0.1,
         }
     }
 }
@@ -215,7 +213,6 @@ impl RequestGovernor {
             circuit_cooldown: Duration::from_millis(45),
             retry_min: Duration::from_millis(1),
             retry_max: Duration::from_millis(5),
-            jitter_fraction: 0.0,
         }))
     }
 
@@ -398,15 +395,14 @@ impl RequestGovernor {
             && state.rate_limit_events.len() >= self.policy.rate_limit_threshold;
 
         let retry_delay = if kind.needs_backoff() {
-            let base = if let Some(server_delay) = retry_after {
+            Some(if let Some(server_delay) = retry_after {
+                // 服务器下发的 Retry-After 各客户端本来就是错开的，最不需要
+                // 抖动（原实现恰好只给它加了抖动）；也绝不能被截短。
                 server_delay.clamp(self.policy.retry_min, self.policy.retry_max)
             } else {
+                // 本地推测的阶梯自带 decorrelated jitter——它才是需要打散相位的
+                // 那一个：所有客户端的 consecutive_errors 会同时变成 1。
                 retry_delay_for_failure(state.consecutive_errors)
-            };
-            Some(if retry_after.is_some() {
-                add_positive_jitter(base, self.policy.jitter_fraction)
-            } else {
-                base
             })
         } else {
             None
@@ -546,28 +542,16 @@ impl RequestGovernor {
 
 /// 无服务器 Retry-After 时的固定退避序列。最后一项会持续使用，避免
 /// 连续失败后把恢复时间无界拉长。
+/// 本地推测的退避阶梯。
+///
+/// 走统一的 decorrelated jitter：原来是裸的 2/4/8/16/30 确定性阶梯，所有
+/// 客户端在同一次服务器抖动后会整齐划一地同时重试。
 fn retry_delay_for_failure(consecutive_errors: u32) -> Duration {
-    const RETRY_DELAYS: [Duration; 5] = [
-        Duration::from_secs(2),
-        Duration::from_secs(4),
-        Duration::from_secs(8),
-        Duration::from_secs(16),
-        Duration::from_secs(30),
-    ];
-    let index = consecutive_errors.saturating_sub(1).min(4) as usize;
-    RETRY_DELAYS[index]
-}
-
-fn add_positive_jitter(duration: Duration, fraction: f64) -> Duration {
-    if fraction <= 0.0 {
-        return duration;
-    }
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos())
-        .unwrap_or(0);
-    let unit = f64::from(nanos % 10_001) / 10_000.0;
-    duration.mul_f64(1.0 + unit * fraction)
+    super::backoff::backoff_for_attempt(
+        consecutive_errors,
+        super::backoff::BACKOFF_BASE,
+        super::backoff::BACKOFF_MAX,
+    )
 }
 
 #[cfg(test)]
@@ -584,7 +568,6 @@ mod tests {
             circuit_cooldown: Duration::from_millis(45),
             retry_min: Duration::from_millis(12),
             retry_max: Duration::from_millis(100),
-            jitter_fraction: 0.0,
         }
     }
 
@@ -755,13 +738,21 @@ mod tests {
     }
 
     #[test]
+    // 本地退避改成 decorrelated jitter 后，锁死的是「包络 + 真的被打散」，
+    // 而不是精确序列——精确序列恰恰是重试雪崩的成因。
     fn retry_schedule_matches_the_documented_sequence() {
-        assert_eq!(retry_delay_for_failure(1), Duration::from_secs(2));
-        assert_eq!(retry_delay_for_failure(2), Duration::from_secs(4));
-        assert_eq!(retry_delay_for_failure(3), Duration::from_secs(8));
-        assert_eq!(retry_delay_for_failure(4), Duration::from_secs(16));
-        assert_eq!(retry_delay_for_failure(5), Duration::from_secs(30));
-        assert_eq!(retry_delay_for_failure(99), Duration::from_secs(30));
+        for attempt in [1u32, 2, 3, 4, 5, 99] {
+            let delay = retry_delay_for_failure(attempt);
+            assert!(
+                delay >= Duration::from_secs(2) && delay <= Duration::from_secs(30),
+                "attempt {attempt} produced {delay:?} outside [2s, 30s]"
+            );
+        }
+        let samples: Vec<Duration> = (0..64).map(|_| retry_delay_for_failure(3)).collect();
+        assert!(
+            samples.windows(2).any(|w| w[0] != w[1]),
+            "local backoff ladder must be jittered, not deterministic"
+        );
     }
 
     #[test]

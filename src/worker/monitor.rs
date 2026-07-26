@@ -875,15 +875,12 @@ fn recovered_interval_after_success(
     }
 }
 
+/// governor 没给建议时的兜底退避。
+///
+/// 与 governor 的本地阶梯、登录重试共用同一个 decorrelated jitter 实现：
+/// 三处各写一份确定性阶梯，等于让所有客户端在服务器抖动后同时重试。
 fn fixed_network_backoff(consecutive_failures: u32) -> Duration {
-    const DELAYS: [Duration; 5] = [
-        Duration::from_secs(2),
-        Duration::from_secs(4),
-        Duration::from_secs(8),
-        Duration::from_secs(16),
-        Duration::from_secs(30),
-    ];
-    DELAYS[consecutive_failures.saturating_sub(1).min(4) as usize]
+    crate::eams::backoff_for_attempt(consecutive_failures)
 }
 
 /// 当前 run 被取消（stop_grab/登出/新一轮开始都会推进 generation）后完成。
@@ -1010,13 +1007,21 @@ mod tests {
     }
 
     #[test]
+    // 退避改成 decorrelated jitter 后，断言从「精确序列」变成「包络 + 打散」：
+    // 精确序列本身就是雪崩的成因（所有客户端同时重试），不该再被锁死。
     fn fallback_network_backoff_uses_documented_sequence() {
-        assert_eq!(fixed_network_backoff(1), Duration::from_secs(2));
-        assert_eq!(fixed_network_backoff(2), Duration::from_secs(4));
-        assert_eq!(fixed_network_backoff(3), Duration::from_secs(8));
-        assert_eq!(fixed_network_backoff(4), Duration::from_secs(16));
-        assert_eq!(fixed_network_backoff(5), Duration::from_secs(30));
-        assert_eq!(fixed_network_backoff(99), Duration::from_secs(30));
+        for attempt in [1u32, 2, 3, 4, 5, 99] {
+            let delay = fixed_network_backoff(attempt);
+            assert!(
+                delay >= Duration::from_secs(2) && delay <= Duration::from_secs(30),
+                "attempt {attempt} produced {delay:?} outside the documented envelope"
+            );
+        }
+        let samples: Vec<Duration> = (0..64).map(|_| fixed_network_backoff(3)).collect();
+        assert!(
+            samples.windows(2).any(|w| w[0] != w[1]),
+            "fallback backoff must be jittered, not a fixed ladder"
+        );
     }
 
     #[test]
