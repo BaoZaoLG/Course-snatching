@@ -202,6 +202,32 @@ fn parser_fixtures_have_golden_results() {
     assert!(body_looks_like_login_page(LOGIN_EXPIRED));
 }
 
+// C-05：别人退课导致人数回落，不得把「真的选上了」判成失败。
+//
+// 原实现只在 after > before 时确认，人数回落会走到「疑似成功但人数未变」
+// 的分支被降级；真成功被误判为失败会让 monitor 反复重复提交。
+#[test]
+fn a_third_party_drop_does_not_reject_our_own_success() {
+    // 提交前 5 人，确认时只剩 4 人（别人退了课），课程仍可选。
+    let data = "var lessonJSONs=[{id:2002,no:'CS.2002',name:'确认提交',teachers:'老师',stdCount:4,limitCount:30}];";
+    let server = MockServer::scripted(vec![
+        MockResponse::ok("选课成功"),
+        MockResponse::ok(data),
+        MockResponse::ok("window.lessonId2Counts={'2002':{sc:4,lc:30}}"),
+    ]);
+    let client = server.client();
+    let result = runtime()
+        .block_on(client.elect_lesson("0", "2002", Some(5), crate::eams::ConfirmMode::Verify))
+        .unwrap();
+    // 强成功文案 + 人数回落：仍然是成功（只是没能二次确认），
+    // 绝不能被降级成 Busy 而无休止地重复提交。
+    assert!(
+        matches!(&result, ElectResult::Success { .. }),
+        "someone else dropping the course must not reject our success, got {result:?}"
+    );
+    server.requests(3);
+}
+
 // G-02：冲刺窗口内一次提交只准打一个请求。
 //
 // 原实现一次提交要 3 个 RTT + 50ms，且三个请求全部走最高优先级——目标 A 的
@@ -366,10 +392,32 @@ fn mock_server_covers_rate_limit_oversized_count_failure_and_submit_confirmation
     let result = runtime()
         .block_on(client.elect_lesson("0", "2002", Some(2), crate::eams::ConfirmMode::Verify))
         .unwrap();
-    assert!(matches!(result, ElectResult::Success { detail } if detail.contains("已二次确认")));
+    // C-05：课程仍在可选列表里、只有全局人数从 2 变成 3——这一票完全可能是
+    // 别人投的，不足以确认「我」选上了。只能是「暂不确定」，绝不能是确认。
+    assert!(
+        matches!(&result, ElectResult::Success { detail } if detail.contains("暂不确定")),
+        "a global count bump must not confirm our own submission, got {result:?}"
+    );
     let submit_requests = submitted.requests(3).join("\n");
     assert!(submit_requests.contains("batchOperator.action"));
     assert!(submit_requests.contains("stdElectCourse!data.action"));
+
+    // 与他人行为无关的权威判据：课程已经不在我的可选列表里。
+    let gone_data = "var lessonJSONs=[{id:2999,no:'CS.2999',name:'别的课',teachers:'老师',stdCount:1,limitCount:30}];";
+    let confirmed = MockServer::scripted(vec![
+        MockResponse::ok("选课成功"),
+        MockResponse::ok(gone_data),
+        MockResponse::ok("window.lessonId2Counts={'2999':{sc:1,lc:30}}"),
+    ]);
+    let client = confirmed.client();
+    let result = runtime()
+        .block_on(client.elect_lesson("0", "2002", Some(2), crate::eams::ConfirmMode::Verify))
+        .unwrap();
+    assert!(
+        matches!(&result, ElectResult::Success { detail } if detail.contains("已二次确认")),
+        "absence from the electable catalog is the authoritative confirmation, got {result:?}"
+    );
+    confirmed.requests(2);
     assert!(submit_requests.contains("queryStdCount.action"));
 
     let oversized =

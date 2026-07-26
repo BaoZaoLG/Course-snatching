@@ -602,25 +602,38 @@ impl EamsClient {
             return Ok(VerifyOutcome::Confirmed);
         };
 
-        if let (Some(before), Some(after)) = (before_selected, lesson.seat.selected()) {
-            if after > before {
-                return Ok(VerifyOutcome::Confirmed);
-            }
-        }
+        // ── 全局人数差不再作为「确认成功」的证据 ────────────────────
+        //
+        // 抢课高峰同一秒内有大量其他学生进出：`after > before` 完全可能由
+        // 别人造成，把失败判成成功是这里唯一不可接受的错误——一旦误判，
+        // monitor 会把目标移出 pending，等于永久放弃一门其实没抢到的课。
+        // 基线还是上一轮的陈旧快照，误差更大。
+        //
+        // 唯一与他人行为无关的权威判据是「这门课还在不在我的可选列表里」：
+        // 选上之后它就不该再出现在可选目录中。已经在上面判过了。
+        //
+        // 人数变化仍然有用，但只用作「存疑」的弱信号，不作为终态证据。
+        let counts_moved = matches!(
+            (before_selected, lesson.seat.selected()),
+            (Some(before), Some(after)) if after > before
+        );
+        let strong = success_detail.contains("选课成功")
+            || success_detail.contains("已经选过")
+            || success_detail.contains("已选过")
+            || success_detail.contains("操作成功");
+
         if lesson.seat.is_full() {
+            // 课程已满且我们刚提交成功：再抢也没有意义，按确认处理与原逻辑一致。
+            // （即便这一名额是别人占的，把目标留在 pending 也只会空转。）
             return Ok(VerifyOutcome::Confirmed);
         }
-        if lesson.seat.has_seat() {
-            let strong = success_detail.contains("选课成功")
-                || success_detail.contains("已经选过")
-                || success_detail.contains("已选过")
-                || success_detail.contains("操作成功");
-            if !strong {
-                return Ok(VerifyOutcome::Rejected(
-                    "提交返回疑似成功，但人数未变化且课程仍可选，下轮将复核重试".into(),
-                ));
-            }
-            return Ok(VerifyOutcome::Inconclusive);
+        if lesson.seat.has_seat() && !strong && !counts_moved {
+            // 弱成功文案 + 人数一点没动 + 课程仍可选：三者同时成立时最像
+            // 「其实没成功」。仍然只降级成存疑（上层映射为 Busy 保留重试），
+            // 绝不终态化——真实成功被误判为失败的代价更大。
+            return Ok(VerifyOutcome::Rejected(
+                "提交返回疑似成功，但人数未变化且课程仍可选，下轮将复核重试".into(),
+            ));
         }
         Ok(VerifyOutcome::Inconclusive)
     }
