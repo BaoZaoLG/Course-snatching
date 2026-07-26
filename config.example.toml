@@ -1,5 +1,7 @@
 # 示例配置。程序会在 %APPDATA%\Course-snatching\config.toml 自行维护同名文件，
 # 这份只用于说明字段含义；缺失字段一律回落到默认值。
+# 配置结构版本。程序读到更高版本时会只读运行并提示，绝不覆盖写。
+schema_version = 1
 base_url = "https://example.edu/eams"
 username = ""
 # 常规轮询间隔（秒）。真正的限速由请求治理的令牌桶承担。

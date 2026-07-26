@@ -16,6 +16,14 @@ static CRASH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub const DEBUG_FILE_LIMIT: usize = 10;
 pub const DEBUG_TOTAL_BYTES_LIMIT: u64 = 20 * 1024 * 1024;
 pub const DEBUG_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+/// 当前配置结构版本。改字段语义/类型时 +1 并在迁移链里补一步。
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    // 没有版本号的旧配置就是 v1。
+    1
+}
+
 pub const CRASH_FILE_LIMIT: usize = 3;
 /// 崩溃报告也要有年龄上限：只按数量轮转的话，一份含服务器文本的报告可以
 /// 无限期留在盘上。
@@ -31,6 +39,14 @@ pub struct WatchMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    /// 配置结构版本。
+    ///
+    /// `#[serde(default)]` 只能兜住「新增字段」，兜不住改语义 / 改类型 / 拆分。
+    /// 显式版本号让兼容逻辑从解析器里搬到一条可读的迁移链上——schedule_time
+    /// 从 HH:MM 升到 YYYY-MM-DD HH:MM:SS 那次改动，就是缺版本号被迫在解析器
+    /// 里长期背兼容包袱的证据。
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub base_url: String,
     pub username: String,
     pub interval_seconds: f64,
@@ -83,6 +99,20 @@ pub struct AppConfig {
     /// 账号等价的会话 Cookie，多留一份密码的边际风险有限。想关的用户可以
     /// 在高级设置里关掉。
     pub remember_credentials_for_session: bool,
+    /// 本程序不认识的字段原样保留。
+    ///
+    /// 结构体没有 `deny_unknown_fields`，而 `save_to` 是全量序列化：旧版读到
+    /// 新版写的配置会忽略未知字段，用户回滚一次版本，新字段就永久消失且毫无
+    /// 提示。原样带着走即可避免这种静默丢数据。
+    #[serde(flatten)]
+    pub unknown_fields: toml::Table,
+    /// 这份配置来自更高版本的程序：可以照常运行，但绝不覆盖写。
+    ///
+    /// 全量序列化保存会把新版本的字段结构改回旧形状，用户升级回去就会发现
+    /// 配置被降级过。宁可不保存，也不要静默破坏。跟着配置走而不是放全局，
+    /// 免得导入/导出与测试之间互相串味。
+    #[serde(skip)]
+    pub read_only: bool,
     /// 冲刺期的轮询间隔（秒）。
     ///
     /// 冲刺此前唯一的差别只是去掉 0–10% 的正抖动，也就是最多快 10%——默认
@@ -95,6 +125,9 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            unknown_fields: toml::Table::new(),
+            read_only: false,
             base_url: "https://example.edu/eams".into(),
             username: String::new(),
             interval_seconds: 1.5,
@@ -186,7 +219,15 @@ impl AppConfig {
                 // Raw page dumps may contain personal information. A persisted legacy option
                 // must never silently re-enable them in a new application session.
                 cfg.debug_dump_enabled = false;
-                (cfg, None)
+                // 只读运行必须让用户知道，否则他改了设置却发现下次启动全没了。
+                let warning = cfg.read_only.then(|| {
+                    format!(
+                        "配置来自更高版本的程序（schema v{}，本程序支持 v{}），\
+                         本次只读运行：所有改动都不会被保存。请升级程序。",
+                        cfg.schema_version, CURRENT_SCHEMA_VERSION
+                    )
+                });
+                (cfg, warning)
             }
             Err(error) => {
                 let backup = invalid_backup_path(&path);
@@ -209,6 +250,7 @@ impl AppConfig {
             .with_context(|| format!("读取配置失败：{}", path.display()))?;
         let mut cfg: Self =
             toml::from_str(&text).with_context(|| format!("解析配置失败：{}", path.display()))?;
+        cfg = migrate(cfg)?;
         cfg.normalize();
         // This legacy field is accepted on read only. Raw pages can contain personal data,
         // so every fresh application session must start with dumping disabled.
@@ -221,6 +263,12 @@ impl AppConfig {
     }
 
     fn save_to(&self, path: &Path) -> Result<()> {
+        if self.read_only {
+            bail!(
+                "配置来自更高版本的程序，本次以只读方式运行，未保存改动。\
+                 请升级程序，或手动备份后删除配置文件。"
+            );
+        }
         let _save_guard = CONFIG_SAVE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -438,6 +486,23 @@ impl AppConfig {
         let _ = retain_files(dir, CRASH_FILE_LIMIT, u64::MAX, Some(CRASH_MAX_AGE_SECS));
         Ok(path)
     }
+}
+
+/// 配置迁移链。
+///
+/// 每次改字段语义/类型就把 `CURRENT_SCHEMA_VERSION` +1，并在这里补一步；
+/// 兼容逻辑集中在这条链上，而不是散落进解析器（`normalize` 里那段 1970
+/// 占位符 hack 就是后者的下场）。
+fn migrate(mut cfg: AppConfig) -> Result<AppConfig> {
+    if cfg.schema_version > CURRENT_SCHEMA_VERSION {
+        // 未来版本：读得进来就照用，但绝不覆盖写回去。
+        cfg.read_only = true;
+        return Ok(cfg);
+    }
+    // v1 是当前版本，链上暂时没有步骤。新增迁移时形如：
+    //   if cfg.schema_version < 2 { ...; cfg.schema_version = 2; }
+    cfg.schema_version = CURRENT_SCHEMA_VERSION;
+    Ok(cfg)
 }
 
 #[derive(Debug)]
@@ -1161,6 +1226,64 @@ https://example.edu/eams?sessionId=abc&course=1";
             example_keys, default_keys,
             "config.example.toml drifted from AppConfig"
         );
+    }
+
+    // S-05：降级即静默丢数据是最难发现的一类问题——用户回滚一次版本，
+    // 新版本写下的字段就永久消失且毫无提示。
+    #[test]
+    fn unknown_fields_survive_a_round_trip() {
+        let text = "\
+base_url = \"https://example.edu/eams\"\n\
+schema_version = 1\n\
+some_future_option = 42\n\
+another_future_option = \"keep me\"\n";
+        let cfg: AppConfig = toml::from_str(text).unwrap();
+        assert_eq!(cfg.unknown_fields.len(), 2, "unknown keys must be captured");
+        let saved = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            saved.contains("some_future_option") && saved.contains("keep me"),
+            "a downgrade must not silently drop the newer version's settings:\n{saved}"
+        );
+    }
+
+    // 读到来自更高版本的配置：可以照常运行，但绝不覆盖写。
+    #[test]
+    fn a_newer_schema_makes_the_config_read_only() {
+        let dir = std::env::temp_dir().join(format!("cs-schema-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "schema_version = {}\nbase_url = \"https://example.edu/eams\"\n",
+                CURRENT_SCHEMA_VERSION + 1
+            ),
+        )
+        .unwrap();
+
+        let cfg = AppConfig::read_from(&path).unwrap();
+        assert!(cfg.read_only, "must refuse to overwrite");
+        let error = cfg.save_to(&path).expect_err("save must be refused");
+        assert!(
+            format!("{error:#}").contains("只读"),
+            "the refusal must explain itself, got {error:#}"
+        );
+        // 文件必须原封不动。
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains(&format!("schema_version = {}", CURRENT_SCHEMA_VERSION + 1)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 没有版本号的旧配置按 v1 处理并被写上版本号。
+    #[test]
+    fn legacy_config_without_a_version_becomes_v1() {
+        let cfg: AppConfig = toml::from_str("base_url = \"https://example.edu/eams\"").unwrap();
+        assert_eq!(cfg.schema_version, 1);
+        let migrated = migrate(cfg).unwrap();
+        assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(!migrated.read_only);
     }
 
     // 数值不变式统一收敛到 normalize()：UI 与 worker 各兜一次总会漏掉

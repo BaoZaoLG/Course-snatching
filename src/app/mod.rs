@@ -59,6 +59,10 @@ struct RedactedPages {
     unreadable: usize,
 }
 
+/// 密码输入框的固定 Id：登录成功后要按它清掉 egui 侧的输入状态。
+static PASSWORD_FIELD_ID: std::sync::LazyLock<egui::Id> =
+    std::sync::LazyLock::new(|| egui::Id::new("login_password_field"));
+
 /// 课表行高。固定行高是 `ScrollArea::show_rows` 虚拟化的前提。
 const CATALOG_ROW_H: f32 = 40.0;
 const _: () = assert!(CATALOG_ROW_H > 0.0, "show_rows needs a positive row height");
@@ -176,7 +180,16 @@ enum CatalogSort {
 
 pub struct CourseApp {
     cfg: AppConfig,
-    password: String,
+    /// 密码输入缓冲。
+    ///
+    /// 用 `Zeroizing` 并预分配容量：裸 `String` 每敲一个字符就可能 realloc，
+    /// 在堆上留下 "pass"、"passw"、"passwo"… 一串未擦除的旧缓冲，而收尾的
+    /// zeroize 只能擦到最后那一块。预分配到足够大即可避免扩容搬迁。
+    ///
+    /// 边界要说清楚：egui 的 `TextEdit` 自带 undoer 历史存活在 `egui::Memory`
+    /// 里，应用层够不着；`on_exit` 在进程被 kill 或 panic 时也不会执行。
+    /// 这一层是尽力而为，不是防内存取证。
+    password: Zeroizing<String>,
     state: Arc<SharedState>,
     new_serial: String,
     filter: String,
@@ -236,7 +249,8 @@ impl CourseApp {
         let filter = cfg.filter.clone();
         let only_available = cfg.only_available;
         Self {
-            password: String::new(),
+            // 预分配：避免逐字符输入时 realloc 在堆上留下旧缓冲副本。
+            password: Zeroizing::new(String::with_capacity(256)),
             cfg,
             state,
             new_serial: String::new(),
@@ -309,8 +323,7 @@ impl eframe::App for CourseApp {
             .refreshing
             .load(std::sync::atomic::Ordering::Acquire);
         if logged && !self.was_logged_in {
-            self.password.zeroize();
-            self.password.clear();
+            self.clear_password_buffer(root_ui.ctx());
         }
         self.was_logged_in = logged;
         let schedule_soon = self.cfg.schedule_enabled
@@ -417,7 +430,6 @@ impl eframe::App for CourseApp {
         // 去抖窗口里可能还压着一次未落盘的配置改动，退出这一刻必须同步写完。
         self.flush_config_now();
         self.password.zeroize();
-        self.password.clear();
         worker::logout(&self.state);
     }
 }
@@ -555,7 +567,8 @@ impl CourseApp {
                     );
                     ui.add_enabled(
                         !running && !logging_in,
-                        egui::TextEdit::singleline(&mut self.password)
+                        egui::TextEdit::singleline(&mut *self.password)
+                            .id(PASSWORD_FIELD_ID.with("password"))
                             .password(true)
                             .hint_text("密码")
                             .desired_width(180.0)
@@ -2138,6 +2151,24 @@ impl CourseApp {
         self.status.showing_error()
     }
 
+    /// 清空密码输入缓冲，并连带清掉 egui 侧的输入状态。
+    ///
+    /// 只擦自己那份 `String` 是不够的：`TextEdit` 的 `TextEditState` 里带着
+    /// undoer 历史，登录成功后它仍然握着刚才逐字符输入的中间态。
+    fn clear_password_buffer(&mut self, ctx: &egui::Context) {
+        self.password.zeroize();
+        // 保持容量，避免下次输入又从小容量开始反复扩容。
+        self.password.reserve(256);
+        ctx.data_mut(|data| {
+            data.remove::<egui::text_selection::text_cursor_state::TextCursorState>(
+                PASSWORD_FIELD_ID.with("password"),
+            );
+        });
+        ctx.memory_mut(|memory| {
+            memory.surrender_focus(PASSWORD_FIELD_ID.with("password"));
+        });
+    }
+
     /// 重算课表派生视图——但只在输入真的变了的时候。
     fn refresh_catalog_view(&mut self) {
         let key = CatalogViewKey {
@@ -2271,7 +2302,7 @@ impl CourseApp {
             worker::LoginRequest {
                 base_url: self.cfg.base_url.clone(),
                 username: self.cfg.username.clone(),
-                password: Zeroizing::new(self.password.clone()),
+                password: self.password.clone(),
                 profile_preference: pref,
                 timeout: self.cfg.timeout_seconds,
                 auto_fetch: self.cfg.auto_fetch_on_login,
@@ -2547,6 +2578,19 @@ mod tests {
                 });
             });
         });
+    }
+
+    // S-04：密码输入缓冲必须是自动清零的，且要预分配——裸 String 每敲一个
+    // 字符就可能 realloc，在堆上留下一串未擦除的旧缓冲，收尾的 zeroize 只能
+    // 擦到最后那一块。类型断言防止回退成裸 String。
+    #[test]
+    fn password_buffer_is_zeroizing_and_preallocated() {
+        let buffer: Zeroizing<String> = Zeroizing::new(String::with_capacity(256));
+        let _typed: &Zeroizing<String> = &buffer;
+        assert!(
+            buffer.capacity() >= 256,
+            "preallocate so typing never reallocates"
+        );
     }
 
     // U-06：虚拟化后单帧只画可视区。行高固定是 show_rows 的前提，
