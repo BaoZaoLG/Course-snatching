@@ -59,6 +59,10 @@ struct RedactedPages {
     unreadable: usize,
 }
 
+/// 课表行高。固定行高是 `ScrollArea::show_rows` 虚拟化的前提。
+const CATALOG_ROW_H: f32 = 40.0;
+const _: () = assert!(CATALOG_ROW_H > 0.0, "show_rows needs a positive row height");
+
 /// 课表派生视图缓存。
 ///
 /// `key` 覆盖一切会改变结果的输入；任一不同才重算。
@@ -1476,12 +1480,12 @@ impl CourseApp {
                     draw_table_header(ui, full_w, &widths);
                     ui.add_space(2.0);
 
-                    egui::ScrollArea::vertical()
-                        .id_salt("catalog")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_min_width(full_w);
-                            if filtered.is_empty() {
+                    if filtered.is_empty() {
+                        egui::ScrollArea::vertical()
+                            .id_salt("catalog")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(full_w);
                                 ui.add_space(54.0);
                                 empty_hint(
                                     ui,
@@ -1496,15 +1500,27 @@ impl CourseApp {
                                         "请调整搜索内容或筛选条件"
                                     },
                                 );
-                            } else {
-                                for (index, lesson) in filtered.iter().take(800).enumerate() {
+                            });
+                    } else {
+                        // 只画可视区。可视区通常只有约 15 行，此前却要为最多
+                        // 800 行分配 rect、跑 animate_bool_with_time、生成 galley
+                        // 并 tessellate——这是 running 时最大的单帧开销。行高
+                        // 固定，天然适配 show_rows；顺带去掉 800 行的硬截断，
+                        // 课程再多也不会被悄悄截掉。
+                        egui::ScrollArea::vertical()
+                            .id_salt("catalog")
+                            .auto_shrink([false, false])
+                            .show_rows(ui, CATALOG_ROW_H, filtered.len(), |ui, range| {
+                                ui.set_min_width(full_w);
+                                for index in range {
+                                    let lesson = &filtered[index];
                                     let serial_watched = watched.contains(&lesson.no);
                                     let selected_id = watched_lesson_ids.get(&lesson.no);
                                     let already = selected_id.is_some_and(|id| id == &lesson.id);
                                     let switching = serial_watched
                                         && selected_id.is_some_and(|id| id != &lesson.id);
                                     let needs_specifying = serial_watched && selected_id.is_none();
-                                    let row_h = 40.0;
+                                    let row_h = CATALOG_ROW_H;
                                     let (row_rect, row_response) = ui.allocate_exact_size(
                                         Vec2::new(full_w, row_h),
                                         Sense::click(),
@@ -1514,6 +1530,24 @@ impl CourseApp {
                                     } else {
                                         pal().row_alt
                                     };
+                                    // 纯 painter 绘制不产生任何 widget 语义：
+                                    // Cargo.toml 开了 accesskit，但读屏软件看到
+                                    // 的主内容区是一片空白。至少让每一行可枚举、
+                                    // 能被读出来。
+                                    row_response.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            format!(
+                                                "{} {} {} 已选 {}{}",
+                                                lesson.no,
+                                                lesson.name,
+                                                lesson.teachers,
+                                                lesson.capacity_text(),
+                                                if already { "（监控中）" } else { "" }
+                                            ),
+                                        )
+                                    });
                                     let hover = ui.ctx().animate_bool_with_time(
                                         ui.id().with(("course_row", &lesson.id)),
                                         row_response.hovered(),
@@ -1636,8 +1670,8 @@ impl CourseApp {
                                         .color(pal().muted),
                                     );
                                 }
-                            }
-                        });
+                            });
+                    }
                 });
             });
     }
@@ -2513,6 +2547,15 @@ mod tests {
                 });
             });
         });
+    }
+
+    // U-06：虚拟化后单帧只画可视区。行高固定是 show_rows 的前提，
+    // 一旦有人把它改成变高的行，虚拟化会静默错位。
+    #[test]
+    fn catalog_rows_stay_fixed_height_for_virtualisation() {
+        // 行高是手写常量且被 show_rows 与行绘制两处共用；改动必须同步，
+        // 否则虚拟化会静默错位（画出来的行和滚动条算的位置对不上）。
+        assert_eq!(CATALOG_ROW_H, 40.0);
     }
 
     // U-02：派生视图缓存的正确性全靠这把 key——漏掉任何一个输入，界面就会
