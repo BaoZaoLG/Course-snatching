@@ -6,14 +6,18 @@
 
 use super::monitor::start_grab;
 use super::runtime::spawn_task;
+use super::time::local_now_millis;
 use super::{local_now_seconds, LogLevel, SharedState};
 use crate::config::AppConfig;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 错过开抢时刻后的补触发宽限期（秒）：超过即视为过期，不再补抢。
 pub const SCHEDULE_GRACE_SECS: i64 = 30;
+
+/// 墙钟与单调时钟的允许偏差（秒）。超过即认为发生了休眠或系统对时。
+const CLOCK_JUMP_TOLERANCE_SECS: i64 = 2;
 
 /// UI 帧循环对定时开抢可执行的动作（由 `schedule_decision` 给出）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +29,16 @@ pub enum ScheduleAction {
     MarkExpired,
     /// 保持现状。
     Noop,
+}
+
+/// 是否仍在可触发窗口内。
+///
+/// UI 帧循环与 worker 待命任务共用这一个判定，宽限期语义只有一处实现。
+/// 曾经只有 UI 侧会把过期的定时标记为 expired，待命任务自己不检查——
+/// 笔记本合盖休眠跨过目标时刻后唤醒，tokio 定时器立刻到期，待命任务会
+/// 启动一次早已作废的抢课运行。
+pub fn within_schedule_grace(now: i64, target: i64) -> bool {
+    now <= target + SCHEDULE_GRACE_SECS
 }
 
 /// 定时开抢的触发决策。纯函数：时间与去重语义集中在此，便于边界测试。
@@ -59,7 +73,11 @@ pub fn arm_schedule(state: Arc<SharedState>, cfg: AppConfig, key: String, target
     state.publish_config(cfg.clone());
     let now = local_now_seconds();
     if now >= target_local_secs {
-        // Already due (inside the grace window) — fire immediately, worker-side.
+        // Already due — fire immediately, worker-side, but only inside the grace window.
+        if !within_schedule_grace(now, target_local_secs) {
+            expire_schedule(&state, &key, now - target_local_secs);
+            return;
+        }
         if state.running.load(Ordering::Acquire) {
             state.disarm_schedule_if_current(arm_gen);
         } else if state.claim_schedule_fire(&key, arm_gen) {
@@ -71,6 +89,10 @@ pub fn arm_schedule(state: Arc<SharedState>, cfg: AppConfig, key: String, target
     }
     state.set_message(format!("定时待命中，目标 T{:+}s", target_local_secs - now));
     spawn_task(async move {
+        // 单调时钟基线：用它识别墙钟跳变（休眠唤醒、系统对时），墙钟自己
+        // 没法区分「睡了两小时」和「时间被改了」。
+        let mut last_monotonic = Instant::now();
+        let mut last_wall = local_now_seconds();
         loop {
             if state.schedule_arm_generation.load(Ordering::Acquire) != arm_gen {
                 // 已被取消或新的待命接管：armed 键由接管方维护，不能动。
@@ -83,6 +105,18 @@ pub fn arm_schedule(state: Arc<SharedState>, cfg: AppConfig, key: String, target
                 return;
             }
             let now = local_now_seconds();
+            let monotonic_elapsed = last_monotonic.elapsed().as_secs() as i64;
+            let wall_elapsed = now - last_wall;
+            if (wall_elapsed - monotonic_elapsed).abs() > CLOCK_JUMP_TOLERANCE_SECS {
+                state.log(
+                    LogLevel::Warn,
+                    format!(
+                        "检测到系统时间跳变（墙钟 {wall_elapsed}s / 单调 {monotonic_elapsed}s），重新评估定时开抢"
+                    ),
+                );
+            }
+            last_monotonic = Instant::now();
+            last_wall = now;
             if now >= target_local_secs {
                 break;
             }
@@ -103,19 +137,38 @@ pub fn arm_schedule(state: Arc<SharedState>, cfg: AppConfig, key: String, target
             state.disarm_schedule_if_current(arm_gen);
             return;
         }
+        // 唤醒后必须复查宽限期：休眠跨过目标时刻时 tokio 定时器会立刻到期，
+        // 不检查就会在错过数小时后突然开抢。
+        let woke_at = local_now_seconds();
+        if !within_schedule_grace(woke_at, target_local_secs) {
+            expire_schedule(&state, &key, woke_at - target_local_secs);
+            return;
+        }
         if !state.claim_schedule_fire(&key, arm_gen) {
             return;
         }
+        let deviation_ms = local_now_millis() - target_local_secs * 1000;
         state.log(
             LogLevel::Info,
-            format!(
-                "精确定时触发（偏差约 {}ms 内）",
-                ((local_now_seconds() - target_local_secs).abs() * 1000).min(999)
-            ),
+            format!("精确定时触发（偏差 {deviation_ms:+}ms）"),
         );
         let run_cfg = state.latest_config.lock().clone().unwrap_or(cfg);
         start_grab(state, run_cfg);
     });
+}
+
+/// 错过宽限期：标记过期、明确告知用户为什么没开抢。静默不开抢比开抢更糟——
+/// 用户会以为定时生效了。
+fn expire_schedule(state: &SharedState, key: &str, late_by_secs: i64) {
+    state.mark_schedule_expired(key);
+    state.log(
+        LogLevel::Warn,
+        format!(
+            "定时开抢已过期未触发：{key}（已迟 {late_by_secs}s，超过 {SCHEDULE_GRACE_SECS}s 宽限期）。\
+             常见原因是本机休眠或系统时间跳变，请重新设定时刻。"
+        ),
+    );
+    state.set_message("定时开抢已过期，未开抢");
 }
 
 #[cfg(test)]
@@ -151,6 +204,56 @@ mod tests {
         assert_eq!(
             schedule_decision(target + SCHEDULE_GRACE_SECS + 1, target, false, true),
             MarkExpired
+        );
+    }
+
+    // G-05：宽限期语义必须只有一处实现，UI 与待命任务共用。
+    #[test]
+    fn grace_window_boundaries_are_shared_with_the_ui_decision() {
+        let target = 1_000_000_i64;
+        assert!(within_schedule_grace(target - 1, target));
+        assert!(within_schedule_grace(target, target));
+        assert!(within_schedule_grace(target + SCHEDULE_GRACE_SECS, target));
+        assert!(!within_schedule_grace(
+            target + SCHEDULE_GRACE_SECS + 1,
+            target
+        ));
+        // 与 UI 侧决策一致：超出宽限期就是 MarkExpired，不是 Arm。
+        assert_eq!(
+            schedule_decision(target + SCHEDULE_GRACE_SECS + 1, target, false, false),
+            ScheduleAction::MarkExpired
+        );
+    }
+
+    // 错过宽限期（休眠跨过目标时刻、系统时间跳变）绝不能补抢：
+    // 半夜三点突然开始抢一门早上八点该抢的课，比不抢更糟。
+    #[test]
+    fn arm_past_the_grace_window_expires_instead_of_firing() {
+        let base = serve_nothing();
+        let state = prepared_state(&base);
+        let key = "2026-01-01 08:00:00";
+        arm_schedule(
+            state.clone(),
+            test_config(&base, "LATE.001"),
+            key.into(),
+            local_now_seconds() - SCHEDULE_GRACE_SECS - 5,
+        );
+        assert!(
+            !state.running.load(Ordering::Acquire),
+            "expired schedule must not start a run"
+        );
+        assert!(state.schedule_fired_matches(key), "must be marked expired");
+        assert!(!state.schedule_armed_matches(key));
+        assert!(state.watch.lock().is_empty());
+        let logs = state
+            .logs
+            .lock()
+            .iter()
+            .map(|item| item.message.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            logs.iter().any(|m| m.contains("已过期未触发")),
+            "user must be told why nothing happened, got {logs:?}"
         );
     }
 

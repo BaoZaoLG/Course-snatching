@@ -59,6 +59,75 @@ struct RedactedPages {
     unreadable: usize,
 }
 
+/// 一次性操作结果的显示时长（秒）。错误留久一点，用户往往正在读它。
+const TRANSIENT_STATUS_TTL: f64 = 6.0;
+const TRANSIENT_ERROR_TTL: f64 = 12.0;
+
+/// 用户动作的结果提示。带 TTL，到期后让位给后台状态。
+struct TransientStatus {
+    text: String,
+    until: f64,
+    is_error: bool,
+}
+
+/// 状态栏消息模型。
+///
+/// 后台心跳（worker_message）与一次性操作结果分两个槽位：前者每帧刷新，
+/// 后者优先显示且带 TTL。此前两者共用一个字段，导致 30 余处 UI 侧提示
+/// （导出、导入、文件操作——恰恰全是可能失败、必须给反馈的动作）在同一帧
+/// 就被后台心跳覆盖，用户一个字都看不到。
+#[derive(Default)]
+struct StatusBar {
+    background: String,
+    transient: Option<TransientStatus>,
+    now: f64,
+}
+
+impl StatusBar {
+    fn new(background: String) -> Self {
+        Self {
+            background,
+            transient: None,
+            now: 0.0,
+        }
+    }
+
+    /// 推进时基。每帧开头调用一次，TTL 判定全部基于它。
+    fn tick(&mut self, now: f64) {
+        self.now = now;
+    }
+
+    fn set_background(&mut self, text: String) {
+        self.background = text;
+    }
+
+    fn push(&mut self, text: String, is_error: bool) {
+        let ttl = if is_error {
+            TRANSIENT_ERROR_TTL
+        } else {
+            TRANSIENT_STATUS_TTL
+        };
+        self.transient = Some(TransientStatus {
+            text,
+            until: self.now + ttl,
+            is_error,
+        });
+    }
+
+    fn effective(&self) -> &str {
+        match &self.transient {
+            Some(status) if self.now < status.until => &status.text,
+            _ => &self.background,
+        }
+    }
+
+    fn showing_error(&self) -> bool {
+        self.transient
+            .as_ref()
+            .is_some_and(|status| self.now < status.until && status.is_error)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LogFilter {
     All,
@@ -81,7 +150,7 @@ pub struct CourseApp {
     new_serial: String,
     filter: String,
     only_available: bool,
-    status_line: String,
+    status: StatusBar,
     show_logs: bool,
     show_advanced: bool,
     was_logged_in: bool,
@@ -130,7 +199,9 @@ impl CourseApp {
             new_serial: String::new(),
             filter,
             only_available,
-            status_line: config_warning.unwrap_or_else(|| "登录后刷新课程，从课表加入监控".into()),
+            status: StatusBar::new(
+                config_warning.unwrap_or_else(|| "登录后刷新课程，从课表加入监控".into()),
+            ),
             show_logs: true,
             show_advanced: false,
             was_logged_in: false,
@@ -155,6 +226,8 @@ impl CourseApp {
 
 impl eframe::App for CourseApp {
     fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // transient 状态的 TTL 判定要用同一个时基，先推进本帧时间。
+        self.status.tick(root_ui.input(|input| input.time));
         if !self.window_backdrop_attempted {
             self.window_backdrop_attempted = true;
             configure_window_backdrop(frame);
@@ -246,8 +319,11 @@ impl eframe::App for CourseApp {
         let lesson_count = self.state.lessons.lock().len();
         let worker_msg = self.state.worker_message.lock().clone();
         let network = self.state.network_snapshot();
+        // 后台心跳只更新 background_status；一次性操作结果走 transient 通道，
+        // 否则每帧这一句会把用户刚触发的提示（导出/导入/文件操作，共 30 余处）
+        // 立刻盖掉，界面上一个字都不会出现。
         if !worker_msg.is_empty() {
-            self.status_line = worker_msg;
+            self.status.set_background(worker_msg);
         }
         let active_pid = if self.cfg.profile_id.trim().is_empty() {
             self.state.profile_id.lock().clone()
@@ -335,7 +411,8 @@ impl CourseApp {
                     } else {
                         ("未登录", pal().muted)
                     };
-                    let detail = self.status_line.trim().to_string();
+                    let detail = self.effective_status().trim().to_string();
+                    let detail_is_error = self.status_is_error();
                     let show_detail = !detail.is_empty() && detail != label;
 
                     // Left: brand + live state
@@ -380,16 +457,22 @@ impl CourseApp {
 
                     // Right: action tip as a clear status chip (more noticeable, intentional placement)
                     if show_detail {
+                        // 失败类提示用软红底，别让用户在一片同色的提示里漏掉它。
+                        let (fill, line, text_color) = if detail_is_error {
+                            (pal().danger_fill, pal().danger_line, pal().red)
+                        } else {
+                            (pal().header_fill, pal().line, pal().text)
+                        };
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             egui::Frame::NONE
-                                .fill(pal().header_fill)
-                                .stroke(egui::Stroke::new(1.0, pal().line))
+                                .fill(fill)
+                                .stroke(egui::Stroke::new(1.0, line))
                                 .corner_radius(8.0)
                                 .inner_margin(egui::Margin::symmetric(12, 6))
                                 .show(ui, |ui| {
                                     ui.set_max_width(420.0);
                                     ui.label(
-                                        RichText::new(detail).size(META_SIZE).color(pal().text),
+                                        RichText::new(detail).size(META_SIZE).color(text_color),
                                     );
                                 });
                         });
@@ -457,7 +540,7 @@ impl CourseApp {
                             *self.state.profile_id.lock() = self.cfg.profile_id.trim().to_string();
                         }
                         self.save_config();
-                        self.status_line = "正在刷新课程…".into();
+                        self.set_status("正在刷新课程…");
                         self.state.set_message("正在刷新课程…");
                         worker::refresh_lessons(self.state.clone(), self.cfg.profile_id.clone());
                     }
@@ -506,7 +589,7 @@ impl CourseApp {
                         .clicked()
                     {
                         worker::stop_grab(&self.state);
-                        self.status_line = "正在停止…".into();
+                        self.set_status("正在停止…");
                     }
 
                     if logged
@@ -1577,7 +1660,7 @@ impl CourseApp {
                         if ui.add(soft_danger_button("退出", 72.0)).clicked() {
                             self.confirm_logout = false;
                             worker::logout(&self.state);
-                            self.status_line = "已退出登录".into();
+                            self.set_status("已退出登录");
                         }
                     });
                 });
@@ -1771,8 +1854,8 @@ impl CourseApp {
             .save_file()
         {
             match std::fs::write(&path, summary) {
-                Ok(()) => self.status_line = format!("结果摘要已导出：{}", path.display()),
-                Err(error) => self.status_line = format!("导出失败：{error}"),
+                Ok(()) => self.set_status(format!("结果摘要已导出：{}", path.display())),
+                Err(error) => self.set_status_error(format!("导出失败：{error}")),
             }
         }
     }
@@ -1789,8 +1872,8 @@ impl CourseApp {
             .save_file()
         {
             match std::fs::write(&path, text) {
-                Ok(()) => self.status_line = format!("日志已导出：{}", path.display()),
-                Err(error) => self.status_line = format!("导出失败：{error}"),
+                Ok(()) => self.set_status(format!("日志已导出：{}", path.display())),
+                Err(error) => self.set_status_error(format!("导出失败：{error}")),
             }
         }
     }
@@ -1859,13 +1942,10 @@ impl CourseApp {
             .and_then(|body| std::fs::write(&path, body).map_err(serde_json::Error::io))
         {
             Ok(()) => {
-                self.status_line = format!(
-                    "诊断包已导出：{}{}",
-                    path.display(),
-                    Self::export_raw_page_note(collected.submissions, collected.unreadable)
-                )
+                let note = Self::export_raw_page_note(collected.submissions, collected.unreadable);
+                self.set_status(format!("诊断包已导出：{}{}", path.display(), note));
             }
-            Err(error) => self.status_line = format!("导出诊断包失败：{error}"),
+            Err(error) => self.set_status_error(format!("导出诊断包失败：{error}")),
         }
     }
 
@@ -1901,8 +1981,8 @@ impl CourseApp {
             .save_file()
         {
             match self.cfg.export_to(&path) {
-                Ok(()) => self.status_line = format!("配置已导出：{}", path.display()),
-                Err(error) => self.status_line = format!("导出失败：{error:#}"),
+                Ok(()) => self.set_status(format!("配置已导出：{}", path.display())),
+                Err(error) => self.set_status_error(format!("导出失败：{error:#}")),
             }
         }
     }
@@ -1923,12 +2003,12 @@ impl CourseApp {
                     apply_style(ctx, self.cfg.dark_mode);
                     ctx.set_pixels_per_point(self.cfg.ui_scale.clamp(0.9, 1.5));
                     if let Err(error) = self.cfg.save() {
-                        self.status_line = format!("导入后保存失败：{error:#}");
+                        self.set_status_error(format!("导入后保存失败：{error:#}"));
                     } else {
-                        self.status_line = format!("配置已导入：{}", path.display());
+                        self.set_status(format!("配置已导入：{}", path.display()));
                     }
                 }
-                Err(error) => self.status_line = format!("导入失败：{error:#}"),
+                Err(error) => self.set_status_error(format!("导入失败：{error:#}")),
             }
         }
     }
@@ -1941,11 +2021,33 @@ impl CourseApp {
             let _ = std::process::Command::new("explorer").arg(&dir).spawn();
         }
         let crash = AppConfig::crash_log_path();
-        self.status_line = format!(
+        self.set_status(format!(
             "数据目录：{}（崩溃日志：{}）",
             dir.display(),
             crash.display()
-        );
+        ));
+    }
+
+    /// 记录一条用户动作的结果提示。
+    ///
+    /// 必须走这里而不是直接写字段：后台心跳每帧都会刷新状态栏，直接赋值
+    /// 会在同一帧内被覆盖，用户永远看不到。
+    fn set_status(&mut self, text: impl Into<String>) {
+        self.status.push(text.into(), false);
+    }
+
+    /// 同 `set_status`，但按错误呈现（红色、显示更久）。
+    fn set_status_error(&mut self, text: impl Into<String>) {
+        self.status.push(text.into(), true);
+    }
+
+    /// 当前应显示的状态文本：未过期的一次性提示优先，否则回落到后台状态。
+    fn effective_status(&self) -> &str {
+        self.status.effective()
+    }
+
+    fn status_is_error(&self) -> bool {
+        self.status.showing_error()
     }
 
     fn save_config(&mut self) {
@@ -1953,7 +2055,7 @@ impl CourseApp {
         self.state.publish_config(self.cfg.clone());
         if let Err(error) = self.cfg.save() {
             let message = format!("配置保存失败：{error:#}");
-            self.status_line = message.clone();
+            self.set_status(message.clone());
             self.state.set_message(message.clone());
             self.state.log(LogLevel::Error, message);
         }
@@ -1965,16 +2067,16 @@ impl CourseApp {
             .logging_in
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            self.status_line = "正在登录，请稍候…".into();
+            self.set_status("正在登录，请稍候…");
             return;
         }
         if self.cfg.username.trim().is_empty() || self.password.is_empty() {
-            self.status_line = "请填写账号和密码".into();
+            self.set_status_error("请填写账号和密码");
             self.state.set_message("请填写账号和密码");
             return;
         }
         if let Err(error) = self.cfg.validate_connection() {
-            self.status_line = error.to_string();
+            self.set_status(error.to_string());
             self.state.set_message(error.to_string());
             self.state.log(LogLevel::Warn, error.to_string());
             return;
@@ -1983,7 +2085,7 @@ impl CourseApp {
             if self.confirmed_custom_host.as_deref() != Some(&host) {
                 let message =
                     format!("即将把账号密码提交到非默认域名 {host}，请在高级设置中确认本次信任");
-                self.status_line = message.clone();
+                self.set_status(message.clone());
                 self.state.set_message(message.clone());
                 self.state.log(LogLevel::Warn, message);
                 return;
@@ -1994,7 +2096,7 @@ impl CourseApp {
             *self.state.profile_id.lock() = pref.clone();
         }
         self.save_config();
-        self.status_line = "正在登录…".into();
+        self.set_status("正在登录…");
         worker::login_and_fetch(
             self.state.clone(),
             worker::LoginRequest {
@@ -2024,12 +2126,13 @@ impl CourseApp {
             .running
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            self.status_line = "运行期间不能修改监控目标".into();
+            self.set_status_error("运行期间不能修改监控目标");
             return;
         }
         if lesson.id.is_empty() || !lesson.id.chars().all(|ch| ch.is_ascii_digit()) {
-            self.status_line = "课程教学班标识无效，无法加入监控".into();
-            self.state.log(LogLevel::Error, self.status_line.clone());
+            let message = "课程教学班标识无效，无法加入监控";
+            self.set_status_error(message);
+            self.state.log(LogLevel::Error, message);
             return;
         }
         if !self
@@ -2055,7 +2158,7 @@ impl CourseApp {
             "已指定监控：{} · {} · {}",
             lesson.no, lesson.name, lesson.teachers
         );
-        self.status_line = message.clone();
+        self.set_status(message.clone());
         self.state.set_message(message.clone());
         self.state.log(LogLevel::Info, message);
     }
@@ -2066,16 +2169,16 @@ impl CourseApp {
             .running
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            self.status_line = "运行期间不能修改监控目标".into();
+            self.set_status_error("运行期间不能修改监控目标");
             return;
         }
         if self.cfg.watch_serials.iter().any(|x| x == serial) {
-            self.status_line = format!("已在监控：{serial}");
+            self.set_status(format!("已在监控：{serial}"));
             return;
         }
         self.cfg.watch_serials.push(serial.to_string());
         self.save_config();
-        self.status_line = format!("已加入监控：{serial}");
+        self.set_status(format!("已加入监控：{serial}"));
         self.state.set_message(format!("已加入监控：{serial}"));
         self.state
             .log(LogLevel::Info, format!("已加入监控：{serial}"));
@@ -2083,7 +2186,7 @@ impl CourseApp {
 
     fn start_grab(&mut self) {
         if let Err(e) = self.cfg.validate_watch() {
-            self.status_line = format!("{e}");
+            self.set_status(format!("{e}"));
             self.state.set_message(format!("{e}"));
             self.state.log(LogLevel::Warn, format!("{e}"));
             return;
@@ -2093,7 +2196,7 @@ impl CourseApp {
             .logged_in
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            self.status_line = "请先登录".into();
+            self.set_status_error("请先登录");
             self.state.set_message("请先登录");
             return;
         }
@@ -2103,7 +2206,7 @@ impl CourseApp {
         self.save_config();
         self.result_summary = None;
         worker::start_grab(self.state.clone(), self.cfg.clone());
-        self.status_line = "抢课进行中".into();
+        self.set_status("抢课进行中");
         self.state.set_message("抢课进行中");
     }
 
@@ -2191,7 +2294,7 @@ impl CourseApp {
             .lock()
             .retain(|item| !serials.iter().any(|s| s == &item.serial));
         self.save_config();
-        self.status_line = format!("已清理 {} 个目标", serials.len());
+        self.set_status(format!("已清理 {} 个目标", serials.len()));
         self.state.log(
             LogLevel::Info,
             format!("已清理 {} 个监控目标", serials.len()),
@@ -2201,7 +2304,7 @@ impl CourseApp {
     fn build_result_summary(&self) -> String {
         let watch = self.state.watch.lock().clone();
         if watch.is_empty() {
-            return self.status_line.clone();
+            return self.effective_status().to_string();
         }
         let mut success = 0usize;
         let mut failed = 0usize;
@@ -2274,6 +2377,44 @@ mod tests {
                 });
             });
         });
+    }
+
+    // U-01：后台心跳每帧刷新，绝不能盖掉用户刚触发的一次性提示。
+    // 曾经两者共用一个字段，30 余处 UI 提示（导出/导入/文件操作）永不可见。
+    #[test]
+    fn transient_status_wins_over_background_heartbeat_until_it_expires() {
+        let mut bar = StatusBar::new("未登录".into());
+        bar.tick(100.0);
+        assert_eq!(bar.effective(), "未登录");
+
+        bar.push("诊断包已导出：D:/a.json".into(), false);
+        // 同一帧内后台心跳照常刷新——这正是原来把提示盖掉的那一步。
+        bar.set_background("抢课进行中".into());
+        assert_eq!(bar.effective(), "诊断包已导出：D:/a.json");
+        assert!(!bar.showing_error());
+
+        // TTL 内保持可见。
+        bar.tick(100.0 + TRANSIENT_STATUS_TTL - 0.1);
+        assert_eq!(bar.effective(), "诊断包已导出：D:/a.json");
+        // 到期后让位给后台状态，而不是永久占住状态栏。
+        bar.tick(100.0 + TRANSIENT_STATUS_TTL + 0.1);
+        assert_eq!(bar.effective(), "抢课进行中");
+        assert!(!bar.showing_error());
+    }
+
+    #[test]
+    fn error_status_is_marked_and_outlives_a_plain_one() {
+        let mut bar = StatusBar::new("就绪".into());
+        bar.tick(0.0);
+        bar.push("导出失败：磁盘已满".into(), true);
+        assert!(bar.showing_error());
+        // 错误提示的存活时间必须长于普通提示——用户往往正在读它。
+        bar.tick(TRANSIENT_STATUS_TTL + 0.1);
+        assert_eq!(bar.effective(), "导出失败：磁盘已满");
+        assert!(bar.showing_error());
+        bar.tick(TRANSIENT_ERROR_TTL + 0.1);
+        assert_eq!(bar.effective(), "就绪");
+        assert!(!bar.showing_error());
     }
 
     // [#1] 诊断包导出的原始页面必须经过 redact_diagnostic_page：

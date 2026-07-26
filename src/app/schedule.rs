@@ -43,7 +43,7 @@ impl CourseApp {
             worker::ScheduleAction::Arm => {
                 let remain = (target_secs - now).max(0);
                 worker::arm_schedule(self.state.clone(), self.cfg.clone(), key, target_secs);
-                self.status_line = format!("定时精准待命，约 {remain}s 后开抢");
+                self.set_status(format!("定时精准待命，约 {remain}s 后开抢"));
             }
             worker::ScheduleAction::Noop => {}
         }

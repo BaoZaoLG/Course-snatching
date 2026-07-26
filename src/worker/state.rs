@@ -1,5 +1,5 @@
 use super::time::now_hms;
-use crate::config::AppConfig;
+use crate::config::{redact_diagnostic_text, AppConfig};
 use crate::eams::{EamsClient, Lesson, NetworkSnapshot};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -131,11 +131,18 @@ impl SharedState {
         })
     }
 
+    /// 日志写入端就脱敏。
+    ///
+    /// 日志 message 本身携带服务器文本（summarize_html 保留 160 字符原文、
+    /// extract_login_error、各处 detail），而它有两个出口：「导出日志」和
+    /// 「导出诊断包」。此前只有后者脱敏，同一条数据从两个按钮出去一个明文
+    /// 一个脱敏，用户无从知晓这个区别。脱敏收敛到写入端后，不脱敏的出口在
+    /// 结构上就不存在了——包括界面上的日志抽屉。
     pub fn log(&self, level: LogLevel, message: impl Into<String>) {
         let item = LogItem {
             time: now_hms(),
             level,
-            message: message.into(),
+            message: redact_diagnostic_text(&message.into()),
         };
         let mut logs = self.logs.lock();
         logs.push_front(item);
@@ -146,7 +153,8 @@ impl SharedState {
     }
 
     pub fn set_message(&self, message: impl Into<String>) {
-        *self.worker_message.lock() = message.into();
+        // 状态栏同样会显示服务器文本（限流原因、登录错误），一并脱敏。
+        *self.worker_message.lock() = redact_diagnostic_text(&message.into());
         self.touch();
     }
 
@@ -277,5 +285,31 @@ impl SharedState {
         self.running.load(Ordering::Acquire)
             || self.logging_in.load(Ordering::Acquire)
             || self.refreshing.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // S-03：脱敏收敛到写入端后，「导出日志」与「导出诊断包」两个按钮对
+    // 同一条数据必须产出相同结果——不存在未脱敏的出口，界面日志抽屉也一样。
+    #[test]
+    fn log_and_status_are_redacted_at_the_write_side() {
+        let state = SharedState::new();
+        state.log(
+            LogLevel::Error,
+            "登录失败：Set-Cookie: JSESSIONID=abc123 password=hunter2",
+        );
+        let logged = state.logs.lock().front().unwrap().message.clone();
+        for secret in ["abc123", "hunter2"] {
+            assert!(!logged.contains(secret), "log leaked {secret}: {logged}");
+        }
+        assert!(logged.contains("登录失败"), "over-redacted: {logged}");
+
+        state.set_message("限流原因：token=tk_live_1 请稍后");
+        let shown = state.worker_message.lock().clone();
+        assert!(!shown.contains("tk_live_1"), "status leaked: {shown}");
+        assert!(shown.contains("请稍后"), "over-redacted: {shown}");
     }
 }

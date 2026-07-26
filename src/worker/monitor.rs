@@ -842,6 +842,12 @@ fn is_network_error(kind: BackendErrorKind) -> bool {
             | BackendErrorKind::Timeout
             | BackendErrorKind::Server
             | BackendErrorKind::Transport
+            // 细分出来的传输类失败与 Transport 同权：它们同样不该计入
+            // 「非网络失败」的停机阈值，选课窗口期不允许静默停机。
+            | BackendErrorKind::Connect
+            | BackendErrorKind::Tls
+            | BackendErrorKind::Redirect
+            | BackendErrorKind::Decode
     )
 }
 

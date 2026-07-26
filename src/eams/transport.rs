@@ -4,6 +4,7 @@ use super::parse::{
     extract_login_error, looks_like_login_page, normalize_base, origin_key, parse_retry_after_secs,
     read_body_limited, summarize_html,
 };
+use super::types::classify_reqwest_error;
 use super::{
     backend_error_kind, rate_limit_retry_after, BackendErrorKind, EamsClient, EamsError,
     ProfileContext, RequestGovernor, RequestPriority, ResponseHandling, MAX_RESPONSE_BYTES, UA,
@@ -78,13 +79,13 @@ impl EamsClient {
     ) -> Result<(Url, String)> {
         let permit = self.governor.acquire(priority).await;
         let result = async {
-            let response = request.send().await.map_err(|error| EamsError::Network {
-                kind: if error.is_timeout() {
-                    BackendErrorKind::Timeout
-                } else {
-                    BackendErrorKind::Transport
-                },
-                message: format!("{action}失败"),
+            let response = request.send().await.map_err(|error| {
+                let (kind, cause) = classify_reqwest_error(&error);
+                EamsError::Network {
+                    kind,
+                    message: format!("{action}失败：{cause}"),
+                    source: Some(Box::new(error)),
+                }
             })?;
             let status = response.status();
             let final_url = response.url().clone();
@@ -101,19 +102,17 @@ impl EamsClient {
                     if backend_error_kind(&error) != BackendErrorKind::Unknown {
                         error.context(format!("读取{action}响应失败"))
                     } else {
-                        let kind = error
+                        let (kind, cause) = error
                             .chain()
                             .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
-                            .map_or(BackendErrorKind::Transport, |cause| {
-                                if cause.is_timeout() {
-                                    BackendErrorKind::Timeout
-                                } else {
-                                    BackendErrorKind::Transport
-                                }
-                            });
+                            .map_or(
+                                (BackendErrorKind::Transport, error.to_string()),
+                                classify_reqwest_error,
+                            );
                         anyhow::Error::new(EamsError::Network {
                             kind,
-                            message: format!("读取{action}响应失败"),
+                            message: format!("读取{action}响应失败：{cause}"),
+                            source: None,
                         })
                     }
                 })?;

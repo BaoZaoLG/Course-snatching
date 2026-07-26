@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -17,6 +17,9 @@ pub const DEBUG_FILE_LIMIT: usize = 10;
 pub const DEBUG_TOTAL_BYTES_LIMIT: u64 = 20 * 1024 * 1024;
 pub const DEBUG_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 pub const CRASH_FILE_LIMIT: usize = 3;
+/// 崩溃报告也要有年龄上限：只按数量轮转的话，一份含服务器文本的报告可以
+/// 无限期留在盘上。
+pub const CRASH_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -357,15 +360,36 @@ impl AppConfig {
     }
 
     pub fn retain_crash_reports() -> io::Result<()> {
-        retain_files(&Self::crash_dir(), CRASH_FILE_LIMIT, u64::MAX, None)
+        retain_files(
+            &Self::crash_dir(),
+            CRASH_FILE_LIMIT,
+            u64::MAX,
+            Some(CRASH_MAX_AGE_SECS),
+        )
     }
 
     /// Panic reporting must not trigger a second panic. Each report has its own file so a
     /// later crash does not overwrite the evidence from an earlier one.
+    ///
+    /// 报告在这里统一过一遍脱敏：panic payload 只要经手过服务器文本
+    /// （`.expect(&format!(...))` 一次疏忽就够）就会原样落盘，而这条曾是
+    /// 全项目唯一绕过脱敏的落盘路径。
     pub fn write_crash_report(report: &str) -> io::Result<PathBuf> {
-        let dir = Self::crash_dir();
-        fs::create_dir_all(&dir)?;
-        let _ = retain_files(&dir, CRASH_FILE_LIMIT.saturating_sub(1), u64::MAX, None);
+        Self::write_crash_report_in(&Self::crash_dir(), report)
+    }
+
+    /// 目录可注入，测试才能验证「落盘的那份确实已脱敏」而不是往用户
+    /// 真实的 %APPDATA% 里写东西。
+    pub(crate) fn write_crash_report_in(dir: &Path, report: &str) -> io::Result<PathBuf> {
+        let report = redact_diagnostic_text(report);
+        let report = report.as_str();
+        fs::create_dir_all(dir)?;
+        let _ = retain_files(
+            dir,
+            CRASH_FILE_LIMIT.saturating_sub(1),
+            u64::MAX,
+            Some(CRASH_MAX_AGE_SECS),
+        );
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -378,7 +402,7 @@ impl AppConfig {
             seq
         ));
         fs::write(&path, report)?;
-        let _ = Self::retain_crash_reports();
+        let _ = retain_files(dir, CRASH_FILE_LIMIT, u64::MAX, Some(CRASH_MAX_AGE_SECS));
         Ok(path)
     }
 }
@@ -432,19 +456,41 @@ pub fn retain_files(
     Ok(())
 }
 
+// 脱敏正则全部 LazyLock 缓存：脱敏现在跑在日志写入端（每条日志一次），
+// 每次调用重新编译三个正则的开销落在 worker 热路径上。
+static RE_REDACT_HEADER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    // 折行的 header 续行（以空白开头）也要一并抹掉，否则
+    // "Set-Cookie:\n\tJSESSIONID=…" 只抹掉了首行。
+    regex::Regex::new(r"(?im)^(cookie|set-cookie|authorization)\s*:\s*.*(?:\r?\n[ \t]+.*)*$")
+        .expect("header redaction regex")
+});
+static RE_REDACT_KEY_VALUE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\b(password|passwd|pwd|token|jsessionid|session(?:id)?)(\s*[:=]\s*)([^\s,;]+)",
+    )
+    .expect("redaction regex")
+});
+static RE_REDACT_QUERY: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)([?&](?:password|passwd|pwd|token|jsessionid|session(?:id)?)=)[^&#\s]+")
+        .expect("query redaction regex")
+});
+/// 一行里出现多对 `名=值`（典型的 Cookie 行 `a=1; JSESSIONID=x; b=2`）时，
+/// 上面的 key_value 正则会逐对命中，但一行只写了一个 header 前缀的情况
+/// 靠这条兜底：把 `; ` 分隔的敏感对逐个抹掉。
+static RE_REDACT_COOKIE_PAIR: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(jsessionid|sessionid|session|token|auth)=([^;&\s]+)")
+        .expect("cookie pair redaction regex")
+});
+
 /// Logs and diagnostic notes can contain server text. Strip the common credential and session
 /// forms before any export; raw pages are handled by a separate explicit confirmation.
 pub fn redact_diagnostic_text(text: &str) -> String {
-    let header = regex::Regex::new(r"(?im)^(cookie|set-cookie|authorization)\s*:\s*.*$")
-        .expect("header redaction regex");
-    let key_value =
-        regex::Regex::new(r"(?i)(password|passwd|token|session(?:id)?)(\s*[:=]\s*)([^\s,;]+)")
-            .expect("redaction regex");
-    let query = regex::Regex::new(r"(?i)([?&](?:password|passwd|token|session(?:id)?)=)[^&#\s]+")
-        .expect("query redaction regex");
-    let text = header.replace_all(text, "$1: [已隐藏]");
-    let text = key_value.replace_all(&text, "$1$2[已隐藏]");
-    query.replace_all(&text, "${1}[已隐藏]").into_owned()
+    let text = RE_REDACT_HEADER.replace_all(text, "$1: [已隐藏]");
+    let text = RE_REDACT_KEY_VALUE.replace_all(&text, "$1$2[已隐藏]");
+    let text = RE_REDACT_QUERY.replace_all(&text, "${1}[已隐藏]");
+    RE_REDACT_COOKIE_PAIR
+        .replace_all(&text, "$1=[已隐藏]")
+        .into_owned()
 }
 
 /// Sanitises a raw debug response before it can be added to an explicitly requested
@@ -467,17 +513,44 @@ pub fn redact_diagnostic_page(name: &str, content: &str) -> Option<String> {
     }
 
     let text = redact_diagnostic_text(content);
-    let embedded_secret = regex::Regex::new(
+    let text = RE_REDACT_EMBEDDED.replace_all(&text, "$1$2[已隐藏]");
+    let text = RE_REDACT_HTML_VALUE.replace_all(&text, "$1[已隐藏]$3");
+    // value 写在 name 之前的 input，以及 CSRF/隐藏令牌字段，上面两条都盖不到。
+    let text = RE_REDACT_HTML_VALUE_FIRST.replace_all(&text, "$1[已隐藏]$3");
+    Some(
+        RE_REDACT_HIDDEN_TOKEN
+            .replace_all(&text, "$1[已隐藏]$3")
+            .into_owned(),
+    )
+}
+
+static RE_REDACT_EMBEDDED: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
         r#"(?i)(password|passwd|token|session(?:id)?|jsessionid|authorization|cookie)(\s*[\"']?\s*[:=]\s*[\"']?)([^\"'&<>\s,;]+)"#,
     )
-    .expect("embedded diagnostic secret regex");
-    let html_value = regex::Regex::new(
+    .expect("embedded diagnostic secret regex")
+});
+static RE_REDACT_HTML_VALUE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
         r#"(?i)(<(?:input|meta)\b[^>]*(?:name|id)\s*=\s*[\"']?(?:password|passwd|token|session(?:id)?|jsessionid)[\"']?[^>]*\bvalue\s*=\s*[\"'])([^\"']*)([\"'])"#,
     )
-    .expect("HTML diagnostic secret regex");
-    let text = embedded_secret.replace_all(&text, "$1$2[已隐藏]");
-    Some(html_value.replace_all(&text, "$1[已隐藏]$3").into_owned())
-}
+    .expect("HTML diagnostic secret regex")
+});
+/// `<input value="secret" name="password">`：value 在 name 之前。
+static RE_REDACT_HTML_VALUE_FIRST: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)(<(?:input|meta)\b[^>]*\bvalue\s*=\s*[\"'])([^\"']*)([\"'][^>]*(?:name|id)\s*=\s*[\"']?(?:password|passwd|token|session(?:id)?|jsessionid))"#,
+    )
+    .expect("HTML value-first secret regex")
+});
+/// 隐藏的 CSRF / 一次性令牌字段：名字五花八门，凡 hidden 且名字里带
+/// csrf/token/nonce/state/ticket 的一律抹掉值。
+static RE_REDACT_HIDDEN_TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)(<input\b[^>]*(?:name|id)\s*=\s*[\"']?[a-z0-9_\-]*(?:csrf|xsrf|token|nonce|state|ticket|salt)[a-z0-9_\-]*[\"']?[^>]*\bvalue\s*=\s*[\"'])([^\"']*)([\"'])"#,
+    )
+    .expect("hidden token redaction regex")
+});
 
 pub fn redact_diagnostic_url(raw: &str) -> String {
     let Ok(mut url) = Url::parse(raw) else {
@@ -1022,6 +1095,48 @@ https://example.edu/eams?sessionId=abc&course=1";
 
         let url = redact_diagnostic_url("https://user:secret@example.edu/eams?a=1#detail");
         assert_eq!(url, "https://example.edu/eams");
+    }
+
+    // S-02：崩溃报告曾是全项目唯一绕过脱敏的落盘路径。panic payload 只要
+    // 经手过服务器文本（一次 .expect(&format!(...)) 疏忽就够）就会原样落盘。
+    #[test]
+    fn crash_reports_are_redacted_before_they_hit_the_disk() {
+        let dir = std::env::temp_dir().join(format!("cs-crash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let report = "panicked at 'server said Set-Cookie: JSESSIONID=abc123'\n\
+                      context: password=hunter2 token=tk_live_1\n\
+                      url: https://x.edu/eams/a?sessionid=zzz";
+        let path = AppConfig::write_crash_report_in(&dir, report).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        for secret in ["abc123", "hunter2", "tk_live_1", "zzz"] {
+            assert!(!written.contains(secret), "crash report leaked {secret}");
+        }
+        // 报告主体（定位信息）必须保留，否则脱敏等于把排障价值也删了。
+        assert!(written.contains("panicked at"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 折行 header、一行多对 cookie、value 在 name 之前的 input、隐藏 CSRF
+    // 字段——这些都是原正则盖不到的形状。
+    #[test]
+    fn redaction_covers_folded_headers_multi_pair_cookies_and_hidden_tokens() {
+        let folded = "Set-Cookie: JSESSIONID=abc123;\n\tPath=/; HttpOnly\nNext-Header: ok";
+        let out = redact_diagnostic_text(folded);
+        assert!(!out.contains("abc123"), "folded header leaked: {out}");
+        assert!(out.contains("Next-Header: ok"), "over-redacted: {out}");
+
+        let multi = "cookie line: a=1; JSESSIONID=deadbeef; theme=dark";
+        let out = redact_diagnostic_text(multi);
+        assert!(!out.contains("deadbeef"), "multi-pair cookie leaked: {out}");
+        assert!(out.contains("theme=dark"), "over-redacted: {out}");
+
+        let value_first = r#"<input value="s3cret" name="password">"#;
+        let out = redact_diagnostic_page("p.html", value_first).unwrap();
+        assert!(!out.contains("s3cret"), "value-before-name leaked: {out}");
+
+        let csrf = r#"<input type="hidden" name="csrfToken" value="ct_9f8e7d">"#;
+        let out = redact_diagnostic_page("p.html", csrf).unwrap();
+        assert!(!out.contains("ct_9f8e7d"), "hidden CSRF leaked: {out}");
     }
 
     #[test]

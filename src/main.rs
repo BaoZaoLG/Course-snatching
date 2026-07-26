@@ -30,6 +30,7 @@ fn install_panic_report() {
             std::backtrace::Backtrace::force_capture()
         );
         // Never let a failed diagnostics write mask or re-panic over the original failure.
+        // 脱敏在 write_crash_report 内部统一做，避免出现第二条未脱敏的落盘口。
         let _ = AppConfig::write_crash_report(&report);
         default_hook(info);
     }));

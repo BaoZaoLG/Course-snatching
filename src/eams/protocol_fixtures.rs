@@ -221,10 +221,22 @@ fn every_fixture_prefix_is_panic_free() {
                 continue;
             }
             let prefix = &source[..end];
+            // 覆盖面必须包含每一个「输入来自远端、签名是 &str -> _」的解析
+            // 入口。原来只测三个，parse_lessons_json 的切片 panic 恰好漏在
+            // 覆盖面之外。
             let result = std::panic::catch_unwind(|| {
                 let _ = parse_lessons_from_page(prefix);
                 let _ = parse_lessons_js_like(prefix);
                 let _ = body_looks_like_login_page(prefix);
+                let _ = super::parse::parse_lessons_json(prefix);
+                let _ = super::parse::classify_elect_response(prefix);
+                let _ = super::parse::js_like_to_json(prefix);
+                let _ = super::parse::summarize_html(prefix);
+                let _ = super::parse::extract_password_salt(prefix);
+                let _ = super::parse::extract_login_error(prefix);
+                let _ = super::parse::extract_all_profile_ids(prefix);
+                let _ = super::parse::parse_lessons_by_regex(prefix);
+                let _ = super::parse::parse_lessons_from_html_table(prefix);
             });
             assert!(
                 result.is_ok(),

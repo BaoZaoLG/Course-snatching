@@ -28,6 +28,23 @@ fn is_capacity_full_text(text: &str) -> bool {
         .any(|marker| text.contains(marker))
 }
 
+/// 终态拒绝：学分/门数上限这类改不了的条件，重试只是白打请求。
+/// 必须先于容量与瞬态判定，否则「学分已满」会被当成可重试。
+fn is_hard_reject_text(text: &str) -> bool {
+    ["学分已满", "门数已满", "不允许再选"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// 明确的成功标记。必须先于瞬态繁忙词表：「操作成功，请稍后在已选课程中
+/// 查看」这类常见文案含「稍后」，先判繁忙会把成功当成可重试，目标留在
+/// pending 里重复提交。
+fn has_strong_success_text(text: &str) -> bool {
+    ["已经选过", "已选过", "选课成功", "操作成功"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
 /// 服务器瞬态繁忙文案：高峰期以 HTTP 200 正文出现（“系统繁忙，请稍后再试”等），
 /// 命中即视为可重试，避免开抢时刻被终态放弃。词表与 worker 对 Err 路径的
 /// 限流兜底识别（限流/过快/太快/频繁/稍后）保持一致并补充繁忙类说法。
@@ -46,6 +63,41 @@ fn is_transient_busy_text(text: &str) -> bool {
     .any(|marker| text.contains(marker))
 }
 
+/// 选课结果的判定范围。
+///
+/// 直接在整页上做子串匹配会被无关内容带偏：页脚一句「请勿频繁刷新」能让
+/// 每次提交都变成 Busy，页面上列出的其它满员课程会误触容量判定。所以先抠
+/// 服务器的结果容器（`extract_login_error` 已经是这个写法），抠不到才退回
+/// 整页摘要。
+fn extract_result_scope(html: &str) -> Option<String> {
+    // 结果容器里有「稍后」这种词才算真的在讲本次提交结果。
+    let doc = Html::parse_document(html);
+    for sel in [
+        "#actionMessage",
+        ".actionMessage",
+        ".actionError",
+        "#msgboxDiv",
+        ".alert",
+        ".error",
+    ] {
+        let Ok(selector) = Selector::parse(sel) else {
+            continue;
+        };
+        if let Some(node) = doc.select(&selector).next() {
+            let text = node
+                .text()
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn classify_elect_response(text: &str) -> ElectResult {
     let summary = summarize_html(text);
     if let Ok(value) = serde_json::from_str::<Value>(text) {
@@ -55,6 +107,9 @@ pub(crate) fn classify_elect_response(text: &str) -> ElectResult {
             return ElectResult::Success { detail };
         }
         if value.get("success").and_then(Value::as_bool) == Some(false) {
+            if is_hard_reject_text(&detail) {
+                return ElectResult::Failed { detail };
+            }
             if is_capacity_full_text(&detail) {
                 return ElectResult::Full { detail };
             }
@@ -65,25 +120,35 @@ pub(crate) fn classify_elect_response(text: &str) -> ElectResult {
         }
     }
 
-    if is_capacity_full_text(text) {
-        return ElectResult::Full { detail: summary };
+    // 判定只看结果容器；抠不到才退回整页摘要。
+    let scope = extract_result_scope(text).unwrap_or_else(|| summary.clone());
+    let detail = if scope.is_empty() {
+        summary.clone()
+    } else {
+        scope.clone()
+    };
+
+    // 强成功标记最优先——含「稍后」的成功文案不能被判成 Busy。
+    if has_strong_success_text(&scope) {
+        return ElectResult::Success { detail };
     }
-    if text.contains("已经选过") || text.contains("已选过") {
-        return ElectResult::Success { detail: summary };
+    // 终态拒绝先于容量：「学分已满」不是可重试的「人数已满」。
+    if is_hard_reject_text(&scope) {
+        return ElectResult::Failed { detail };
+    }
+    if is_capacity_full_text(&scope) {
+        return ElectResult::Full { detail };
     }
     // 瞬态繁忙先于普通失败标记：“操作未成功，请稍后重试”这类明确邀请重试的
     // 文案宁可多试一轮，也不要在开抢高峰被终态放弃。
-    if is_transient_busy_text(text) {
-        return ElectResult::Busy { detail: summary };
+    if is_transient_busy_text(&scope) {
+        return ElectResult::Busy { detail };
     }
     if ["失败", "未成功", "冲突", "不允许", "错误", "不可选"]
         .iter()
-        .any(|marker| text.contains(marker))
+        .any(|marker| scope.contains(marker))
     {
-        return ElectResult::Failed { detail: summary };
-    }
-    if text.contains("选课成功") || text.contains("操作成功") {
-        return ElectResult::Success { detail: summary };
+        return ElectResult::Failed { detail };
     }
     ElectResult::Failed {
         detail: if summary.is_empty() {
@@ -417,10 +482,30 @@ pub(crate) fn extract_profiles_detailed(text: &str) -> Vec<(String, String)> {
     out
 }
 
+/// 原始调试页面落盘。
+///
+/// 落盘即脱敏，而不是只在导出时脱敏：会话 Cookie 在有效期内等于账号，
+/// 把最危险的一份留在 %APPDATA% 里、把最安全的一份交出去，顺序是反的。
+/// 导出侧的 `redact_diagnostic_page` 保留为二次防线。
 pub(crate) fn save_debug_text(name: &str, content: &str) -> Result<()> {
     let dir = AppConfig::debug_dir();
-    std::fs::create_dir_all(&dir)?;
+    save_debug_text_in(&dir, name, content)?;
     let _ = AppConfig::retain_debug_files();
+    Ok(())
+}
+
+/// 目录可注入，测试才能验证「落盘的那份确实已脱敏」而不是往用户
+/// 真实的 %APPDATA% 里写东西。
+pub(crate) fn save_debug_text_in(
+    dir: &std::path::Path,
+    name: &str,
+    content: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    // 含选课提交表单的页面整份丢弃，与导出侧语义一致。
+    let Some(content) = crate::config::redact_diagnostic_page(name, content) else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(dir)?;
     let safe_name = name
         .chars()
         .map(|ch| {
@@ -431,9 +516,9 @@ pub(crate) fn save_debug_text(name: &str, content: &str) -> Result<()> {
             }
         })
         .collect::<String>();
-    std::fs::write(dir.join(safe_name), content)?;
-    let _ = AppConfig::retain_debug_files();
-    Ok(())
+    let path = dir.join(safe_name);
+    std::fs::write(&path, content.as_bytes())?;
+    Ok(Some(path))
 }
 
 pub(crate) fn extract_all_profile_ids(text: &str) -> Vec<String> {
@@ -672,6 +757,13 @@ pub(crate) fn parse_lessons_json(text: &str) -> Result<Vec<Lesson>> {
         Err(_) => {
             let start = text.find('[').ok_or_else(|| anyhow!("not json"))?;
             let end = text.rfind(']').ok_or_else(|| anyhow!("not json"))?;
+            // start > end（WAF 拦截页、乱序截断的壳页，如 "参数非法]…x = ["）时
+            // &text[start..=end] 直接 panic。这条路径是可达的：调用方在前两级
+            // 解析失败后把服务器原始响应喂进来，而 panic 发生在 spawn_task 里且
+            // JoinHandle 被 drop——抢课任务会在冲刺中途无声死掉。
+            if start >= end {
+                bail!("not json: unbalanced brackets");
+            }
             serde_json::from_str(&text[start..=end]).context("json array parse failed")?
         }
     };
@@ -912,5 +1004,106 @@ pub(crate) fn summarize_html(text: &str) -> String {
         format!("{t}…")
     } else {
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // C-01：所有 ']' 都出现在第一个 '[' 之前时，&text[start..=end] 会 panic。
+    // 这条路径是可达的（WAF 拦截页、乱序截断的壳页），而 panic 在 spawn_task
+    // 里被吞掉——抢课任务会在冲刺中途无声死掉。必须是 Err，不是 panic。
+    #[test]
+    fn unbalanced_brackets_are_an_error_not_a_panic() {
+        for text in [
+            "参数非法]<script>var x = [",
+            "]",
+            "][",
+            "] 请求被拦截 [",
+            "}] 网关错误 [{",
+        ] {
+            let result = std::panic::catch_unwind(|| parse_lessons_json(text));
+            assert!(result.is_ok(), "parse_lessons_json panicked on {text:?}");
+            assert!(
+                result.unwrap().is_err(),
+                "unbalanced {text:?} must be a parse error"
+            );
+        }
+        // 正常的数组仍然要解析成功。
+        assert!(parse_lessons_json(
+            r#"[{"id":"371644","no":"CS.1","name":"x","teachers":"t","stdCount":1,"limitCount":2}]"#
+        )
+        .is_ok());
+    }
+
+    // C-06：判定必须先抠结果容器，且强成功标记优先于瞬态繁忙词表。
+    #[test]
+    fn success_message_containing_later_is_not_downgraded_to_busy() {
+        // 「操作成功，请稍后在已选课程中查看」含「稍后」。先判繁忙就会把
+        // 成功当成可重试，目标留在 pending 里被反复重复提交。
+        let html = r#"<html><body><div class="actionMessage">操作成功，请稍后在已选课程中查看</div></body></html>"#;
+        assert!(matches!(
+            classify_elect_response(html),
+            ElectResult::Success { .. }
+        ));
+    }
+
+    #[test]
+    fn page_footer_and_unrelated_full_courses_do_not_hijack_the_verdict() {
+        // 页脚一句「请勿频繁刷新」曾能让每次提交都变成 Busy。
+        let html = r#"<html><body>
+            <div class="actionMessage">选课成功</div>
+            <table><tr><td>其他课程 人数已满</td></tr></table>
+            <div class="footer">请勿频繁刷新本页面</div>
+        </body></html>"#;
+        assert!(
+            matches!(classify_elect_response(html), ElectResult::Success { .. }),
+            "result container must win over footer and unrelated rows"
+        );
+    }
+
+    #[test]
+    fn credit_cap_rejection_stays_terminal_while_seat_full_stays_retryable() {
+        let credit = r#"<div class="actionError">学分已满，不允许再选</div>"#;
+        assert!(matches!(
+            classify_elect_response(credit),
+            ElectResult::Failed { .. }
+        ));
+        let seats = r#"<div class="actionError">人数已满</div>"#;
+        assert!(matches!(
+            classify_elect_response(seats),
+            ElectResult::Full { .. }
+        ));
+        let busy = r#"<div class="actionError">系统繁忙，请稍后再试</div>"#;
+        assert!(matches!(
+            classify_elect_response(busy),
+            ElectResult::Busy { .. }
+        ));
+    }
+
+    // S-01：调试页落盘时就必须脱敏。会话 Cookie 在有效期内等于账号，
+    // 而 %APPDATA%\debug 最长驻留 7 天。
+    #[test]
+    fn debug_pages_are_redacted_before_they_hit_the_disk() {
+        let dir = std::env::temp_dir().join(format!("cs-debug-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let page = "Set-Cookie: JSESSIONID=abc123\n<input name=\"password\" value=\"hunter2\">";
+        let path = save_debug_text_in(&dir, "login.html", page)
+            .unwrap()
+            .expect("normal page must be written");
+        let written = std::fs::read_to_string(&path).unwrap();
+        for secret in ["abc123", "hunter2"] {
+            assert!(!written.contains(secret), "debug dump leaked {secret}");
+        }
+        assert!(written.contains("[已隐藏]"));
+
+        // 含提交表单的页面整份不落盘。
+        let submission =
+            save_debug_text_in(&dir, "submit.html", "optype=true&operator0=371644:true:0").unwrap();
+        assert!(submission.is_none(), "submission form must not be written");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

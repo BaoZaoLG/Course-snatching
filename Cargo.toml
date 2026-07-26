@@ -63,6 +63,9 @@ winresource = "0.1"
 
 [profile.release]
 codegen-units = 1
-strip = true
+# strip = true 会把符号全剥掉，panic hook 里的 Backtrace::force_capture()
+# 只剩裸地址——排障价值接近零，却仍然暴露模块布局。只剥调试信息，保留
+# 函数符号，崩溃报告才是可读的。
+strip = "debuginfo"
 opt-level = 3
 lto = "thin"

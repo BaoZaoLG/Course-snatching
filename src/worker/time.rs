@@ -9,6 +9,16 @@ pub fn local_now_seconds() -> i64 {
         + 8 * 3600
 }
 
+/// 东八区本地毫秒。定时触发偏差必须用毫秒精度衡量——整秒精度下
+/// 「偏差约 N ms」只可能打出 0 或上限值，反而掩盖真实抖动。
+pub fn local_now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+        + 8 * 3600 * 1000
+}
+
 pub(crate) fn local_seconds() -> i64 {
     local_now_seconds()
 }
