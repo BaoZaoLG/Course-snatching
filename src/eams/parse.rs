@@ -259,17 +259,157 @@ pub(crate) async fn read_body_limited(
     Ok(buf)
 }
 
+/// 从 `Content-Type` 头里取字符集标签。
+fn charset_from_content_type(content_type: Option<&str>) -> Option<&'static encoding_rs::Encoding> {
+    let value = content_type?.to_ascii_lowercase();
+    let idx = value.find("charset=")?;
+    let label = value[idx + "charset=".len()..]
+        .split(&[';', ' ', '"', '\''][..])
+        .next()?
+        .trim();
+    encoding_rs::Encoding::for_label(label.as_bytes())
+}
+
+/// 从 HTML 头部的 `<meta charset>` / `<meta http-equiv>` 里取字符集。
+/// 只扫前 2KB：声明必须出现在文档开头，扫全文既慢又容易被正文误导。
+fn charset_from_meta(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    static RE_META_CHARSET: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_\-]+)"#)
+            .expect("meta charset regex")
+    });
+    let head = &bytes[..bytes.len().min(2048)];
+    // 字符集声明本身一定是 ASCII，lossy 足够。
+    let head = String::from_utf8_lossy(head);
+    let label = RE_META_CHARSET.captures(&head)?.get(1)?.as_str();
+    encoding_rs::Encoding::for_label(label.as_bytes())
+}
+
+fn replacement_ratio(text: &str) -> f32 {
+    let total = text.chars().count();
+    if total == 0 {
+        return 0.0;
+    }
+    let bad = text
+        .chars()
+        .filter(|ch| *ch == char::REPLACEMENT_CHARACTER)
+        .count();
+    bad as f32 / total as f32
+}
+
+/// 允许的替换字符比例。个别坏字节不该让整个响应作废，但成片乱码必须报错。
+const MAX_REPLACEMENT_RATIO: f32 = 0.02;
+
+/// 按 `Content-Type` → `<meta charset>` → UTF-8 → GB18030 的顺序解码响应体。
+///
+/// 原实现是 `String::from_utf8_lossy`：GB2312/GBK 站点整页变成 U+FFFD，而它
+/// 之上全部是中文子串判定（人数已满 / 系统繁忙 / 限流词表 / 登录错误），
+/// 会整体静默失效——选课成功被判成 Failed 并终态放弃。
+/// 关键在于解码失败要显式报错，静默的乱码比明确的失败危险得多。
+pub(crate) fn decode_body(content_type: Option<&str>, bytes: &[u8]) -> Result<String> {
+    // decode() 自带 BOM 嗅探，BOM 会覆盖这里选定的编码。
+    if let Some(encoding) =
+        charset_from_content_type(content_type).or_else(|| charset_from_meta(bytes))
+    {
+        let (text, _, had_errors) = encoding.decode(bytes);
+        if !had_errors || replacement_ratio(&text) <= MAX_REPLACEMENT_RATIO {
+            return Ok(text.into_owned());
+        }
+        return Err(EamsError::Parse {
+            message: format!("响应按 {} 解码失败（大量乱码）", encoding.name()),
+        }
+        .into());
+    }
+
+    // 没有任何声明：先按 UTF-8 试，明显不像 UTF-8 时再试 GB18030
+    // （中文高校站点唯一现实的另一种可能），两者都不成才报错。
+    let (utf8_text, _, utf8_errors) = encoding_rs::UTF_8.decode(bytes);
+    if !utf8_errors || replacement_ratio(&utf8_text) <= MAX_REPLACEMENT_RATIO {
+        return Ok(utf8_text.into_owned());
+    }
+    let (gbk_text, _, gbk_errors) = encoding_rs::GB18030.decode(bytes);
+    if !gbk_errors || replacement_ratio(&gbk_text) < replacement_ratio(&utf8_text) {
+        return Ok(gbk_text.into_owned());
+    }
+    Err(EamsError::Parse {
+        message: "响应解码失败：既不是 UTF-8 也不是 GB18030，且未声明字符集".into(),
+    }
+    .into())
+}
+
 pub(crate) fn looks_like_login_page(url: &Url, text: &str) -> bool {
     body_looks_like_login_page(text)
         || (url.as_str().to_ascii_lowercase().contains("login") && text.trim().is_empty())
 }
 
+/// 页面是否是登录页。
+///
+/// 判据分两级：便宜的子串预筛（绝大多数响应在这里就被排除，不必为每个响应
+/// 付 HTML 解析的代价）+ 结构确认。只做子串匹配的话，选课页导航栏里一个
+/// 「修改密码」表单、或打包进页面的 JS bundle 含这几个 token 就会命中，而
+/// 系统性误报会稳定地自我确认两次，直接终止抢课。
 pub(crate) fn body_looks_like_login_page(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    text.contains("loginform")
-        || text.contains("name=\"password\"")
-        || text.contains("id=\"password\"")
-        || (text.contains("username") && text.contains("password") && text.contains("login"))
+    let lowered = text.to_ascii_lowercase();
+    let cheap_hit = lowered.contains("loginform")
+        || lowered.contains("name=\"password\"")
+        || lowered.contains("id=\"password\"")
+        || lowered.contains("type=\"password\"")
+        || (lowered.contains("username")
+            && lowered.contains("password")
+            && lowered.contains("login"));
+    if !cheap_hit {
+        return false;
+    }
+    structural_login_page(text)
+}
+
+/// `action`/`id` 指向登录端点。
+fn is_login_endpoint(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    ["login", "cas", "authserver", "sso", "signin", "idp"]
+        .iter()
+        .any(|marker| value.contains(marker))
+}
+
+/// 页面里有真正的选课目录结构。
+///
+/// 只认结构性标记，不认泛泛的「选课」二字——登录页横幅上也可能写着选课，
+/// 用它做否定判据会漏掉真实的会话过期，那是更危险的方向。
+fn page_has_elect_catalog(text: &str) -> bool {
+    [
+        "electableLesson",
+        "lessonListOperator",
+        "stdElectCourse",
+        "lessonJSONs",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+fn structural_login_page(html: &str) -> bool {
+    static FORM_SEL: LazyLock<Option<Selector>> = LazyLock::new(|| Selector::parse("form").ok());
+    static PASSWORD_SEL: LazyLock<Option<Selector>> =
+        LazyLock::new(|| Selector::parse("input[type=password]").ok());
+    let doc = Html::parse_document(html);
+    // 一等判据：存在 form 且它指向登录端点。
+    if let Some(selector) = FORM_SEL.as_ref() {
+        let has_login_form = doc.select(selector).any(|node| {
+            let value = node.value();
+            value.attr("action").is_some_and(is_login_endpoint)
+                || value.attr("id").is_some_and(is_login_endpoint)
+                || value.attr("name").is_some_and(is_login_endpoint)
+        });
+        if has_login_form {
+            return true;
+        }
+    }
+    // 二等判据：有密码输入框，且页面里没有选课目录结构。
+    // 「修改密码」表单出现在选课页上时会被这一条挡住。
+    if let Some(selector) = PASSWORD_SEL.as_ref() {
+        if doc.select(selector).next().is_some() && !page_has_elect_catalog(html) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn extract_login_error(html: &str) -> Option<String> {
@@ -1082,6 +1222,72 @@ mod tests {
         ));
     }
 
+    // C-02：GBK 站点整页变 U+FFFD 后，其上所有中文子串判定都会静默失效——
+    // 「人数已满」认不出、选课成功被判成 Failed 并终态放弃。
+    #[test]
+    fn gbk_bodies_decode_by_header_meta_and_sniffing() {
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode("人数已满，请稍后再试");
+
+        // 1) Content-Type 声明
+        let text = decode_body(Some("text/html; charset=GBK"), &gbk_bytes).unwrap();
+        assert!(text.contains("人数已满"), "header charset ignored: {text}");
+
+        // 2) <meta charset>
+        let mut with_meta = b"<html><head><meta charset=\"gb2312\"></head><body>".to_vec();
+        with_meta.extend_from_slice(&gbk_bytes);
+        with_meta.extend_from_slice(b"</body></html>");
+        let text = decode_body(Some("text/html"), &with_meta).unwrap();
+        assert!(text.contains("人数已满"), "meta charset ignored: {text}");
+
+        // 3) 什么都没声明：UTF-8 解不动时回退 GB18030
+        let text = decode_body(None, &gbk_bytes).unwrap();
+        assert!(text.contains("人数已满"), "sniffing failed: {text}");
+
+        // 4) UTF-8 正常路径不受影响
+        let text = decode_body(Some("text/html; charset=utf-8"), "选课成功".as_bytes()).unwrap();
+        assert_eq!(text, "选课成功");
+
+        // 5) 声明了字符集却整片解不动：必须显式报错，不能继续喂乱码给判定层
+        let broken = vec![0xff_u8; 64];
+        assert!(
+            decode_body(Some("text/html; charset=utf-8"), &broken).is_err(),
+            "silent mojibake is worse than an explicit failure"
+        );
+    }
+
+    // C-07：选课页导航栏里的「修改密码」表单不能被当成登录页。
+    // 系统性误报会稳定地自我确认两次，直接 clear_session 终止抢课。
+    #[test]
+    fn change_password_form_on_an_elect_page_is_not_a_login_page() {
+        let elect_page = r#"<html><body>
+            <div id="nav"><form action="/eams/security/my.action">
+                <input type="password" name="password"><input type="password" name="password2">
+            </form></div>
+            <script>var lessonJSONs=[{id:371644,no:'CS.1'}];</script>
+            <div id="electableLessonList">课程列表</div>
+        </body></html>"#;
+        assert!(
+            !body_looks_like_login_page(elect_page),
+            "change-password form must not read as a login page"
+        );
+
+        // 真正的登录页仍然要认出来——漏判是更危险的方向。
+        for page in [
+            r#"<form id="loginForm"><input name="password"></form>"#,
+            r#"<html><body><form action="/eams/loginExt.action" method="post">
+                 <input name="username"><input type="password" name="password">
+               </form></body></html>"#,
+            r#"<html><body><form action="https://cas.example.edu/login">
+                 <input type="password" name="password">
+               </form></body></html>"#,
+        ] {
+            assert!(
+                body_looks_like_login_page(page),
+                "missed a real login page: {page}"
+            );
+        }
+    }
+
     // S-01：调试页落盘时就必须脱敏。会话 Cookie 在有效期内等于账号，
     // 而 %APPDATA%\debug 最长驻留 7 天。
     #[test]
@@ -1105,5 +1311,17 @@ mod tests {
         assert!(submission.is_none(), "submission form must not be written");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tmp_debug {
+    #[test]
+    fn tmp_login_fixture() {
+        let page = r#"<form id="loginForm"><input name="password"></form>"#;
+        assert!(
+            super::body_looks_like_login_page(page),
+            "fixture not detected"
+        );
     }
 }

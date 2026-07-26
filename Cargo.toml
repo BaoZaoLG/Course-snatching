@@ -31,6 +31,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 eframe = { version = "0.35", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+# 教务站点仍大量使用 GB2312/GBK/GB18030。缺了它整页会变成 U+FFFD，
+# 而其上所有判定都是中文子串匹配，会整体静默失效。
+encoding_rs = "0.8"
 hex = "0.4"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["cookies", "form", "rustls", "gzip", "stream"] }

@@ -1,15 +1,17 @@
 //! Shared HTTP transport, session cookie handling, and request governance.
 
 use super::parse::{
-    extract_login_error, looks_like_login_page, normalize_base, origin_key, parse_retry_after_secs,
-    read_body_limited, summarize_html,
+    decode_body, extract_login_error, looks_like_login_page, normalize_base, origin_key,
+    parse_retry_after_secs, read_body_limited, summarize_html,
 };
-use super::types::classify_reqwest_error;
+use super::types::{
+    classify_reqwest_error, looks_like_sso_endpoint, sso_redirect_target, SsoRedirectBlocked,
+};
 use super::{
     backend_error_kind, rate_limit_retry_after, BackendErrorKind, EamsClient, EamsError,
     ProfileContext, RequestGovernor, RequestPriority, ResponseHandling, MAX_RESPONSE_BYTES, UA,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::redirect::Policy;
@@ -41,6 +43,15 @@ impl EamsClient {
                 }
                 if origin_key(attempt.url()) == allowed_origin {
                     attempt.follow()
+                } else if let Some(target) =
+                    looks_like_sso_endpoint(attempt.url()).then(|| attempt.url().to_string())
+                {
+                    // 拦截策略本身是对的（cookie 不能跟着跑到第三方），但错误
+                    // 映射不能把它当成普通网络故障：国内高校 EAMS 前面基本都挂
+                    // CAS/统一身份认证，会话过期时返回的正是跳到另一 origin 的
+                    // SSO 登录页。归成 Transport 的话，登录失效检测在最常见的
+                    // 部署形态下整体失效——用户只会看到无限「网络异常重试中」。
+                    attempt.error(SsoRedirectBlocked(target))
                 } else {
                     attempt.error("blocked cross-origin redirect")
                 }
@@ -80,6 +91,10 @@ impl EamsClient {
         let permit = self.governor.acquire(priority).await;
         let result = async {
             let response = request.send().await.map_err(|error| {
+                // 被拦下的 SSO 跳转 = 会话过期，必须走登录失效分支而不是网络重试。
+                if sso_redirect_target(&error).is_some() {
+                    return EamsError::AuthExpired;
+                }
                 let (kind, cause) = classify_reqwest_error(&error);
                 EamsError::Network {
                     kind,
@@ -90,6 +105,12 @@ impl EamsClient {
             let status = response.status();
             let final_url = response.url().clone();
             let retry_after_secs = parse_retry_after_secs(response.headers());
+            // 响应体被 read_body_limited 消费掉之前先留下字符集声明。
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             if response
                 .content_length()
                 .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
@@ -116,7 +137,8 @@ impl EamsClient {
                         })
                     }
                 })?;
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let text = decode_body(content_type.as_deref(), &bytes)
+                .with_context(|| format!("{action}响应"))?;
             let code = status.as_u16();
             if code == 429 || (code == 503 && retry_after_secs.is_some()) {
                 let summary = summarize_html(&text);

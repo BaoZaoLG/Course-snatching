@@ -145,6 +145,10 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             continue;
                         }
                         state.log(LogLevel::Error, "登录失效，抢课已停止");
+                        // 先终态化看板再 clear_session：后者会立刻把 running 置 false，
+                        // 界面此刻就可能读到状态，不能让「提交中/检查中」的行在
+                        // “已停止”之后还挂着。
+                        mark_pending_stopped(&state, &pending);
                         state.clear_session("登录失效，请重新登录");
                         crate::notify::dispatch_alert(
                             "登录失效",
@@ -547,6 +551,9 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                         if is_auth_error(&error) {
                             if confirm_auth_expired(&state, generation, &client).await {
                                 state.log(LogLevel::Error, "登录失效，抢课已停止");
+                                // 同刷新路径：clear_session 会立刻置 running=false，
+                                // 看板必须在那之前终态化。
+                                mark_pending_stopped(&state, &pending);
                                 state.clear_session("登录失效，请重新登录");
                                 // 与刷新路径一致：提交阶段掉线正是最需要提醒的时刻。
                                 crate::notify::dispatch_alert(

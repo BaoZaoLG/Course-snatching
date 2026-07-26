@@ -137,6 +137,38 @@ pub enum EamsError {
     InsecureBaseUrl,
 }
 
+/// 被重定向策略拦下的跨域跳转，且目标看起来是 SSO 登录端点。
+///
+/// 单独一个类型是为了能在传输层把它下钻回来映射成 `AuthExpired`——
+/// 靠错误文本匹配太脆。
+#[derive(Debug, Error)]
+#[error("会话已过期，服务器要求跳转到统一身份认证：{0}")]
+pub(crate) struct SsoRedirectBlocked(pub String);
+
+/// 目标 URL 看起来是统一身份认证的登录端点。
+pub(crate) fn looks_like_sso_endpoint(url: &reqwest::Url) -> bool {
+    let path = url.path().to_ascii_lowercase();
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    ["/cas", "/authserver", "/sso", "/login", "/idp", "/oauth"]
+        .iter()
+        .any(|marker| path.contains(marker))
+        || ["cas.", "sso.", "authserver.", "id.", "passport."]
+            .iter()
+            .any(|marker| host.starts_with(marker))
+}
+
+/// 错误链里是否有被拦下的 SSO 跳转。
+pub(crate) fn sso_redirect_target(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if let Some(blocked) = err.downcast_ref::<SsoRedirectBlocked>() {
+            return Some(blocked.0.clone());
+        }
+        current = err.source();
+    }
+    None
+}
+
 /// 把 reqwest 的错误分成可诊断的类别，并抽出最深一层根因文本。
 ///
 /// 原实现只用 `is_timeout()` 判一次就把 error 丢掉：DNS 失败、TLS 证书错误、

@@ -783,6 +783,58 @@ mod tests {
         assert_eq!(second[0].no, "ABC.001");
     }
 
+    // C-03：国内高校 EAMS 基本都挂 CAS/统一身份认证，会话过期时返回的是
+    // 302 到另一 origin 的 SSO 登录页。它被同源策略拦下后若归成普通网络
+    // 错误，登录失效检测在最常见的部署形态下整体失效——用户只会看到无限
+    // 「网络异常，N 秒后重试」，退避一路爬到 30s 直到选课结束。
+    #[test]
+    fn blocked_sso_redirect_is_auth_expired_not_a_network_error() {
+        let base = serve_redirects("https://cas.example.edu/authserver/login?service=x");
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let runtime = test_runtime();
+        let error = runtime
+            .block_on(client.fetch_lessons("0"))
+            .expect_err("cross-origin SSO redirect must fail the request");
+        assert!(
+            is_auth_error(&error),
+            "SSO redirect must map to AuthExpired, got {error:#}"
+        );
+        assert_eq!(backend_error_kind(&error), BackendErrorKind::AuthExpired);
+    }
+
+    // 跳到与登录无关的第三方（图床、统计）仍然按普通拦截处理，
+    // 不能反过来把任意跨域跳转都当成会话过期。
+    #[test]
+    fn unrelated_cross_origin_redirect_stays_a_transport_error() {
+        let base = serve_redirects("https://cdn.example.net/assets/logo.png");
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let runtime = test_runtime();
+        let error = runtime
+            .block_on(client.fetch_lessons("0"))
+            .expect_err("cross-origin redirect must fail the request");
+        assert!(!is_auth_error(&error), "must not be treated as auth expiry");
+        assert_eq!(backend_error_kind(&error), BackendErrorKind::Redirect);
+    }
+
+    /// 每个连接都回 302 到指定 Location。
+    fn serve_redirects(location: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{address}/eams/")
+    }
+
     #[test]
     fn validates_base_url_security_and_normalization() {
         assert!(normalize_base("http://example.com").is_err());
