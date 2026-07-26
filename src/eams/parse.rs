@@ -202,11 +202,28 @@ pub(crate) fn normalize_base(raw: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// 宽松的 salt 兜底：不限定 36 位 UUID 形状。
+static RE_SALT_LOOSE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"SHA1\(\s*'([^']{8,64})-'").expect("loose salt regex"));
+
 pub(crate) fn extract_password_salt(html: &str) -> Option<String> {
     RE_SALT_PRIMARY
         .captures(html)
         .map(|c| c[1].to_string())
         .or_else(|| RE_SALT_FALLBACK.captures(html).map(|c| c[1].to_string()))
+        // 两条主正则都写死了 36 位 UUID 形状，换版即硬失败。宽松兜底至少
+        // 能撑过「salt 换了格式但机制没变」这种最常见的小改动。
+        .or_else(|| RE_SALT_LOOSE.captures(html).map(|c| c[1].to_string()))
+}
+
+/// 登录页是否根本没有 salt 机制（而不是「有但格式不认识」）。
+///
+/// 两者的处置完全不同：前者说明这个站点用的是别的登录方式，重试多少次都
+/// 没用；后者是解析层需要跟进的换版。错误提示必须把这两种区分开，否则用户
+/// 只会看到同一句「页面可能已改版」。
+pub(crate) fn login_page_mentions_salt(html: &str) -> bool {
+    let lowered = html.to_ascii_lowercase();
+    lowered.contains("sha1(") || lowered.contains("cryptojs")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +275,76 @@ pub(crate) async fn read_body_limited(
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+/// 登录页上的验证码要素。
+///
+/// 多数 EAMS 在连续失败若干次后强制上验证码，而 `login()` 最多重试 4 次，
+/// 恰好容易把学校推到这个阈值上——一旦触发，工具此前会永久卡死：
+/// `extract_login_error` 早就把「验证码」列为已知错误文案，却没有任何获取
+/// 或提交验证码的路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CaptchaChallenge {
+    /// 验证码图片地址（页面里给的原样值，可能是相对路径）。
+    pub image_src: String,
+    /// 提交时的表单字段名。
+    pub field_name: String,
+}
+
+/// 从登录页里找出验证码图片与输入框。
+///
+/// 只认页面自己给出的地址——绝不猜测端点。找不到就是没有验证码，
+/// 登录流程一如既往。
+pub(crate) fn extract_captcha(html: &str) -> Option<CaptchaChallenge> {
+    const MARKERS: [&str; 8] = [
+        "captcha",
+        "validatecode",
+        "checkcode",
+        "randomcode",
+        "verifycode",
+        "authcode",
+        "kaptcha",
+        "yzm",
+    ];
+    let looks_like_captcha = |value: &str| -> bool {
+        MARKERS
+            .iter()
+            .any(|m| value.to_ascii_lowercase().contains(m))
+    };
+
+    let doc = Html::parse_document(html);
+    let img_selector = Selector::parse("img").ok()?;
+    let image_src = doc.select(&img_selector).find_map(|node| {
+        let value = node.value();
+        let src = value.attr("src")?;
+        let hints = [Some(src), value.attr("id"), value.attr("name")];
+        hints
+            .into_iter()
+            .flatten()
+            .any(looks_like_captcha)
+            .then(|| src.to_string())
+    })?;
+
+    // 字段名同样从页面里取；取不到才退回最常见的那个名字。
+    let input_selector = Selector::parse("input").ok()?;
+    let field_name = doc
+        .select(&input_selector)
+        .find_map(|node| {
+            let value = node.value();
+            let name = value.attr("name")?;
+            let hints = [Some(name), value.attr("id")];
+            hints
+                .into_iter()
+                .flatten()
+                .any(looks_like_captcha)
+                .then(|| name.to_string())
+        })
+        .unwrap_or_else(|| "captcha".to_string());
+
+    Some(CaptchaChallenge {
+        image_src,
+        field_name,
+    })
 }
 
 /// 解析课程目录时命中的策略。
@@ -1197,6 +1284,32 @@ pub(crate) fn summarize_html(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // F-01：验证码要素只从登录页本身取，绝不猜测端点。
+    #[test]
+    fn captcha_is_detected_from_the_login_page_only() {
+        let with_captcha = r#"<html><body><form id="loginForm">
+            <input name="username"><input type="password" name="password">
+            <img id="captchaImg" src="/eams/captcha.action?ts=1">
+            <input name="captchaResponse" id="captcha">
+        </form></body></html>"#;
+        let challenge = extract_captcha(with_captcha).expect("captcha must be detected");
+        assert_eq!(challenge.image_src, "/eams/captcha.action?ts=1");
+        assert_eq!(challenge.field_name, "captchaResponse");
+
+        // 没有验证码的登录页必须返回 None——否则会给每次登录凭空加一步。
+        let plain = r#"<html><body><form id="loginForm">
+            <input name="username"><input type="password" name="password">
+            <img src="/eams/logo.png">
+        </form></body></html>"#;
+        assert!(extract_captcha(plain).is_none());
+
+        // 字段名取不到时退回最常见的名字，但图片地址仍然只认页面给的。
+        let no_field = r#"<img src="/eams/validateCode.action">"#;
+        let challenge = extract_captcha(no_field).unwrap();
+        assert_eq!(challenge.image_src, "/eams/validateCode.action");
+        assert_eq!(challenge.field_name, "captcha");
+    }
 
     // T-05：命中的解析策略是「教务换版」最早的信号——它通常在彻底解析失败的
     // 几天之前就先降级。

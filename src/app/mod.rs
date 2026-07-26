@@ -59,6 +59,20 @@ struct RedactedPages {
     unreadable: usize,
 }
 
+/// 把验证码图片字节解码成 egui 贴图数据。
+///
+/// 只认 PNG——教务的验证码几乎都是 PNG 或 JPEG，而为了 JPEG 引入一个完整的
+/// 图像解码库不划算；解不出来时界面会如实说明并给出替代做法，而不是显示
+/// 一个空白框。
+fn image_from_bytes(bytes: &[u8]) -> Result<egui::ColorImage, String> {
+    let decoded = eframe::icon_data::from_png_bytes(bytes).map_err(|error| error.to_string())?;
+    let size = [decoded.width as usize, decoded.height as usize];
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        &decoded.rgba,
+    ))
+}
+
 /// 监控卡片上「组」输入框的 Id 前缀。
 static GROUP_FIELD_ID: std::sync::LazyLock<egui::Id> =
     std::sync::LazyLock::new(|| egui::Id::new("watch_group_field"));
@@ -224,6 +238,12 @@ pub struct CourseApp {
     toast: Option<(f64, String, bool)>,
     /// 待展示的吐司队列。同一帧里来多条告警时逐条显示，而不是互相覆盖。
     toast_queue: std::collections::VecDeque<(String, bool)>,
+    /// 验证码输入框内容；提交时取走交给 LoginRequest。
+    captcha_input: Option<String>,
+    /// 验证码输入框的实时内容。
+    captcha_text: String,
+    /// 已加载到 egui 的验证码贴图（避免每帧重新解码 PNG）。
+    captcha_texture: Option<(usize, egui::TextureHandle)>,
     confirm_logout: bool,
     confirm_clear_logs: bool,
     confirm_remove: Option<usize>,
@@ -285,6 +305,9 @@ impl CourseApp {
             catalog_view: CatalogView::default(),
             toast: None,
             toast_queue: std::collections::VecDeque::new(),
+            captcha_input: None,
+            captcha_text: String::new(),
+            captcha_texture: None,
             confirm_logout: false,
             confirm_clear_logs: false,
             confirm_remove: None,
@@ -1868,6 +1891,89 @@ impl CourseApp {
                     });
                 });
         }
+        // F-01：教务在连续登录失败若干次后强制上验证码。此前没有任何获取或
+        // 提交验证码的路径，一旦触发工具就永久卡死——而 login() 最多重试 4 次，
+        // 恰好容易把学校推到这个阈值上。不做 OCR，一次性手填即可。
+        let captcha = self.state.pending_captcha.lock().clone();
+        if let Some(bytes) = captcha {
+            egui::Window::new("需要输入验证码")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(root_ui.ctx(), |ui| {
+                    ui.set_min_width(320.0);
+                    ui.label(
+                        RichText::new("教务系统要求验证码（通常是连续登录失败后触发）。")
+                            .size(META_SIZE)
+                            .color(pal().text),
+                    );
+                    ui.add_space(8.0);
+                    // 按字节长度做缓存键：换一张图长度几乎必然不同，
+                    // 相同则没必要重新解码。
+                    let key = bytes.len();
+                    if self.captcha_texture.as_ref().map(|(k, _)| *k) != Some(key) {
+                        if let Ok(image) = image_from_bytes(&bytes) {
+                            let texture = ui.ctx().load_texture(
+                                "captcha",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.captcha_texture = Some((key, texture));
+                        } else {
+                            self.captcha_texture = None;
+                        }
+                    }
+                    match &self.captcha_texture {
+                        Some((_, texture)) => {
+                            ui.add(
+                                egui::Image::new(texture)
+                                    .fit_to_original_size(1.0)
+                                    .max_height(64.0),
+                            );
+                        }
+                        None => {
+                            ui.label(
+                                RichText::new(
+                                    "验证码图片无法显示（格式不受支持）。\
+                                     可在浏览器中登录一次教务系统解除限制后重试。",
+                                )
+                                .size(CAPTION_SIZE)
+                                .color(pal().amber),
+                            );
+                        }
+                    }
+                    ui.add_space(8.0);
+                    let entry = ui.add(
+                        egui::TextEdit::singleline(&mut self.captcha_text)
+                            .hint_text("输入图中字符")
+                            .desired_width(160.0),
+                    );
+                    let submit_by_enter =
+                        entry.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(quiet_button("取消", 72.0)).clicked() {
+                            *self.state.pending_captcha.lock() = None;
+                            self.captcha_text.clear();
+                            self.captcha_texture = None;
+                            self.state.set_message("已取消登录");
+                        }
+                        let can_submit = !self.captcha_text.trim().is_empty();
+                        if (ui
+                            .add_enabled(can_submit, primary_button("提交", pal().blue, 88.0))
+                            .clicked()
+                            || (submit_by_enter && can_submit))
+                            && can_submit
+                        {
+                            self.captcha_input = Some(self.captcha_text.trim().to_string());
+                            self.captcha_text.clear();
+                            self.captcha_texture = None;
+                            *self.state.pending_captcha.lock() = None;
+                            self.do_login();
+                        }
+                    });
+                });
+        }
         if self.confirm_export_raw_diagnostics {
             egui::Window::new("确认导出原始页面")
                 .collapsible(false)
@@ -2473,6 +2579,8 @@ impl CourseApp {
                 auto_fetch: self.cfg.auto_fetch_on_login,
                 debug_dump_enabled: self.cfg.debug_dump_enabled,
                 remember_for_relogin: self.cfg.remember_credentials_for_session,
+                // 只有从验证码弹窗过来的这次登录会带答案。
+                captcha_answer: self.captcha_input.take(),
             },
         );
     }

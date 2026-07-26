@@ -127,6 +127,13 @@ pub enum EamsError {
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
+    #[error("需要输入验证码")]
+    CaptchaRequired {
+        /// 验证码图片字节，交给界面显示。
+        image: Vec<u8>,
+        /// 提交时的表单字段名（来自登录页，不是猜的）。
+        field_name: String,
+    },
     #[error("响应解析失败：{message}")]
     Parse { message: String },
     #[error("业务请求被拒绝：{message}")]
@@ -215,6 +222,8 @@ pub fn backend_error_kind(error: &anyhow::Error) -> BackendErrorKind {
                 EamsError::HttpStatus { status, .. } if *status >= 500 => BackendErrorKind::Server,
                 EamsError::HttpStatus { .. } => BackendErrorKind::HttpClient,
                 EamsError::Network { kind, .. } => *kind,
+                // 需要验证码不是网络问题，也不该计入停机阈值：它等着用户输入。
+                EamsError::CaptchaRequired { .. } => BackendErrorKind::Business,
                 EamsError::Parse { .. } => BackendErrorKind::Parse,
                 EamsError::Business { .. } => BackendErrorKind::Business,
                 EamsError::ResponseTooLarge(_) => BackendErrorKind::ResponseTooLarge,

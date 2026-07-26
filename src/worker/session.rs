@@ -19,6 +19,20 @@ pub struct LoginRequest {
     pub debug_dump_enabled: bool,
     /// 是否在本次会话内保留凭据，用于会话过期后自动重登。
     pub remember_for_relogin: bool,
+    /// 用户填写的验证码（仅在教务要求时有值）。
+    pub captcha_answer: Option<String>,
+}
+
+/// 从错误链里取出验证码图片。
+fn captcha_image(error: &anyhow::Error) -> Option<Vec<u8>> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<crate::eams::EamsError>()
+            .and_then(|error| match error {
+                crate::eams::EamsError::CaptchaRequired { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+    })
 }
 
 /// 本次会话保留的登录凭据。
@@ -78,6 +92,7 @@ pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
         auto_fetch,
         debug_dump_enabled,
         remember_for_relogin,
+        captcha_answer,
     } = req;
     if state.logging_in.swap(true, Ordering::AcqRel) {
         state.log(LogLevel::Warn, "登录进行中，请稍候…");
@@ -107,8 +122,28 @@ pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
             }
         };
 
-        if let Err(error) = client.login(&username, password.as_str()).await {
+        let login_result = match captcha_answer.as_deref() {
+            Some(answer) => {
+                client
+                    .login_with_captcha(&username, password.as_str(), answer)
+                    .await
+            }
+            None => client.login(&username, password.as_str()).await,
+        };
+        if let Err(error) = login_result {
             state.logged_in.store(false, Ordering::Release);
+            // 需要验证码：把图片交给界面，等用户填完再重新提交。
+            if let Some(image) = captcha_image(&error) {
+                *state.pending_captcha.lock() = Some(image);
+                state.log(LogLevel::Warn, "教务要求输入验证码，请在弹窗中填写");
+                state.set_message("需要输入验证码");
+                // 凭据先留着，用户填完验证码后直接复用，不必重敲密码。
+                *state.credentials.lock() = Some(SessionCredentials {
+                    username: username.clone(),
+                    password: password.clone(),
+                });
+                return;
+            }
             if backend_error_kind(&error) == BackendErrorKind::RateLimited {
                 state.log(
                     LogLevel::Error,
@@ -125,6 +160,8 @@ pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
         state.logged_in.store(true, Ordering::Release);
         *state.client.lock() = Some(client.clone());
         // 凭据只在登录成功后保留，且只在用户允许时保留。
+        // 登录成功，清掉待填验证码。
+        *state.pending_captcha.lock() = None;
         *state.credentials.lock() = remember_for_relogin.then(|| SessionCredentials {
             username: username.clone(),
             password: password.clone(),
@@ -348,6 +385,7 @@ mod tests {
             auto_fetch: false,
             debug_dump_enabled: false,
             remember_for_relogin: false,
+            captcha_answer: None,
         };
         let _typed: &Zeroizing<String> = &request.password;
     }
