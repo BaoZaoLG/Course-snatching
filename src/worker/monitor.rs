@@ -3,12 +3,17 @@ use super::state::*;
 use super::time::*;
 use crate::config::AppConfig;
 use crate::eams::{
-    backend_error_kind, is_auth_error, BackendErrorKind, CircuitStatus, ElectResult, Lesson,
+    backend_error_kind, is_auth_error, BackendErrorKind, CircuitStatus, EamsClient, ElectResult,
+    Lesson,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+/// 指定教学班在目录中连续缺失该轮数后才终态放弃：单轮缺失可能只是
+/// 服务器抖动或兜底解析得到的子集，直接放弃会在最关键时刻丢掉目标。
+const MAX_ID_MISSING_ROUNDS: u32 = 5;
 pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
     if let Err(error) = cfg.validate_watch() {
         state.log(LogLevel::Warn, error.to_string());
@@ -77,6 +82,8 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
         // of complete refreshes, preventing fast/slow oscillation.
         let mut consecutive_successful_refreshes = 0u32;
         let mut seat_open_prev: HashMap<String, bool> = HashMap::new();
+        // 指定教学班连续未在目录中出现的轮数（见 MAX_ID_MISSING_ROUNDS）。
+        let mut id_missing_rounds: HashMap<String, u32> = HashMap::new();
         let burst_secs = cfg.open_burst_seconds.min(120);
         let burst_deadline =
             tokio::time::Instant::now() + Duration::from_secs(u64::from(burst_secs));
@@ -84,7 +91,7 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
         // cooldown the worker resumes ordinary monitoring instead.
         let mut burst_aborted_by_circuit = false;
 
-        while state.is_current_run(generation) && !pending.is_empty() {
+        'run: while state.is_current_run(generation) && !pending.is_empty() {
             let round_started = tokio::time::Instant::now();
             if client.circuit_is_open() {
                 burst_aborted_by_circuit = true;
@@ -94,7 +101,14 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                 && tokio::time::Instant::now() < burst_deadline;
             client.set_burst_mode(in_burst);
 
-            let catalog = match client.fetch_lessons_for_monitoring(&profile).await {
+            // 停止请求必须能穿透 governor 等待与在途 HTTP：熔断/限流冷却
+            // 可达分钟级，取消只影响本地等待，不影响服务器端已收到的请求。
+            let fetch_result = tokio::select! {
+                biased;
+                () = run_cancelled(&state, generation) => break,
+                result = client.fetch_lessons_for_monitoring(&profile) => result,
+            };
+            let catalog = match fetch_result {
                 Ok((list, complete_refresh)) => {
                     consecutive_refresh_failures = 0;
                     if complete_refresh {
@@ -117,6 +131,19 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                 }
                 Err(error) => {
                     if is_auth_error(&error) {
+                        if !confirm_auth_expired(&state, generation, &client).await {
+                            if !state.is_current_run(generation) {
+                                break;
+                            }
+                            state.log(LogLevel::Warn, "检测到疑似登录失效，复核未确认，继续监控");
+                            sleep_cancellable(
+                                &state,
+                                generation,
+                                Duration::from_secs_f64(effective_interval.clamp(0.05, 30.0)),
+                            )
+                            .await;
+                            continue;
+                        }
                         state.log(LogLevel::Error, "登录失效，抢课已停止");
                         state.clear_session("登录失效，请重新登录");
                         crate::notify::dispatch_alert(
@@ -275,13 +302,60 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
 
                 let lesson = if let Some(expected_id) = cfg.watch_lesson_ids.get(&serial) {
                     match by_id.get(expected_id) {
-                        Some(lesson) if lesson.no.trim() == serial => lesson.clone(),
-                        _ => {
+                        Some(lesson) if lesson.no.trim() == serial => {
+                            id_missing_rounds.remove(&serial);
+                            lesson.clone()
+                        }
+                        Some(_) => {
+                            // id 仍在目录中但序号对不上：教学班确实已变化，终态失败。
                             let detail = "指定教学班已变化或不在当前轮次，请重新从课程列表加入";
                             update_watch(&state, &serial, WatchState::Failed, detail, None, None);
                             state.log(LogLevel::Error, format!("[{serial}] {detail}"));
                             pending.remove(&serial);
                             terminal_failures += 1;
+                            continue;
+                        }
+                        None => {
+                            // 单轮目录缺失可能只是服务器抖动或 HTML 兜底解析出的
+                            // 子集：按 Missing 重试（与按序号路径一致），连续多轮
+                            // 仍未刷到才终结，避免瞬态缺失葬送唯一目标。
+                            let missing = *id_missing_rounds
+                                .entry(serial.clone())
+                                .and_modify(|count| *count = count.saturating_add(1))
+                                .or_insert(1);
+                            if missing >= MAX_ID_MISSING_ROUNDS {
+                                let detail = format!(
+                                    "指定教学班连续 {MAX_ID_MISSING_ROUNDS} 轮未刷到，可能已撤销，请重新从课程列表加入"
+                                );
+                                update_watch(
+                                    &state,
+                                    &serial,
+                                    WatchState::Failed,
+                                    detail.clone(),
+                                    None,
+                                    None,
+                                );
+                                state.log(LogLevel::Error, format!("[{serial}] {detail}"));
+                                pending.remove(&serial);
+                                terminal_failures += 1;
+                                continue;
+                            }
+                            update_watch(
+                                &state,
+                                &serial,
+                                WatchState::Missing,
+                                format!(
+                                    "本轮未刷到（{missing}/{MAX_ID_MISSING_ROUNDS}），继续重试"
+                                ),
+                                None,
+                                None,
+                            );
+                            state.log(
+                                LogLevel::Warn,
+                                format!(
+                                    "[{serial}] 指定教学班本轮未刷到（{missing}/{MAX_ID_MISSING_ROUNDS}），继续重试"
+                                ),
+                            );
                             continue;
                         }
                     }
@@ -399,10 +473,13 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     Some(&lesson),
                 );
 
-                match client
-                    .elect_lesson(&profile, &lesson.id, lesson.seat.selected())
-                    .await
-                {
+                // 与刷新一致：提交等待也要能被停止请求穿透。
+                let elect_result = tokio::select! {
+                    biased;
+                    () = run_cancelled(&state, generation) => break 'run,
+                    result = client.elect_lesson(&profile, &lesson.id, lesson.seat.selected()) => result,
+                };
+                match elect_result {
                     Ok(ElectResult::Success { detail }) => {
                         consecutive_submission_errors = 0;
                         state.log(LogLevel::Success, format!("[{serial}] 成功：{detail}"));
@@ -468,9 +545,36 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     }
                     Err(error) => {
                         if is_auth_error(&error) {
-                            state.log(LogLevel::Error, "登录失效，抢课已停止");
-                            state.clear_session("登录失效，请重新登录");
-                            break;
+                            if confirm_auth_expired(&state, generation, &client).await {
+                                state.log(LogLevel::Error, "登录失效，抢课已停止");
+                                state.clear_session("登录失效，请重新登录");
+                                // 与刷新路径一致：提交阶段掉线正是最需要提醒的时刻。
+                                crate::notify::dispatch_alert(
+                                    "登录失效",
+                                    "提交阶段登录失效，抢课已停止，请重新登录",
+                                    false,
+                                    cfg.notify_enabled,
+                                    cfg.sound_enabled,
+                                );
+                                break 'run;
+                            }
+                            if !state.is_current_run(generation) {
+                                break 'run;
+                            }
+                            // 复核未确认失效：本次提交结果未知，保留目标下轮复核。
+                            state.log(
+                                LogLevel::Warn,
+                                format!("[{serial}] 提交时疑似登录失效，复核未确认，下轮重试"),
+                            );
+                            update_watch(
+                                &state,
+                                &serial,
+                                WatchState::Checking,
+                                "登录复核正常，下轮重试",
+                                Some(lesson.capacity_text()),
+                                Some(&lesson),
+                            );
+                            continue;
                         }
                         let reported_kind = backend_error_kind(&error);
                         let error_text = format!("{error:#}");
@@ -508,7 +612,9 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                                 cfg.notify_enabled,
                                 cfg.sound_enabled,
                             );
-                            break;
+                            // 必须终止整个 run：普通 break 只会跳出本轮的
+                            // for 循环，pending 非空时 while 会继续下一轮。
+                            break 'run;
                         }
                     }
                 }
@@ -524,7 +630,12 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                 && !client.circuit_is_open()
                 && tokio::time::Instant::now() < burst_deadline;
             let desired_period = poll_delay_for_mode(effective_interval, in_burst);
-            let delay = desired_period.saturating_sub(round_started.elapsed());
+            // 提交路径设置的服务器冷却也在轮末等待中兑现：让等待可见、
+            // 可取消，而不是下一轮请求在 acquire 里被无提示地阻塞。
+            let cooldown_wait = client.network_snapshot().cooldown_remaining;
+            let delay = desired_period
+                .saturating_sub(round_started.elapsed())
+                .max(cooldown_wait);
             if !delay.is_zero() {
                 state.set_message(format!(
                     "{}剩余 {} 门，{:.2}s 后继续",
@@ -572,9 +683,11 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                     cfg.sound_enabled,
                 );
             }
-        } else if state.logged_in.load(Ordering::Acquire) {
+        } else {
+            // 登录失效/登出也会走到这里：看板中未终态的行必须标记为已停止，
+            // 否则“提交中”等状态会永久停留；状态消息则保持掉线提示不被覆盖。
             mark_pending_stopped(&state, &pending);
-            if !stopped_for_errors {
+            if !stopped_for_errors && state.logged_in.load(Ordering::Acquire) {
                 state.log(LogLevel::Info, "已停止");
                 state.set_message("已停止");
             }
@@ -587,6 +700,12 @@ pub fn stop_grab(state: &SharedState) {
         return;
     }
     if state.stopping.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // 上面两步之间 run 可能恰好自然结束（guard drop 已清 running/stopping）。
+    // 此时必须回滚 stopping，否则 UI 会一直显示“正在停止”。
+    if !state.running.load(Ordering::Acquire) {
+        state.stopping.store(false, Ordering::Release);
         return;
     }
     // Invalidate the current run but leave `running` true until the worker guard drops.
@@ -754,14 +873,30 @@ fn fixed_network_backoff(consecutive_failures: u32) -> Duration {
     DELAYS[consecutive_failures.saturating_sub(1).min(4) as usize]
 }
 
-#[cfg(test)]
-fn mask_account(username: &str) -> String {
-    let chars: Vec<char> = username.chars().collect();
-    match chars.len() {
-        0 => String::new(),
-        1 => "*".into(),
-        2 => format!("{}*", chars[0]),
-        _ => format!("{}***{}", chars[0], chars[chars.len() - 1]),
+/// 当前 run 被取消（stop_grab/登出/新一轮开始都会推进 generation）后完成。
+/// 与网络 future 一起 select，让停止请求穿透 governor 等待与在途 HTTP，
+/// 停止延迟从最长可达分钟级收敛到亚秒级。
+async fn run_cancelled(state: &SharedState, generation: u64) {
+    while state.is_current_run(generation) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 登录页特征的单次嗅探可能是教务高峰期负载抖动的误报。间隔 1 秒用
+/// 轻量请求复核一次，连续两次判失效才视为真正掉线；真失效仅多花约 1 秒，
+/// 换来误检不再在最关键时刻终止整个抢课任务。
+async fn confirm_auth_expired(state: &SharedState, generation: u64, client: &EamsClient) -> bool {
+    sleep_cancellable(state, generation, Duration::from_secs(1)).await;
+    if !state.is_current_run(generation) {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        () = run_cancelled(state, generation) => false,
+        result = client.ensure_logged_in() => match result {
+            Ok(()) => false,
+            Err(error) => is_auth_error(&error),
+        },
     }
 }
 
@@ -970,14 +1105,6 @@ mod tests {
     }
 
     #[test]
-    fn mask_account_redacts_middle() {
-        assert_eq!(mask_account(""), "");
-        assert_eq!(mask_account("a"), "*");
-        assert_eq!(mask_account("ab"), "a*");
-        assert_eq!(mask_account("student01"), "s***1");
-    }
-
-    #[test]
     fn activity_guard_does_not_clear_newer_run() {
         let state = SharedState::new();
         let gen1 = state.claim_run().expect("first claim");
@@ -1104,6 +1231,323 @@ mod tests {
         );
     }
 
+    #[test]
+    fn specified_lesson_missing_from_one_round_is_retried() {
+        let others = "var lessonJSONs=[{id:999888,no:'OTH.001',name:'其他课',teachers:'李老师',stdCount:1,limitCount:2}];";
+        let others_counts = "window.lessonId2Counts={'999888':{sc:1,lc:2}}";
+        let target = "var lessonJSONs=[{id:371644,no:'IDR.001',name:'目标课',teachers:'张老师',stdCount:1,limitCount:2}];";
+        let target_counts = "window.lessonId2Counts={'371644':{sc:1,lc:2}}";
+        let base = serve_sequence(vec![
+            "<html>elect page</html>",
+            // 第一轮目录缺失指定教学班：必须按 Missing 重试而不是终态放弃
+            others,
+            others_counts,
+            target,
+            target_counts,
+            "选课成功",
+            "var lessonJSONs=[];",
+        ]);
+        let state = prepared_state(&base);
+        let mut cfg = test_config(&base, "IDR.001");
+        cfg.watch_lesson_ids
+            .insert("IDR.001".into(), "371644".into());
+        start_grab(state.clone(), cfg);
+        wait_until_stopped(&state);
+
+        let watch = state.watch.lock().clone();
+        assert_eq!(watch[0].state, WatchState::Success, "got {watch:?}");
+        let logs = log_messages(&state);
+        assert!(
+            logs.iter().any(|m| m.contains("本轮未刷到")),
+            "expected missing-retry log, got {logs:?}"
+        );
+    }
+
+    #[test]
+    fn specified_lesson_missing_for_max_rounds_becomes_terminal() {
+        let others = "var lessonJSONs=[{id:999888,no:'OTH.001',name:'其他课',teachers:'李老师',stdCount:1,limitCount:2}];";
+        let others_counts = "window.lessonId2Counts={'999888':{sc:1,lc:2}}";
+        let mut seq = vec!["<html>elect page</html>"];
+        for _ in 0..MAX_ID_MISSING_ROUNDS {
+            seq.push(others);
+            seq.push(others_counts);
+        }
+        let base = serve_sequence(seq);
+        let state = prepared_state(&base);
+        let mut cfg = test_config(&base, "IDX.001");
+        cfg.interval_seconds = 0.1;
+        cfg.watch_lesson_ids
+            .insert("IDX.001".into(), "371644".into());
+        start_grab(state.clone(), cfg);
+        wait_until_stopped(&state);
+
+        let watch = state.watch.lock().clone();
+        assert_eq!(watch[0].state, WatchState::Failed, "got {watch:?}");
+        assert!(watch[0].detail.contains("连续"), "got {watch:?}");
+        assert!(state.worker_message.lock().contains("失败/跳过 1"));
+    }
+
+    #[test]
+    fn full_submission_result_keeps_target_pending_for_next_round() {
+        let data = "var lessonJSONs=[{id:371644,no:'FUL.001',name:'Full',teachers:'张老师',stdCount:1,limitCount:2}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:1,lc:2}}";
+        let base = serve_sequence(vec![
+            "<html>elect page</html>",
+            data,
+            counts,
+            // 第一轮提交返回容量已满：非终态，目标必须留在监控队列
+            "上限人数已满",
+            data,
+            counts,
+            "选课成功",
+            "var lessonJSONs=[];",
+        ]);
+        let state = prepared_state(&base);
+        start_grab(state.clone(), test_config(&base, "FUL.001"));
+        wait_until_stopped(&state);
+
+        let watch = state.watch.lock().clone();
+        assert_eq!(watch[0].state, WatchState::Success, "got {watch:?}");
+        assert!(state.worker_message.lock().contains("全部完成"));
+        let logs = log_messages(&state);
+        assert!(
+            logs.iter().any(|m| m.contains("已满")),
+            "expected full log, got {logs:?}"
+        );
+    }
+
+    #[test]
+    fn non_network_submission_failures_stop_after_threshold() {
+        let data = "var lessonJSONs=[{id:371644,no:'ERR.001',name:'Err',teachers:'张老师',stdCount:1,limitCount:2}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:1,lc:2}}";
+        let base = serve_sequence_with_status(vec![
+            (200, "<html>elect page</html>"),
+            (200, data),
+            (200, counts),
+            // 4xx 属非网络类失败：连续 2 次必须触发自动停止
+            (400, "请求参数错误"),
+            (200, data),
+            (200, counts),
+            (400, "请求参数错误"),
+        ]);
+        let state = prepared_state(&base);
+        start_grab(state.clone(), test_config(&base, "ERR.001"));
+        wait_until_stopped(&state);
+
+        assert!(
+            state
+                .worker_message
+                .lock()
+                .contains("提交连续失败 2 次，已自动停止"),
+            "got message: {}",
+            state.worker_message.lock()
+        );
+        let watch = state.watch.lock().clone();
+        assert_eq!(watch[0].state, WatchState::Failed, "got {watch:?}");
+    }
+
+    #[test]
+    fn consecutive_server_errors_do_not_trigger_auto_stop() {
+        // 网络类失败（HTTP 500）交给 governor 冷却处理，绝不能命中停机
+        // 阈值：反向锁定 !is_network_failure 守卫，选课窗口期不允许静默停机。
+        let base = serve_sequence_with_status(vec![
+            (500, "server error"),
+            (500, "server error"),
+            (500, "server error"),
+            (500, "server error"),
+        ]);
+        let state = prepared_state(&base);
+        let mut cfg = test_config(&base, "NET.001");
+        cfg.max_consecutive_errors = 1;
+        start_grab(state.clone(), cfg);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while std::time::Instant::now() < deadline
+            && !log_messages(&state)
+                .iter()
+                .any(|m| m.contains("刷新课程失败"))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let logs = log_messages(&state);
+        assert!(
+            logs.iter().any(|m| m.contains("刷新课程失败")),
+            "no refresh failure logged: {logs:?}"
+        );
+        assert!(
+            state.running.load(Ordering::Acquire),
+            "network failures must not stop the worker"
+        );
+        assert!(!state.worker_message.lock().contains("已自动停止"));
+        stop_grab(&state);
+        wait_until_stopped(&state);
+    }
+
+    #[test]
+    fn non_network_refresh_failures_stop_after_threshold() {
+        let base = serve_sequence(vec![
+            "<html>elect page</html>",
+            // 数据接口返回完全不可解析的页面：解析失败属非网络类，须停机
+            "<html>完全无法解析的页面</html>",
+        ]);
+        let state = prepared_state(&base);
+        let mut cfg = test_config(&base, "PRS.001");
+        cfg.max_consecutive_errors = 1;
+        start_grab(state.clone(), cfg);
+        wait_until_stopped(&state);
+
+        assert!(
+            state
+                .worker_message
+                .lock()
+                .contains("连续刷新失败 1 次，已自动停止"),
+            "got message: {}",
+            state.worker_message.lock()
+        );
+    }
+
+    #[test]
+    fn transient_login_page_sniff_is_reverified_before_stopping() {
+        let login_page = r#"<form id="loginForm"><input name="password"></form>"#;
+        let data = "var lessonJSONs=[{id:371644,no:'AUT.001',name:'Auth',teachers:'张老师',stdCount:1,limitCount:2}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:1,lc:2}}";
+        let base = serve_sequence(vec![
+            // 首轮刷新被误判为登录页：复核通过后必须继续而不是停机
+            login_page,
+            "<html>home ok</html>",
+            "<html>elect page</html>",
+            data,
+            counts,
+            "选课成功",
+            "var lessonJSONs=[];",
+        ]);
+        let state = prepared_state(&base);
+        start_grab(state.clone(), test_config(&base, "AUT.001"));
+        wait_until_stopped(&state);
+
+        let watch = state.watch.lock().clone();
+        assert_eq!(watch[0].state, WatchState::Success, "got {watch:?}");
+        assert!(
+            state.logged_in.load(Ordering::Acquire),
+            "a false alarm must not clear the session"
+        );
+        let logs = log_messages(&state);
+        assert!(
+            logs.iter().any(|m| m.contains("复核未确认")),
+            "expected reverify log, got {logs:?}"
+        );
+    }
+
+    #[test]
+    fn confirmed_auth_expiry_stops_and_marks_rows_stopped() {
+        let login_page = r#"<form id="loginForm"><input name="password"></form>"#;
+        let base = serve_sequence(vec![login_page, login_page]);
+        let state = prepared_state(&base);
+        start_grab(state.clone(), test_config(&base, "AUT.002"));
+        wait_until_stopped(&state);
+
+        assert!(!state.logged_in.load(Ordering::Acquire));
+        assert!(state.worker_message.lock().contains("登录失效"));
+        let watch = state.watch.lock().clone();
+        assert_eq!(
+            watch[0].state,
+            WatchState::Stopped,
+            "row must be marked stopped after auth loss: {watch:?}"
+        );
+        let logs = log_messages(&state);
+        assert!(
+            logs.iter().any(|m| m.contains("登录失效，抢课已停止")),
+            "expected auth stop log, got {logs:?}"
+        );
+    }
+
+    #[test]
+    fn submission_auth_expiry_notifies_and_marks_rows_stopped() {
+        let login_page = r#"<form id="loginForm"><input name="password"></form>"#;
+        let data = "var lessonJSONs=[{id:371644,no:'SUB.001',name:'Sub',teachers:'张老师',stdCount:1,limitCount:2}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:1,lc:2}}";
+        let base = serve_sequence(vec![
+            "<html>elect page</html>",
+            data,
+            counts,
+            // 提交响应是登录页；复核仍是登录页：确认掉线
+            login_page,
+            login_page,
+        ]);
+        let state = prepared_state(&base);
+        start_grab(state.clone(), test_config(&base, "SUB.001"));
+        wait_until_stopped(&state);
+
+        assert!(!state.logged_in.load(Ordering::Acquire));
+        assert!(state.worker_message.lock().contains("登录失效"));
+        let watch = state.watch.lock().clone();
+        assert_eq!(
+            watch[0].state,
+            WatchState::Stopped,
+            "“提交中”行必须被标记已停止: {watch:?}"
+        );
+        let logs = log_messages(&state);
+        assert!(
+            logs.iter().any(|m| m.contains("登录失效，抢课已停止")),
+            "expected submission auth stop log, got {logs:?}"
+        );
+    }
+
+    #[test]
+    fn stop_penetrates_governor_cooldown_quickly() {
+        let base = serve_sequence(vec![]);
+        let state = prepared_state(&base);
+        // 模拟提交路径刚设下的长冷却：下一次刷新会在 acquire 中被阻塞
+        state
+            .client
+            .lock()
+            .as_ref()
+            .unwrap()
+            .set_cooldown_for_tests(Duration::from_secs(30));
+        start_grab(state.clone(), test_config(&base, "CAN.001"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !state.running.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(state.running.load(Ordering::Acquire), "run did not start");
+        // 让 worker 进入 acquire 的冷却等待
+        std::thread::sleep(Duration::from_millis(200));
+
+        let stop_started = std::time::Instant::now();
+        stop_grab(&state);
+        wait_until_stopped(&state);
+        assert!(
+            stop_started.elapsed() < Duration::from_secs(2),
+            "stop took {:?}, must penetrate governor cooldown sub-second",
+            stop_started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stop_race_with_natural_finish_never_strands_stopping_flag() {
+        for _ in 0..200 {
+            let state = SharedState::new();
+            let generation = state.claim_run().expect("claim");
+            let racer = state.clone();
+            let handle = std::thread::spawn(move || racer.release_run_if_owner(generation));
+            stop_grab(&state);
+            handle.join().unwrap();
+            assert!(
+                !state.stopping.load(Ordering::Acquire),
+                "run ended but stopping flag remained set"
+            );
+        }
+    }
+
+    fn log_messages(state: &SharedState) -> Vec<String> {
+        state
+            .logs
+            .lock()
+            .iter()
+            .map(|l| l.message.clone())
+            .collect()
+    }
+
     fn prepared_state(base: &str) -> Arc<SharedState> {
         let state = SharedState::new();
         state.logged_in.store(true, Ordering::Release);
@@ -1131,23 +1575,30 @@ mod tests {
         }
         assert!(
             !state.running.load(Ordering::Acquire),
-            "worker did not stop in time"
+            "worker did not stop in time; message={:?}, logs={:?}",
+            state.worker_message.lock().clone(),
+            log_messages(state)
         );
     }
 
     fn serve_sequence(responses: Vec<&'static str>) -> String {
+        serve_sequence_with_status(responses.into_iter().map(|body| (200, body)).collect())
+    }
+
+    fn serve_sequence_with_status(responses: Vec<(u16, &'static str)>) -> String {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            for body in responses {
+            for (status, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0u8; 4096];
                 let _ = stream.read(&mut request);
+                let reason = if status == 200 { "OK" } else { "Error" };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).unwrap();

@@ -64,6 +64,12 @@ impl EamsClient {
         self.governor.circuit_is_open()
     }
 
+    /// 供 worker 端到端测试构造“治理层冷却中”的场景。
+    #[cfg(test)]
+    pub fn set_cooldown_for_tests(&self, duration: Duration) {
+        self.governor.set_cooldown_for_tests(duration);
+    }
+
     pub fn matches_base_url(&self, raw: &str) -> bool {
         normalize_base(raw).is_ok_and(|url| url == self.base)
     }
@@ -1016,6 +1022,68 @@ mod tests {
         assert!(!lessons[0].capacity_known());
         assert!(!lessons[0].has_seat());
         assert_eq!(lessons[0].capacity_text(), "-");
+    }
+
+    #[test]
+    fn governance_state_survives_client_rebuild_for_same_origin() {
+        // 登录/会话失效会重建 EamsClient：同 origin 必须复用同一 governor，
+        // 限流冷却与 429 历史不能随旧实例丢弃（否则反复点登录即可绕过治理）。
+        let base = "https://governor-rebuild.test/eams";
+        let first = EamsClient::new(base, 5, false).unwrap();
+        let permit = test_runtime().block_on(first.governor.acquire(RequestPriority::Session));
+        first.governor.record_failure(
+            &permit,
+            BackendErrorKind::RateLimited,
+            Some(Duration::from_secs(120)),
+        );
+        drop(first);
+
+        let rebuilt = EamsClient::new(base, 5, false).unwrap();
+        let snapshot = rebuilt.network_snapshot();
+        assert_eq!(snapshot.total_rate_limits, 1);
+        assert!(
+            !snapshot.cooldown_remaining.is_zero(),
+            "cooldown must survive the client rebuild"
+        );
+
+        let other = EamsClient::new("https://governor-other.test/eams", 5, false).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&rebuilt.governor, &other.governor));
+        assert_eq!(other.network_snapshot().total_rate_limits, 0);
+    }
+
+    #[test]
+    fn long_server_retry_after_is_not_truncated() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = "too many requests";
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 300\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let base = format!("http://{address}/eams");
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let error = test_runtime()
+            .block_on(client.get_text("stdElectCourse!data.action?profileId=0"))
+            .unwrap_err();
+        assert!(is_rate_limit_error(&error));
+        // 服务器要求的 300s 冷却全程不被截断（解析层与治理层上限一致）。
+        assert_eq!(
+            rate_limit_retry_after(&error),
+            Some(Duration::from_secs(300))
+        );
+        let snapshot = client.network_snapshot();
+        assert!(snapshot.cooldown_remaining > Duration::from_secs(240));
     }
 
     #[test]

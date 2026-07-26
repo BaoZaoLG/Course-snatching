@@ -244,3 +244,17 @@ fn mask_account(username: &str) -> String {
         _ => format!("{}***{}", chars[0], chars[chars.len() - 1]),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::mask_account;
+
+    // 直接测生产实现：脱敏是隐私相关逻辑，不能靠测试侧复制品假覆盖。
+    #[test]
+    fn mask_account_redacts_middle() {
+        assert_eq!(mask_account(""), "");
+        assert_eq!(mask_account("a"), "*");
+        assert_eq!(mask_account("ab"), "a*");
+        assert_eq!(mask_account("student01"), "s***1");
+    }
+}

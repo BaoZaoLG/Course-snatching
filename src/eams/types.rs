@@ -150,13 +150,15 @@ pub fn is_rate_limit_error(error: &anyhow::Error) -> bool {
 }
 
 /// 从错误链中提取 Retry-After（若服务器提供）。
+/// 上限与解析层 parse_retry_after_secs 保持一致（300s）：服务器要求的
+/// 长冷却被截短会导致提前重试，反而加重封禁风险。
 pub fn rate_limit_retry_after(error: &anyhow::Error) -> Option<Duration> {
     error.chain().find_map(|cause| {
         cause.downcast_ref::<EamsError>().and_then(|e| match e {
             EamsError::RateLimited {
                 retry_after_secs: Some(secs),
                 ..
-            } => Some(Duration::from_secs((*secs).clamp(1, 120))),
+            } => Some(Duration::from_secs((*secs).clamp(1, 300))),
             _ => None,
         })
     })
@@ -248,4 +250,34 @@ pub enum ElectResult {
     Failed {
         detail: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rate_limited(retry_after_secs: Option<u64>) -> anyhow::Error {
+        anyhow::Error::new(EamsError::RateLimited {
+            message: "限流".into(),
+            retry_after_secs,
+        })
+    }
+
+    #[test]
+    fn retry_after_extraction_honors_the_parse_layer_ceiling() {
+        assert_eq!(
+            rate_limit_retry_after(&rate_limited(Some(7))),
+            Some(Duration::from_secs(7))
+        );
+        // 服务器要求 300s 必须完整兑现，不能再被截断到 120s。
+        assert_eq!(
+            rate_limit_retry_after(&rate_limited(Some(300))),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            rate_limit_retry_after(&rate_limited(Some(9_999))),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(rate_limit_retry_after(&rate_limited(None)), None);
+    }
 }

@@ -22,10 +22,18 @@ impl EamsClient {
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static(UA));
         let allowed_origin = origin_key(&base);
+        let governor = RequestGovernor::shared_for_origin(&allowed_origin);
         let http = Client::builder()
             .default_headers(headers)
             .cookie_store(true)
             .timeout(Duration::from_secs(timeout_secs.max(5)))
+            // SYN 丢包不该独占整个总超时预算：5s 建不起连接就放弃重试，
+            // 保住冲刺窗口（默认 20s）内的剩余机会。
+            .connect_timeout(Duration::from_secs(5))
+            // 低于常见 Tomcat keepAliveTimeout（20-60s）：长退避/熔断冷却后
+            // 不复用可能已被服务端关闭的陈旧连接，避免恢复后的第一发
+            // 提交先吃一个连接错误。
+            .pool_idle_timeout(Duration::from_secs(15))
             .redirect(Policy::custom(move |attempt| {
                 if attempt.previous().len() >= 12 {
                     return attempt.error("too many redirects");
@@ -42,7 +50,7 @@ impl EamsClient {
             base,
             debug_dump_enabled,
             profile_context: Mutex::new(HashMap::<String, ProfileContext>::new()),
-            governor: RequestGovernor::new(),
+            governor,
         })
     }
 

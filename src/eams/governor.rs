@@ -1,8 +1,8 @@
 use super::types::{BackendErrorKind, CircuitStatus, NetworkSnapshot, RetryAdvice};
 use parking_lot::Mutex;
 use std::cell::Cell;
-use std::collections::VecDeque;
-use std::sync::{Arc, Weak};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -48,7 +48,9 @@ impl Default for GovernorPolicy {
             rate_limit_threshold: 3,
             circuit_cooldown: Duration::from_secs(60),
             retry_min: Duration::from_secs(1),
-            retry_max: Duration::from_secs(120),
+            // 与解析层 parse_retry_after_secs 的 300s 上限保持一致：服务器
+            // 明确要求的冷却绝不能被治理层截断后提前重试（易升级封禁）。
+            retry_max: Duration::from_secs(300),
             jitter_fraction: 0.1,
         }
     }
@@ -76,7 +78,12 @@ struct GovernorState {
     next_id: u64,
     next_sequence: u64,
     waiters: Vec<Waiter>,
-    cooldown_until: Option<Instant>,
+    /// 服务器明确要求降速（限流/Retry-After）或熔断产生的冷却：
+    /// 对所有优先级不可绕过。
+    hard_cooldown_until: Option<Instant>,
+    /// 瞬态网络失败（超时/连接/5xx）的本地退避：Submission 豁免——
+    /// 冲刺期一次超时不应挡住紧随其后的提交；限流与熔断仍然全局生效。
+    soft_cooldown_until: Option<Instant>,
     circuit: Circuit,
     rate_limit_events: VecDeque<Instant>,
     request_events: VecDeque<Instant>,
@@ -120,7 +127,7 @@ impl Drop for RequestPermit {
         ) {
             let until = now + governor.policy.circuit_cooldown;
             state.circuit = Circuit::Open { until };
-            state.cooldown_until = Some(until);
+            state.hard_cooldown_until = Some(until);
             state.burst_mode = false;
         }
         drop(state);
@@ -155,8 +162,18 @@ impl Default for RequestGovernor {
 }
 
 impl RequestGovernor {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    /// 治理状态必须跨 client 重建存活：每次登录、会话失效重登都会重建
+    /// EamsClient，若限流冷却、熔断与 429 历史随旧实例丢弃，反复点击登录
+    /// 即可绕过全部退避。因此按 origin 维护进程级共享 governor，同源的新
+    /// client 继续沿用旧状态。
+    pub(crate) fn shared_for_origin(origin: &str) -> Arc<Self> {
+        static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<RequestGovernor>>>> = OnceLock::new();
+        REGISTRY
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .entry(origin.to_string())
+            .or_default()
+            .clone()
     }
 
     fn with_policy(policy: GovernorPolicy) -> Self {
@@ -169,7 +186,8 @@ impl RequestGovernor {
                 next_id: 1,
                 next_sequence: 1,
                 waiters: Vec::new(),
-                cooldown_until: None,
+                hard_cooldown_until: None,
+                soft_cooldown_until: None,
                 circuit: Circuit::Closed,
                 rate_limit_events: VecDeque::new(),
                 request_events: VecDeque::new(),
@@ -272,7 +290,7 @@ impl RequestGovernor {
                     .map(|waiter| waiter.id);
                 if top != Some(id) {
                     Some(Duration::from_millis(25))
-                } else if let Some(until) = self.blocked_until(&state, now) {
+                } else if let Some(until) = self.blocked_until(&state, now, priority) {
                     Some(until.saturating_duration_since(now))
                 } else if matches!(state.circuit, Circuit::HalfOpen { probe_id: Some(_) }) {
                     Some(Duration::from_millis(25))
@@ -328,7 +346,8 @@ impl RequestGovernor {
         {
             state.circuit = Circuit::Closed;
             state.rate_limit_events.clear();
-            state.cooldown_until = None;
+            state.hard_cooldown_until = None;
+            state.soft_cooldown_until = None;
         }
         drop(state);
         self.notify.notify_waiters();
@@ -405,7 +424,7 @@ impl RequestGovernor {
             };
             let until = now + cooldown;
             state.circuit = Circuit::Open { until };
-            state.cooldown_until = Some(until);
+            state.hard_cooldown_until = Some(until);
             state.burst_mode = false;
             drop(state);
             self.notify.notify_waiters();
@@ -414,11 +433,14 @@ impl RequestGovernor {
 
         let advice = if let Some(delay) = retry_delay {
             let until = now + delay;
-            state.cooldown_until = Some(
-                state
-                    .cooldown_until
-                    .map_or(until, |current| current.max(until)),
-            );
+            // 限流冷却（服务器明确要求降速）全局不可绕过；其余瞬态网络
+            // 失败只做本地退避，Submission 可豁免（见 blocked_until）。
+            let slot = if kind == BackendErrorKind::RateLimited {
+                &mut state.hard_cooldown_until
+            } else {
+                &mut state.soft_cooldown_until
+            };
+            *slot = Some(slot.map_or(until, |current| current.max(until)));
             RetryAdvice::Cooldown(delay)
         } else {
             RetryAdvice::None
@@ -437,7 +459,8 @@ impl RequestGovernor {
             .first_request_at
             .map(|first| now.duration_since(first).as_secs_f64().clamp(1.0, 60.0))
             .unwrap_or(60.0);
-        let cooldown_until = self.blocked_until(&state, now);
+        // 快照取 Refresh 视角（软+硬冷却全部计入），供监控循环计算等待。
+        let cooldown_until = self.blocked_until(&state, now, RequestPriority::Refresh);
         NetworkSnapshot {
             requests_per_second: state.request_events.len() as f64 / denominator,
             latency_ewma_ms: state.latency_ewma_ms,
@@ -457,7 +480,16 @@ impl RequestGovernor {
 
     #[cfg(test)]
     pub(crate) fn clear_cooldown_for_tests(&self) {
-        self.state.lock().cooldown_until = None;
+        let mut state = self.state.lock();
+        state.hard_cooldown_until = None;
+        state.soft_cooldown_until = None;
+        drop(state);
+        self.notify.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cooldown_for_tests(&self, duration: Duration) {
+        self.state.lock().hard_cooldown_until = Some(Instant::now() + duration);
         self.notify.notify_waiters();
     }
 
@@ -478,21 +510,27 @@ impl RequestGovernor {
     fn advance_circuit(&self, state: &mut GovernorState, now: Instant) {
         if matches!(state.circuit, Circuit::Open { until } if now >= until) {
             state.circuit = Circuit::HalfOpen { probe_id: None };
-            state.cooldown_until = None;
+            state.hard_cooldown_until = None;
         }
     }
 
-    fn blocked_until(&self, state: &GovernorState, now: Instant) -> Option<Instant> {
-        let cooldown = state.cooldown_until.filter(|until| *until > now);
+    fn blocked_until(
+        &self,
+        state: &GovernorState,
+        now: Instant,
+        priority: RequestPriority,
+    ) -> Option<Instant> {
+        let hard = state.hard_cooldown_until.filter(|until| *until > now);
+        // 本地退避只约束轮询类请求：一次超时/连接失败不应把同轮里
+        // 紧随其后的提交也挡住（限流与熔断仍走 hard/circuit 全局生效）。
+        let soft = state
+            .soft_cooldown_until
+            .filter(|until| *until > now && priority != RequestPriority::Submission);
         let circuit = match state.circuit {
             Circuit::Open { until } if until > now => Some(until),
             _ => None,
         };
-        match (cooldown, circuit) {
-            (Some(left), Some(right)) => Some(left.max(right)),
-            (Some(until), None) | (None, Some(until)) => Some(until),
-            (None, None) => None,
-        }
+        [hard, soft, circuit].into_iter().flatten().max()
     }
 
     fn prune_request_events(&self, state: &mut GovernorState, now: Instant) {
@@ -669,6 +707,51 @@ mod tests {
             assert_eq!(snapshot.last_error_kind, Some(BackendErrorKind::Business));
             assert_eq!(snapshot.circuit_status, CircuitStatus::Closed);
         });
+    }
+
+    #[test]
+    fn shared_governor_is_reused_per_origin() {
+        let first = RequestGovernor::shared_for_origin("https://registry-a.test:443");
+        let second = RequestGovernor::shared_for_origin("https://registry-a.test:443");
+        let other = RequestGovernor::shared_for_origin("https://registry-b.test:443");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn transient_failure_cooldown_exempts_submission_but_not_refresh() {
+        runtime().block_on(async {
+            let governor = Arc::new(RequestGovernor::with_policy(test_policy()));
+            let failed = governor.acquire(RequestPriority::Submission).await;
+            governor.record_failure(&failed, BackendErrorKind::Timeout, None);
+
+            // 本地退避首档为 2s：不得挡住同轮里紧随其后的另一次提交。
+            let started = Instant::now();
+            let next = governor.acquire(RequestPriority::Submission).await;
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "submission was blocked by a transient local backoff"
+            );
+            governor.record_success(&next);
+
+            // 轮询类请求仍要遵守本地退避。
+            let blocked = tokio::time::timeout(
+                Duration::from_millis(50),
+                governor.acquire(RequestPriority::Refresh),
+            )
+            .await;
+            assert!(blocked.is_err(), "refresh must honour the local backoff");
+        });
+    }
+
+    #[test]
+    fn production_retry_ceiling_matches_the_parse_layer() {
+        // parse_retry_after_secs 将 Retry-After 钳到 300s；治理层不得再截短，
+        // 否则会在服务器要求的冷却结束前重试。
+        assert_eq!(
+            GovernorPolicy::default().retry_max,
+            Duration::from_secs(300)
+        );
     }
 
     #[test]
@@ -868,7 +951,7 @@ mod tests {
     #[test]
     fn production_budget_honors_normal_and_burst_steady_rates() {
         runtime().block_on(async {
-            let governor = RequestGovernor::new();
+            let governor = Arc::new(RequestGovernor::default());
 
             // Drain the documented instantaneous capacity first. The following
             // tokens must then arrive at no more than the steady 6 req/s budget.
