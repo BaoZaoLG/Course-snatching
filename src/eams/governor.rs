@@ -411,12 +411,24 @@ impl RequestGovernor {
             kind,
             BackendErrorKind::Business | BackendErrorKind::AuthExpired | BackendErrorKind::Parse
         );
-        let half_open_failed = permit.half_open_probe
-            && link_level_failure
+        let is_current_probe = permit.half_open_probe
             && matches!(
                 state.circuit,
                 Circuit::HalfOpen { probe_id: Some(id) } if id == permit.id
             );
+        let half_open_failed = is_current_probe && link_level_failure;
+        if is_current_probe && !link_level_failure {
+            // 探针必须有归宿，否则熔断会永久停在 HalfOpen{probe_id:Some}：
+            // `resolved` 已置位所以 Drop 不再兜底，而 acquire 见到这个状态只会
+            // 每 25ms 重试——全进程网络请求无限排队，只能重启程序。
+            //
+            // 归宿是「关闭」而不是「放回半开」：拿到干净的 HTTP 200、只是业务
+            // 被拒，本来就证明链路是通的，与 record_success 同一判断。
+            state.circuit = Circuit::Closed;
+            state.rate_limit_events.clear();
+            state.hard_cooldown_until = None;
+            state.soft_cooldown_until = None;
+        }
         let threshold_reached = kind == BackendErrorKind::RateLimited
             && state.rate_limit_events.len() >= self.policy.rate_limit_threshold;
 
@@ -1131,6 +1143,19 @@ mod tests {
                 CircuitStatus::Open,
                 "the circuit must not slam shut right when we are recovering"
             );
+            // 探针必须有归宿。只断言「没重新熔断」是不够的——把探针留在
+            // HalfOpen{probe_id:Some} 同样不算熔断，但会让后续每一个请求
+            // 无限排队。必须真的能再拿到许可。
+            let resumed = tokio::time::timeout(
+                Duration::from_millis(500),
+                governor.acquire(RequestPriority::Refresh),
+            )
+            .await;
+            assert!(
+                resumed.is_ok(),
+                "a business rejection must not strand the probe and hang every later request"
+            );
+            governor.record_success(&resumed.unwrap());
 
             // 链路失败：仍然重开整轮冷却。
             let governor = Arc::new(RequestGovernor::with_policy(test_policy()));
