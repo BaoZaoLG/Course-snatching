@@ -234,7 +234,18 @@ impl Lesson {
 
 #[derive(Debug, Clone)]
 pub enum ElectResult {
-    Success { detail: String },
-    Full { detail: String },
-    Failed { detail: String },
+    Success {
+        detail: String,
+    },
+    Full {
+        detail: String,
+    },
+    /// 服务器瞬态繁忙或结果暂不可判定（“系统繁忙，请稍后再试”等）：
+    /// 非终态，目标保留在监控队列中下一轮重试。
+    Busy {
+        detail: String,
+    },
+    Failed {
+        detail: String,
+    },
 }

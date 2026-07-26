@@ -68,8 +68,17 @@ impl EamsClient {
         normalize_base(raw).is_ok_and(|url| url == self.base)
     }
 
-    pub(super) fn save_debug(&self, name: &str, content: &str) -> bool {
-        self.debug_dump_enabled && save_debug_text(name, content).is_ok()
+    /// 调试转储可达 12MB 且伴随目录扫描；worker runtime 只有 2 个线程，
+    /// 同步写盘会阻塞选课提交与定时器，因此移到阻塞线程池执行。
+    pub(super) async fn save_debug(&self, name: &str, content: &str) -> bool {
+        if !self.debug_dump_enabled {
+            return false;
+        }
+        let name = name.to_string();
+        let content = content.to_string();
+        tokio::task::spawn_blocking(move || save_debug_text(&name, &content).is_ok())
+            .await
+            .unwrap_or(false)
     }
 
     pub(super) fn url(&self, path: &str) -> Result<Url> {
@@ -160,7 +169,7 @@ impl EamsClient {
                 .then_with(|| left.0.cmp(&right.0))
         });
 
-        self.save_debug("profiles_probe.txt", &debug_blob);
+        self.save_debug("profiles_probe.txt", &debug_blob).await;
         Ok(out)
     }
 
@@ -252,7 +261,8 @@ impl EamsClient {
             .map(|(_, text)| text)
             .unwrap_or_default();
         if score_elect_page(&best) < 200 {
-            self.save_debug(&format!("enter_profile_{pid}.html"), &best);
+            self.save_debug(&format!("enter_profile_{pid}.html"), &best)
+                .await;
         }
         if best.is_empty() {
             return Err(last_error
@@ -344,9 +354,10 @@ impl EamsClient {
             Ok(lessons) => lessons,
             Err(_error) => {
                 self.profile_context.lock().remove(pid);
-                let saved = self.save_debug("lessons_last.html", &data_text);
+                let saved = self.save_debug("lessons_last.html", &data_text).await;
                 if !entered.is_empty() {
-                    self.save_debug(&format!("fetch_enter_{pid}.html"), &entered);
+                    self.save_debug(&format!("fetch_enter_{pid}.html"), &entered)
+                        .await;
                 }
                 let hint = if saved {
                     "，原始响应已保存到用户数据目录的 debug/lessons_last.html"
@@ -421,9 +432,10 @@ impl EamsClient {
 
         if lessons.is_empty() {
             self.profile_context.lock().remove(pid);
-            self.save_debug("lessons_last.html", &data_text);
+            self.save_debug("lessons_last.html", &data_text).await;
             if !entered.is_empty() {
-                self.save_debug(&format!("fetch_enter_{pid}.html"), &entered);
+                self.save_debug(&format!("fetch_enter_{pid}.html"), &entered)
+                    .await;
             }
             let hint = if self.debug_dump_enabled {
                 "，请检查用户数据目录的 debug/lessons_last.html"
@@ -478,8 +490,11 @@ impl EamsClient {
                 .verify_elect_success(pid, lesson_id, before_selected, detail)
                 .await
             {
+                // 复核存疑不终态化：真实成功被误判为失败会让 monitor 永久放弃
+                // 已选上的课；保留在监控队列里，下一轮重提交时服务器会返回
+                // “已经选过”（强成功标记）自然收敛。
                 Ok(VerifyOutcome::Rejected(reason)) => {
-                    return Ok(ElectResult::Failed { detail: reason });
+                    return Ok(ElectResult::Busy { detail: reason });
                 }
                 Ok(VerifyOutcome::Confirmed) => {
                     return Ok(ElectResult::Success {
@@ -501,8 +516,8 @@ impl EamsClient {
         Ok(result)
     }
 
-    /// 成功响应后的确认：人数上升 / 不在可选列表 / 已满 视为确认；
-    /// 若仍有余量且人数未变，且响应文案偏弱，则拒绝以免误报。
+    /// 成功响应后的确认：人数上升 / 不在可解析的课程列表 / 已满 视为确认；
+    /// 若仍有余量且人数未变，且响应文案偏弱，则标记存疑待下轮复核。
     async fn verify_elect_success(
         &self,
         profile_id: &str,
@@ -517,9 +532,9 @@ impl EamsClient {
         let data_text = self
             .get_text_with_priority(&data_path, RequestPriority::Submission)
             .await?;
-        if !data_text.contains(lesson_id) {
-            return Ok(VerifyOutcome::Confirmed);
-        }
+        // 注意：不能凭“页面不含 lesson_id 子串”就判 Confirmed——HTTP 200 的
+        // 异常壳页（如“请求参数非法”）天然不含数字 id。必须先解析出非空
+        // 课程列表，列表中确实没有该课才算确认；页面不可解析则存疑。
         let mut lessons = parse_lessons_from_page(&data_text)
             .or_else(|_| parse_lessons_js_like(&data_text))
             .or_else(|_| parse_lessons_json(&data_text))
@@ -553,7 +568,7 @@ impl EamsClient {
                 || success_detail.contains("操作成功");
             if !strong {
                 return Ok(VerifyOutcome::Rejected(
-                    "提交返回疑似成功，但人数未变化且课程仍可选，已按失败处理".into(),
+                    "提交返回疑似成功，但人数未变化且课程仍可选，下轮将复核重试".into(),
                 ));
             }
             return Ok(VerifyOutcome::Inconclusive);
@@ -611,9 +626,10 @@ mod tests {
 
     #[test]
     fn election_result_does_not_treat_failure_as_success() {
+        // “请稍后重试”是明确的重试邀请：归为可重试的 Busy，而非成功或终态失败
         assert!(matches!(
             classify_elect_response("操作未成功，请稍后重试"),
-            ElectResult::Failed { .. }
+            ElectResult::Busy { .. }
         ));
         assert!(matches!(
             classify_elect_response("选课成功"),
@@ -627,6 +643,104 @@ mod tests {
             classify_elect_response(r#"{"success":false,"message":"时间冲突"}"#),
             ElectResult::Failed { .. }
         ));
+    }
+
+    #[test]
+    fn terminal_rejections_containing_bare_full_substring_are_not_full() {
+        // 学分/门数上限类终态拒绝含裸“已满”，不能归为可重试的 Full
+        assert!(matches!(
+            classify_elect_response("本学期学分已满，不允许再选"),
+            ElectResult::Failed { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response("选课门数已满"),
+            ElectResult::Failed { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response(r#"{"success":false,"message":"学分已满，不允许再选"}"#),
+            ElectResult::Failed { .. }
+        ));
+        // 容量语境的“已满”仍是 Full，即便文案同时含“失败”
+        assert!(matches!(
+            classify_elect_response("选课失败：人数已满"),
+            ElectResult::Full { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response("名额已满"),
+            ElectResult::Full { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response(r#"{"success":false,"message":"上限人数已满"}"#),
+            ElectResult::Full { .. }
+        ));
+    }
+
+    #[test]
+    fn transient_busy_texts_are_retryable_not_terminal() {
+        assert!(matches!(
+            classify_elect_response("系统繁忙，请稍后再试"),
+            ElectResult::Busy { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response("请不要过快点击"),
+            ElectResult::Busy { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response(r#"{"success":false,"message":"系统繁忙，请稍后再试"}"#),
+            ElectResult::Busy { .. }
+        ));
+        // 明确业务拒绝不受瞬态词表误伤
+        assert!(matches!(
+            classify_elect_response("时间冲突，不允许选课"),
+            ElectResult::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn weak_success_with_unchanged_count_stays_retryable_for_reverify() {
+        // JSON success:true 但 message 无强标记，50ms 后人数未变且仍有余量：
+        // 不能终态判失败（真实成功会被永久放弃），应保留下一轮复核。
+        let submit = r#"{"success":true,"message":"提交选课申请成功"}"#;
+        let data = "var lessonJSONs=[{id:371644,no:'ABC.001',name:'Rust',teachers:'张老师',stdCount:2,limitCount:30}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:2,lc:30}}";
+        let base = serve_many(vec![submit, data, counts]);
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let result = test_runtime()
+            .block_on(client.elect_lesson("0", "371644", Some(2)))
+            .unwrap();
+        assert!(
+            matches!(&result, ElectResult::Busy { detail } if detail.contains("复核")),
+            "expected retryable busy, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_shell_page_is_inconclusive_not_confirmed() {
+        // HTTP 200 异常壳页不含数字 id，不能凭“页面不含 lesson_id”判 Confirmed
+        let base = serve_many(vec!["选课成功", "<html>请求参数非法</html>"]);
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let result = test_runtime()
+            .block_on(client.elect_lesson("0", "371644", Some(2)))
+            .unwrap();
+        assert!(
+            matches!(&result, ElectResult::Success { detail } if detail.contains("暂不确定")),
+            "expected inconclusive success, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_confirms_when_lesson_absent_from_parsed_catalog() {
+        let others = "var lessonJSONs=[{id:999888,no:'XYZ.001',name:'其他课',teachers:'李老师',stdCount:1,limitCount:2}];";
+        let counts = "window.lessonId2Counts={'999888':{sc:1,lc:2}}";
+        let base = serve_many(vec!["选课成功", others, counts]);
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let result = test_runtime()
+            .block_on(client.elect_lesson("0", "371644", Some(2)))
+            .unwrap();
+        assert!(
+            matches!(&result, ElectResult::Success { detail } if detail.contains("已二次确认")),
+            "expected confirmed success, got {result:?}"
+        );
     }
 
     #[test]

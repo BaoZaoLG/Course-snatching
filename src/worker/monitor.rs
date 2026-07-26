@@ -436,6 +436,22 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             Some(&lesson),
                         );
                     }
+                    // 瞬态繁忙/结果存疑：非终态，目标保留在 pending 中下一轮重试。
+                    Ok(ElectResult::Busy { detail }) => {
+                        consecutive_submission_errors = 0;
+                        state.log(
+                            LogLevel::Warn,
+                            format!("[{serial}] 服务器繁忙或结果待确认，下轮重试：{detail}"),
+                        );
+                        update_watch(
+                            &state,
+                            &serial,
+                            WatchState::Checking,
+                            format!("繁忙待重试：{detail}"),
+                            Some(lesson.capacity_text()),
+                            Some(&lesson),
+                        );
+                    }
                     Ok(ElectResult::Failed { detail }) => {
                         consecutive_submission_errors = 0;
                         state.log(LogLevel::Error, format!("[{serial}] 选课失败：{detail}"));
@@ -874,6 +890,43 @@ mod tests {
         assert_eq!(watch.len(), 1);
         assert_eq!(watch[0].state, WatchState::Success);
         assert!(state.worker_message.lock().contains("全部完成"));
+    }
+
+    #[test]
+    fn worker_retries_after_transient_busy_submission() {
+        let data = "var lessonJSONs=[{id:371644,no:'BSY.001',name:'Busy',teachers:'张老师',stdCount:1,limitCount:2}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:1,lc:2}}";
+        let base = serve_sequence(vec![
+            "<html>elect page</html>",
+            data,
+            counts,
+            // 第一轮提交：瞬态繁忙，目标必须保留待下一轮
+            "系统繁忙，请稍后再试",
+            data,
+            counts,
+            "选课成功",
+            // post-elect verify: empty catalog is inconclusive but still success
+            "var lessonJSONs=[];",
+        ]);
+        let state = prepared_state(&base);
+        let cfg = test_config(&base, "BSY.001");
+        start_grab(state.clone(), cfg);
+        wait_until_stopped(&state);
+
+        let watch = state.watch.lock().clone();
+        assert_eq!(watch.len(), 1);
+        assert_eq!(watch[0].state, WatchState::Success);
+        assert!(state.worker_message.lock().contains("全部完成"));
+        let logs = state
+            .logs
+            .lock()
+            .iter()
+            .map(|l| l.message.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            logs.iter().any(|m| m.contains("下轮重试")),
+            "expected busy retry log, got {logs:?}"
+        );
     }
 
     #[test]

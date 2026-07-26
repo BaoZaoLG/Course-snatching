@@ -20,6 +20,32 @@ static RE_LESSON_COUNTS: LazyLock<Regex> = LazyLock::new(|| {
         .expect("counts regex")
 });
 
+/// 容量语境的“已满”文案才算 Full（可重试）。裸“已满”也出现在
+/// “学分已满，不允许再选”“选课门数已满”等终态拒绝里，不能触发 Full。
+fn is_capacity_full_text(text: &str) -> bool {
+    ["人数已满", "名额已满", "上限人数"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// 服务器瞬态繁忙文案：高峰期以 HTTP 200 正文出现（“系统繁忙，请稍后再试”等），
+/// 命中即视为可重试，避免开抢时刻被终态放弃。词表与 worker 对 Err 路径的
+/// 限流兜底识别（限流/过快/太快/频繁/稍后）保持一致并补充繁忙类说法。
+fn is_transient_busy_text(text: &str) -> bool {
+    [
+        "稍后",
+        "繁忙",
+        "系统忙",
+        "限流",
+        "过快",
+        "太快",
+        "频繁",
+        "人数过多",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
 pub(crate) fn classify_elect_response(text: &str) -> ElectResult {
     let summary = summarize_html(text);
     if let Ok(value) = serde_json::from_str::<Value>(text) {
@@ -29,19 +55,26 @@ pub(crate) fn classify_elect_response(text: &str) -> ElectResult {
             return ElectResult::Success { detail };
         }
         if value.get("success").and_then(Value::as_bool) == Some(false) {
-            if detail.contains("已满") || detail.contains("上限人数") {
+            if is_capacity_full_text(&detail) {
                 return ElectResult::Full { detail };
+            }
+            if is_transient_busy_text(&detail) {
+                return ElectResult::Busy { detail };
             }
             return ElectResult::Failed { detail };
         }
     }
 
-    if text.contains("上限人数已满") || text.contains("人数已满") || text.contains("已满")
-    {
+    if is_capacity_full_text(text) {
         return ElectResult::Full { detail: summary };
     }
     if text.contains("已经选过") || text.contains("已选过") {
         return ElectResult::Success { detail: summary };
+    }
+    // 瞬态繁忙先于普通失败标记：“操作未成功，请稍后重试”这类明确邀请重试的
+    // 文案宁可多试一轮，也不要在开抢高峰被终态放弃。
+    if is_transient_busy_text(text) {
+        return ElectResult::Busy { detail: summary };
     }
     if ["失败", "未成功", "冲突", "不允许", "错误", "不可选"]
         .iter()
