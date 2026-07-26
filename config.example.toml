@@ -1,5 +1,8 @@
+# 示例配置。程序会在 %APPDATA%\Course-snatching\config.toml 自行维护同名文件，
+# 这份只用于说明字段含义；缺失字段一律回落到默认值。
 base_url = "https://example.edu/eams"
 username = ""
+# 常规轮询间隔（秒）。真正的限速由请求治理的令牌桶承担。
 interval_seconds = 1.5
 watch_serials = []
 watch_lesson_ids = {}
@@ -7,7 +10,6 @@ watch_meta = {}
 profile_id = ""
 timeout_seconds = 15
 auto_fetch_on_login = true
-debug_dump_enabled = false
 max_consecutive_errors = 5
 adaptive_interval = true
 notify_enabled = true
@@ -18,7 +20,12 @@ grab_seats_first = false
 only_available = false
 filter = ""
 first_run_ack = false
+# 开始后前 N 秒进入冲刺窗口。
 open_burst_seconds = 20
+# 冲刺窗口内的轮询间隔（秒），必须不慢于 interval_seconds。
+burst_interval_seconds = 0.2
 monitor_only = false
 schedule_enabled = false
-schedule_time = "2026-01-01 08:00:00"
+# 留空即可：程序会填入一个合理的默认时刻。这里不写死具体日期，
+# 否则示例文件一发布就是过期时刻。
+schedule_time = ""

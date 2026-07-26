@@ -636,7 +636,22 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                 && !burst_aborted_by_circuit
                 && !client.circuit_is_open()
                 && tokio::time::Instant::now() < burst_deadline;
-            let desired_period = poll_delay_for_mode(effective_interval, in_burst);
+            // 冲刺结束后线性回落，而不是断崖式切回常规间隔。
+            let burst_progress = if in_burst {
+                0.0
+            } else if burst_secs == 0 || burst_aborted_by_circuit {
+                1.0
+            } else {
+                let since_end = tokio::time::Instant::now()
+                    .saturating_duration_since(burst_deadline)
+                    .as_secs_f64();
+                (since_end / BURST_RAMP_SECS).clamp(0.0, 1.0)
+            };
+            let desired_period = poll_delay_for_mode(
+                effective_interval,
+                cfg.burst_interval_seconds,
+                burst_progress,
+            );
             // 提交路径设置的服务器冷却也在轮末等待中兑现：让等待可见、
             // 可取消，而不是下一轮请求在 acquire 里被无提示地阻塞。
             let cooldown_wait = client.network_snapshot().cooldown_remaining;
@@ -815,18 +830,39 @@ fn mark_pending_stopped(state: &SharedState, pending: &HashSet<String>) {
 }
 
 /// `burst`: use the base interval without jitter during the open-course sprint window.
-fn poll_delay_for_mode(interval_seconds: f64, burst: bool) -> Duration {
-    let base = interval_seconds.clamp(0.05, 30.0);
-    if burst {
-        return Duration::from_secs_f64(base);
-    }
+/// 冲刺结束后回落到常规间隔所用的秒数。
+///
+/// 不硬切：速率断崖（10 rps 瞬间掉到 0.7 rps）比平滑回落更容易被服务端
+/// 的行为风控识别出来。
+const BURST_RAMP_SECS: f64 = 3.0;
+
+/// 计算下一轮的轮询周期。
+///
+/// `burst_progress` 是从冲刺回落到常规的进度：0.0 表示仍在冲刺窗口内，
+/// 1.0 表示已完全回到用户设定的间隔。
+///
+/// 冲刺此前唯一的差别是去掉 0–10% 的正抖动，即最多快 10%——默认 1.5s 间隔下，
+/// 20 秒的「冲刺窗口」只轮询约 13 次，令牌桶的 10 rps 上限永远碰不到，
+/// 整段限速余量被浪费。现在冲刺有独立的（更短的）间隔，令牌桶才真正成为
+/// 限流点。
+fn poll_delay_for_mode(
+    interval_seconds: f64,
+    burst_interval_seconds: f64,
+    burst_progress: f64,
+) -> Duration {
+    let interval = interval_seconds.clamp(0.05, 30.0);
+    // 冲刺间隔不得慢于常规间隔，否则「冲刺」反而是减速。
+    let burst_interval = burst_interval_seconds.clamp(0.05, 30.0).min(interval);
+    let progress = burst_progress.clamp(0.0, 1.0);
+    let base = burst_interval + (interval - burst_interval) * progress;
+    // 抖动只向正方向：绝不比用户设定的间隔更快。真正的限速由令牌桶承担，
+    // 这里的抖动只为让节奏不那么机械。冲刺期幅度更小，别浪费窗口。
+    let fraction = if progress < 1.0 { 0.03 } else { 0.10 };
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.subsec_nanos())
         .unwrap_or(0);
-    // 0–10% positive jitter keeps traffic less robotic without shortening the
-    // user's requested polling period.
-    let jitter = f64::from(nanos % 1001) / 10_000.0;
+    let jitter = f64::from(nanos % 1001) / 1000.0 * fraction;
     Duration::from_secs_f64((base * (1.0 + jitter)).clamp(0.05, 30.0))
 }
 
@@ -937,18 +973,55 @@ mod tests {
 
     #[test]
     fn poll_delay_is_bounded() {
+        // 常规：抖动只向正方向，绝不比用户设定的间隔更快。
         for _ in 0..100 {
-            let delay = poll_delay_for_mode(1.5, false).as_secs_f64();
-            assert!((1.5..=1.65).contains(&delay));
+            let delay = poll_delay_for_mode(1.5, 0.2, 1.0).as_secs_f64();
+            assert!((1.5..=1.65).contains(&delay), "got {delay}");
         }
         for _ in 0..100 {
-            let delay = poll_delay_for_mode(0.1, false).as_secs_f64();
+            let delay = poll_delay_for_mode(0.1, 0.05, 1.0).as_secs_f64();
             assert!((0.1..=0.11).contains(&delay), "got {delay}");
         }
-        for _ in 0..20 {
-            let burst = poll_delay_for_mode(0.1, true).as_secs_f64();
-            assert!((0.099..=0.101).contains(&burst), "burst got {burst}");
-        }
+    }
+
+    // G-01：冲刺必须真的更快。此前冲刺唯一的差别是去掉正抖动（最多快 10%），
+    // 默认 1.5s 间隔下 20 秒窗口只轮询约 13 次，令牌桶的 10 rps 永远碰不到。
+    #[test]
+    fn burst_actually_shortens_the_polling_period() {
+        let normal = poll_delay_for_mode(1.5, 0.2, 1.0);
+        let burst = poll_delay_for_mode(1.5, 0.2, 0.0);
+        assert!(
+            burst.as_secs_f64() < normal.as_secs_f64() / 5.0,
+            "burst ({burst:?}) must be far shorter than normal ({normal:?}), not ~10% faster"
+        );
+        assert!((0.2..=0.21).contains(&burst.as_secs_f64()), "got {burst:?}");
+
+        // 20 秒冲刺窗口内的轮数必须够多——这正是原实现拿不到的东西。
+        let rounds = 20.0 / burst.as_secs_f64();
+        assert!(rounds > 90.0, "only {rounds:.0} rounds in a 20s burst");
+    }
+
+    #[test]
+    fn burst_ramps_back_instead_of_falling_off_a_cliff() {
+        let burst = poll_delay_for_mode(1.5, 0.2, 0.0).as_secs_f64();
+        let mid = poll_delay_for_mode(1.5, 0.2, 0.5).as_secs_f64();
+        let normal = poll_delay_for_mode(1.5, 0.2, 1.0).as_secs_f64();
+        assert!(
+            burst < mid && mid < normal,
+            "ramp must be monotonic: {burst} -> {mid} -> {normal}"
+        );
+        // 中点大致在两端之间，说明是线性回落而不是提前跳到常规值。
+        assert!((0.8..=0.95).contains(&mid), "mid ramp got {mid}");
+    }
+
+    // 冲刺间隔配得比常规还慢时，冲刺不能反而变成减速。
+    #[test]
+    fn burst_interval_never_exceeds_the_normal_interval() {
+        let delay = poll_delay_for_mode(0.3, 5.0, 0.0).as_secs_f64();
+        assert!(
+            delay <= 0.32,
+            "burst must not be slower than normal: {delay}"
+        );
     }
 
     #[test]

@@ -578,6 +578,138 @@ mod tests {
             .unwrap()
     }
 
+    // ── T-03 并发属性测试 ─────────────────────────────────────────────
+    // governor 原有的 17 个测试全是单线程顺序断言：优先级队列、丢唤醒、
+    // half-open 竞争这些只在并发下出现的问题一个都测不到。放开提交并发
+    // （G-03）之前必须先有这层网。
+
+    /// 不变式一：任意并发压力下，实际速率不超过令牌桶配置。
+    ///
+    /// 这是「放开并发不会变成 DDoS 学校」的核心保证。
+    #[test]
+    fn concurrent_acquires_never_exceed_the_configured_rate() {
+        runtime().block_on(async {
+            let mut policy = test_policy();
+            policy.normal_requests_per_second = 20.0;
+            policy.burst_requests_per_second = 20.0;
+            policy.capacity = 4.0;
+            let governor = Arc::new(RequestGovernor::with_policy(policy));
+
+            const TOTAL: usize = 40;
+            let started = Instant::now();
+            let mut handles = Vec::new();
+            for _ in 0..TOTAL {
+                let governor = governor.clone();
+                handles.push(tokio::spawn(async move {
+                    let permit = governor.acquire(RequestPriority::Submission).await;
+                    governor.record_success(&permit);
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+            let elapsed = started.elapsed();
+            // 前 capacity 个可以瞬时放行，其余必须按 20/s 补充。
+            let minimum = Duration::from_secs_f64((TOTAL as f64 - 4.0) / 20.0);
+            assert!(
+                elapsed >= minimum.mul_f64(0.9),
+                "40 concurrent acquires finished in {elapsed:?}, faster than the {minimum:?} \
+                 the token bucket allows — the rate limit is not holding under concurrency"
+            );
+        });
+    }
+
+    /// 不变式二：hard cooldown 期间零请求通过，最高优先级也不例外。
+    ///
+    /// 服务器明确要求的降速必须全局不可绕过，否则「被限流后继续猛打」
+    /// 正是升级成封禁的路径。
+    #[test]
+    fn hard_cooldown_blocks_every_priority_including_submission() {
+        runtime().block_on(async {
+            let mut policy = test_policy();
+            policy.normal_requests_per_second = 1_000.0;
+            policy.burst_requests_per_second = 1_000.0;
+            policy.capacity = 64.0;
+            policy.retry_min = Duration::from_millis(1);
+            policy.retry_max = Duration::from_secs(300);
+            let governor = Arc::new(RequestGovernor::with_policy(policy));
+
+            let permit = governor.acquire(RequestPriority::Refresh).await;
+            let cooldown = Duration::from_millis(180);
+            governor.record_failure(&permit, BackendErrorKind::RateLimited, Some(cooldown));
+
+            let started = Instant::now();
+            let mut handles = Vec::new();
+            for priority in [
+                RequestPriority::Submission,
+                RequestPriority::Session,
+                RequestPriority::Refresh,
+                RequestPriority::KeepAlive,
+            ] {
+                let governor = governor.clone();
+                handles.push(tokio::spawn(async move {
+                    let permit = governor.acquire(priority).await;
+                    let waited = started.elapsed();
+                    governor.record_success(&permit);
+                    (priority, waited)
+                }));
+            }
+            for handle in handles {
+                let (priority, waited) = handle.await.unwrap();
+                assert!(
+                    waited >= cooldown.mul_f64(0.8),
+                    "{priority:?} slipped through a hard cooldown after only {waited:?}"
+                );
+            }
+        });
+    }
+
+    /// 不变式三：并发等待时，Submission 的等待时长永远不长于同时刻的 Refresh。
+    ///
+    /// 抢课是零和的先到先得，提交被后台刷新挡住等于直接输掉。
+    #[test]
+    fn submission_never_waits_longer_than_a_concurrent_refresh() {
+        runtime().block_on(async {
+            let mut policy = test_policy();
+            policy.normal_requests_per_second = 8.0;
+            policy.burst_requests_per_second = 8.0;
+            policy.capacity = 1.0;
+            let governor = Arc::new(RequestGovernor::with_policy(policy));
+            // 先耗光令牌，保证两个请求都要排队。
+            let warm = governor.acquire(RequestPriority::Refresh).await;
+            governor.record_success(&warm);
+
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            for _ in 0..4 {
+                let governor = governor.clone();
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    let permit = governor.acquire(RequestPriority::Refresh).await;
+                    let _ = sender.send(RequestPriority::Refresh);
+                    governor.record_success(&permit);
+                });
+            }
+            wait_for_waiters(&governor, 4).await;
+            let governor_for_submission = governor.clone();
+            let submission_sender = sender.clone();
+            tokio::spawn(async move {
+                let permit = governor_for_submission
+                    .acquire(RequestPriority::Submission)
+                    .await;
+                let _ = submission_sender.send(RequestPriority::Submission);
+                governor_for_submission.record_success(&permit);
+            });
+            drop(sender);
+
+            let first = receiver.recv().await.expect("someone must be served");
+            assert_eq!(
+                first,
+                RequestPriority::Submission,
+                "a queued submission must not wait behind background refreshes"
+            );
+        });
+    }
+
     #[test]
     fn token_bucket_waits_for_refill() {
         runtime().block_on(async {

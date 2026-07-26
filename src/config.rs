@@ -75,6 +75,13 @@ pub struct AppConfig {
     pub schedule_time: String,
     /// 开始后前 N 秒进入冲刺：更短间隔、去掉正抖动，抢开课窗口。
     pub open_burst_seconds: u32,
+    /// 冲刺期的轮询间隔（秒）。
+    ///
+    /// 冲刺此前唯一的差别只是去掉 0–10% 的正抖动，也就是最多快 10%——默认
+    /// 间隔 1.5s 时，20 秒的「冲刺窗口」只轮询约 13 次，令牌桶的 10 rps
+    /// 上限永远触发不到。真正的提速必须靠独立的冲刺间隔，让令牌桶（而不是
+    /// 用户间隔）成为限流点。
+    pub burst_interval_seconds: f64,
 }
 
 impl Default for AppConfig {
@@ -104,6 +111,7 @@ impl Default for AppConfig {
             schedule_enabled: false,
             schedule_time: default_schedule_time(),
             open_burst_seconds: 20,
+            burst_interval_seconds: 0.2,
         }
     }
 }
@@ -253,6 +261,22 @@ impl AppConfig {
             self.ui_scale = 1.0;
         }
         self.ui_scale = self.ui_scale.clamp(0.9, 1.5);
+        // normalize() 是唯一的「变安全」漏斗：所有数值不变式都在这里兜底，
+        // 免得 UI 与 worker 各兜一次还漏掉导入/手改配置的路径。
+        if !self.interval_seconds.is_finite() {
+            self.interval_seconds = 1.5;
+        }
+        self.interval_seconds = self.interval_seconds.clamp(0.05, 30.0);
+        if !self.burst_interval_seconds.is_finite() {
+            self.burst_interval_seconds = 0.2;
+        }
+        // 上限取常规间隔：冲刺比常规还慢没有意义。
+        self.burst_interval_seconds = self
+            .burst_interval_seconds
+            .clamp(0.05, self.interval_seconds.max(0.05));
+        self.open_burst_seconds = self.open_burst_seconds.min(120);
+        self.timeout_seconds = self.timeout_seconds.clamp(5, 120);
+        self.max_consecutive_errors = self.max_consecutive_errors.clamp(1, 100);
         self.filter = self.filter.trim().to_string();
     }
 
@@ -1095,6 +1119,64 @@ https://example.edu/eams?sessionId=abc&course=1";
 
         let url = redact_diagnostic_url("https://user:secret@example.edu/eams?a=1#detail");
         assert_eq!(url, "https://example.edu/eams");
+    }
+
+    // E-06：示例配置漂移过两次（教用户写一个 skip_serializing 的字段、
+    // 写死一个必然过期的日期）。用测试把它钉在真实结构上。
+    #[test]
+    fn example_config_stays_in_sync_with_the_real_struct() {
+        let text = fs::read_to_string("config.example.toml").expect("example config must exist");
+        let parsed: AppConfig = toml::from_str(&text).expect("example config must deserialize");
+        // 示例里不得出现只在会话内有效、永不写回的字段。
+        assert!(
+            !text.contains("debug_dump_enabled"),
+            "example must not teach a session-only field"
+        );
+        // 也不得写死一个必然过期的开抢时刻。
+        assert!(
+            !text.contains("schedule_time = \"20"),
+            "example must not hardcode a date that expires on release"
+        );
+        // 字段集合必须与默认配置一致：新增字段忘了同步会立刻暴露。
+        let example_keys = toml::to_string(&parsed)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim().to_string()))
+            .collect::<HashSet<_>>();
+        let default_keys = toml::to_string(&AppConfig::default())
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim().to_string()))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            example_keys, default_keys,
+            "config.example.toml drifted from AppConfig"
+        );
+    }
+
+    // 数值不变式统一收敛到 normalize()：UI 与 worker 各兜一次总会漏掉
+    // 导入/手改配置的路径。
+    #[test]
+    fn normalize_is_the_single_funnel_for_numeric_invariants() {
+        let mut cfg = AppConfig {
+            interval_seconds: f64::NAN,
+            burst_interval_seconds: 99.0,
+            open_burst_seconds: 9_999,
+            timeout_seconds: 1,
+            max_consecutive_errors: 0,
+            ui_scale: f32::INFINITY,
+            ..Default::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.interval_seconds, 1.5, "NaN interval must be repaired");
+        assert!(
+            cfg.burst_interval_seconds <= cfg.interval_seconds,
+            "burst must never be slower than normal"
+        );
+        assert_eq!(cfg.open_burst_seconds, 120);
+        assert_eq!(cfg.timeout_seconds, 5);
+        assert_eq!(cfg.max_consecutive_errors, 1);
+        assert_eq!(cfg.ui_scale, 1.0);
     }
 
     // S-02：崩溃报告曾是全项目唯一绕过脱敏的落盘路径。panic payload 只要

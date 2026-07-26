@@ -195,12 +195,33 @@ impl CourseApp {
                         self.cfg.open_burst_seconds = burst.round().clamp(0.0, 120.0) as u32;
                         dirty = true;
                     }
-                    ui.label(
-                        RichText::new("开始后前 N 秒去掉轮询正抖动，首轮不等待")
-                            .size(CAPTION_SIZE)
-                            .color(pal().muted),
-                    );
+                    ui.label(RichText::new("冲刺间隔").size(META_SIZE).color(pal().muted));
+                    let mut burst_interval = self.cfg.burst_interval_seconds;
+                    let ceiling = self.cfg.interval_seconds.max(0.05);
+                    if number_drag_f64(
+                        ui,
+                        &mut burst_interval,
+                        true,
+                        0.05..=ceiling,
+                        0.01,
+                        2,
+                        "秒",
+                        72.0,
+                    )
+                    .changed()
+                    {
+                        self.cfg.burst_interval_seconds = burst_interval.clamp(0.05, ceiling);
+                        dirty = true;
+                    }
                 });
+                ui.label(
+                    RichText::new(
+                        "冲刺窗口内按冲刺间隔轮询（首轮不等待），窗口结束后 3 秒内线性回落到常规间隔。\
+                         真正的限速由请求治理的令牌桶承担，不会因为把间隔调小就无限加压。",
+                    )
+                    .size(CAPTION_SIZE)
+                    .color(pal().muted),
+                );
 
                 if self.cfg.schedule_enabled {
                     ui.add_space(4.0);
