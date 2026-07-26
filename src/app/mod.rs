@@ -59,6 +59,33 @@ struct RedactedPages {
     unreadable: usize,
 }
 
+/// 课表派生视图缓存。
+///
+/// `key` 覆盖一切会改变结果的输入；任一不同才重算。
+#[derive(Default)]
+struct CatalogView {
+    key: CatalogViewKey,
+    /// `Arc` 让绘制侧拿走一份「所有权」只是一次引用计数自增，既不必每帧
+    /// 深拷贝，也不会把 `&self` 借用拖进需要 `&mut self` 的闭包里。
+    rows: Arc<Vec<Lesson>>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CatalogViewKey {
+    /// worker 的状态版本号：课表换了它就变。
+    revision: u64,
+    filter: String,
+    only_available: bool,
+    sort: u8,
+}
+
+/// 配置落盘去抖窗口（秒）。拖滑块期间只在停手后写一次。
+///
+/// 必须长到能吃掉一次连续拖动（60 帧 ≈ 1 秒里只写一次），又短到用户改完
+/// 随手关窗口也不会丢——退出时 `flush_config_now` 会同步补写。
+const CONFIG_FLUSH_DEBOUNCE: f64 = 0.6;
+const _: () = assert!(CONFIG_FLUSH_DEBOUNCE > 0.3 && CONFIG_FLUSH_DEBOUNCE < 3.0);
+
 /// 一次性操作结果的显示时长（秒）。错误留久一点，用户往往正在读它。
 const TRANSIENT_STATUS_TTL: f64 = 6.0;
 const TRANSIENT_ERROR_TTL: f64 = 12.0;
@@ -151,6 +178,12 @@ pub struct CourseApp {
     filter: String,
     only_available: bool,
     status: StatusBar,
+    /// 课表派生视图（过滤 + 排序）的缓存。
+    catalog_view: CatalogView,
+    /// 配置有未落盘的改动。
+    config_dirty: bool,
+    /// 最近一次改动的帧时间，用于去抖。
+    config_dirty_since: f64,
     show_logs: bool,
     show_advanced: bool,
     was_logged_in: bool,
@@ -183,6 +216,12 @@ impl CourseApp {
         cc.egui_ctx
             .set_pixels_per_point(cfg.ui_scale.clamp(0.9, 1.5));
         let state = SharedState::new();
+        // 状态一变就叫醒界面：worker 里几十处 touch() 此前是纯开销（revision
+        // 只写不读），而抢课成功这类关键事件最坏要等 400ms 空闲档才反映。
+        {
+            let ctx = cc.egui_ctx.clone();
+            state.set_repaint_waker(Arc::new(move || ctx.request_repaint()));
+        }
         if let Some(warning) = &config_warning {
             state.log(LogLevel::Warn, warning.clone());
         }
@@ -202,6 +241,8 @@ impl CourseApp {
             status: StatusBar::new(
                 config_warning.unwrap_or_else(|| "登录后刷新课程，从课表加入监控".into()),
             ),
+            config_dirty: false,
+            config_dirty_since: 0.0,
             show_logs: true,
             show_advanced: false,
             was_logged_in: false,
@@ -210,6 +251,7 @@ impl CourseApp {
             titlebar_dark: None,
             log_filter: LogFilter::All,
             catalog_sort: CatalogSort::Default,
+            catalog_view: CatalogView::default(),
             toast: None,
             confirm_logout: false,
             confirm_clear_logs: false,
@@ -228,6 +270,8 @@ impl eframe::App for CourseApp {
     fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // transient 状态的 TTL 判定要用同一个时基，先推进本帧时间。
         self.status.tick(root_ui.input(|input| input.time));
+        // 去抖窗口到了就把配置写下去（在后台线程）。
+        self.flush_config_if_due();
         if !self.window_backdrop_attempted {
             self.window_backdrop_attempted = true;
             configure_window_backdrop(frame);
@@ -274,16 +318,22 @@ impl eframe::App for CourseApp {
                     let now = worker::local_now_seconds();
                     now <= target + 2 && target - now <= 120
                 });
-        ctx.request_repaint_after(std::time::Duration::from_millis(
-            if running || logging_in || refreshing {
-                50
-            } else if schedule_soon {
-                // Sub-frame wake while armed so UI countdown stays honest; precise fire is worker-side.
-                30
-            } else {
-                400
-            },
-        ));
+        // 兜底唤醒。真正的状态变更由 worker 通过 repaint waker 主动叫醒
+        // （见 SharedState::touch），这里只负责动画与倒计时这类「没有事件
+        // 也需要走时间」的东西。空闲时不再以 2.5fps 无条件重绘并重跑整套
+        // 派生视图计算。
+        ctx.request_repaint_after(std::time::Duration::from_millis(if schedule_soon {
+            // 待命末段：亚帧唤醒让倒计时诚实（精确触发在 worker 侧）。
+            30
+        } else if running || logging_in || refreshing {
+            // 运行时有脉冲动画（status_dot）要走，但数据更新靠事件。
+            200
+        } else if self.toast.is_some() || self.status.showing_error() {
+            // 有 TTL 的东西在显示：到期要能自己消失。
+            500
+        } else {
+            2_000
+        }));
 
         // Alerts are only queued when notify_enabled was on at dispatch time.
         for alert in crate::notify::take_alerts() {
@@ -360,6 +410,8 @@ impl eframe::App for CourseApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 去抖窗口里可能还压着一次未落盘的配置改动，退出这一刻必须同步写完。
+        self.flush_config_now();
         self.password.zeroize();
         self.password.clear();
         worker::logout(&self.state);
@@ -1398,30 +1450,13 @@ impl CourseApp {
                     });
                     ui.add_space(12.0);
 
-                    let lessons = self.state.lessons.lock().clone();
-                    let filter = self.filter.trim().to_lowercase();
-                    let filtered: Vec<Lesson> = lessons
-                        .into_iter()
-                        .filter(|lesson| {
-                            if self.only_available && !lesson.has_seat() {
-                                return false;
-                            }
-                            filter.is_empty()
-                                || lesson.no.to_lowercase().contains(&filter)
-                                || lesson.name.to_lowercase().contains(&filter)
-                                || lesson.teachers.to_lowercase().contains(&filter)
-                        })
-                        .collect();
-                    let mut filtered = filtered;
-                    match self.catalog_sort {
-                        CatalogSort::Default => {}
-                        CatalogSort::SeatsFirst => {
-                            filtered.sort_by_key(|lesson| !lesson.has_seat());
-                        }
-                        CatalogSort::Name => {
-                            filtered.sort_by(|a, b| a.name.cmp(&b.name));
-                        }
-                    }
+                    // 派生视图缓存：只有课表本身（revision）或筛选/排序条件
+                    // 变了才重算。running 时重绘间隔曾是 50ms，即每秒约 20 次
+                    // 把整张课表深拷贝、逐条 to_lowercase 再排序——既是 CPU 与
+                    // allocator 压力，也让 UI 线程和抢课网络线程争抢同一把锁，
+                    // 而 worker runtime 只有 2 个线程。
+                    self.refresh_catalog_view();
+                    let filtered = self.catalog_view.rows.clone();
                     // persist search text lightly
                     if self.cfg.filter != self.filter {
                         self.cfg.filter = self.filter.clone();
@@ -2069,14 +2104,95 @@ impl CourseApp {
         self.status.showing_error()
     }
 
+    /// 重算课表派生视图——但只在输入真的变了的时候。
+    fn refresh_catalog_view(&mut self) {
+        let key = CatalogViewKey {
+            revision: self.state.revision(),
+            filter: self.filter.trim().to_lowercase(),
+            only_available: self.only_available,
+            sort: self.catalog_sort as u8,
+        };
+        if self.catalog_view.key == key {
+            return;
+        }
+        let filter = key.filter.clone();
+        let only_available = key.only_available;
+        // 只在这一处对课表加锁并克隆；此前是每帧一次（外加同帧第二次加锁
+        // 只为取 len()）。UI 持锁期间 worker 的 update_watch 会直接阻塞一个
+        // tokio worker 线程，正好发生在延迟最敏感的时刻。
+        let mut rows: Vec<Lesson> = self
+            .state
+            .lessons
+            .lock()
+            .iter()
+            .filter(|lesson| {
+                if only_available && !lesson.has_seat() {
+                    return false;
+                }
+                filter.is_empty()
+                    || lesson.no.to_lowercase().contains(&filter)
+                    || lesson.name.to_lowercase().contains(&filter)
+                    || lesson.teachers.to_lowercase().contains(&filter)
+            })
+            .cloned()
+            .collect();
+        match self.catalog_sort {
+            CatalogSort::Default => {}
+            CatalogSort::SeatsFirst => rows.sort_by_key(|lesson| !lesson.has_seat()),
+            CatalogSort::Name => rows.sort_by(|a, b| a.name.cmp(&b.name)),
+        }
+        self.catalog_view = CatalogView {
+            key,
+            rows: Arc::new(rows),
+        };
+    }
+
+    /// 记录配置变更。
+    ///
+    /// 只标脏、不落盘。`AppConfig::save` 是 create_dir_all、序列化、临时文件、
+    /// `sync_all()`、原子替换的组合，全程同步跑在 UI 线程上；拖动「间隔」滑块
+    /// 或敲搜索框时它每帧触发一次，而 `sync_all` 是真正的磁盘刷写——机械盘或
+    /// 被杀软实时扫描的机器上会造成可感知的卡顿。
+    ///
+    /// 内存里的运行配置立刻发布（定时开抢到点读的是它），落盘去抖后在后台
+    /// 线程完成。
     fn save_config(&mut self) {
-        // 同步最新运行配置：定时开抢到点用它开抢，而不是 arm 时刻的快照。
         self.state.publish_config(self.cfg.clone());
+        self.config_dirty = true;
+        self.config_dirty_since = self.status.now;
+    }
+
+    /// 每帧检查是否该把标脏的配置真正写下去。
+    fn flush_config_if_due(&mut self) {
+        if !self.config_dirty {
+            return;
+        }
+        if self.status.now - self.config_dirty_since < CONFIG_FLUSH_DEBOUNCE {
+            return;
+        }
+        self.config_dirty = false;
+        let cfg = self.cfg.clone();
+        // 写盘搬到后台线程：即便去抖后仍有一次 sync_all，也不该卡住这一帧。
+        // 失败要能告诉用户，所以把结果送回共享状态。
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = cfg.save() {
+                let message = format!("配置保存失败：{error:#}");
+                state.set_message(message.clone());
+                state.log(LogLevel::Error, message);
+            }
+        });
+    }
+
+    /// 退出前把未落盘的配置同步写下去——这一刻不能再去抖。
+    fn flush_config_now(&mut self) {
+        if !self.config_dirty {
+            return;
+        }
+        self.config_dirty = false;
         if let Err(error) = self.cfg.save() {
-            let message = format!("配置保存失败：{error:#}");
-            self.set_status(message.clone());
-            self.state.set_message(message.clone());
-            self.state.log(LogLevel::Error, message);
+            self.state
+                .log(LogLevel::Error, format!("退出前保存配置失败：{error:#}"));
         }
     }
 
@@ -2397,6 +2513,36 @@ mod tests {
                 });
             });
         });
+    }
+
+    // U-02：派生视图缓存的正确性全靠这把 key——漏掉任何一个输入，界面就会
+    // 显示过期结果（比如课表刷新了却还画着旧行）。
+    #[test]
+    fn catalog_view_key_covers_every_input_that_changes_the_result() {
+        let base = || CatalogViewKey {
+            revision: 7,
+            filter: "rust".into(),
+            only_available: true,
+            sort: CatalogSort::Name as u8,
+        };
+        assert_eq!(base(), base(), "identical inputs must hit the cache");
+
+        // worker 的课表一变，revision 就变，缓存必须失效。
+        let mut moved = base();
+        moved.revision = 8;
+        assert_ne!(base(), moved, "a catalog refresh must invalidate the cache");
+
+        let mut refiltered = base();
+        refiltered.filter = "java".into();
+        assert_ne!(base(), refiltered);
+
+        let mut toggled = base();
+        toggled.only_available = false;
+        assert_ne!(base(), toggled);
+
+        let mut resorted = base();
+        resorted.sort = CatalogSort::SeatsFirst as u8;
+        assert_ne!(base(), resorted);
     }
 
     // U-01：后台心跳每帧刷新，绝不能盖掉用户刚触发的一次性提示。

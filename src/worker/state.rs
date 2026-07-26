@@ -100,6 +100,8 @@ pub struct SharedState {
     pub(crate) latest_config: Mutex<Option<AppConfig>>,
     /// 本次会话保留的登录凭据（仅内存、永不落盘），用于会话过期后自动重登。
     pub(crate) credentials: Mutex<Option<super::session::SessionCredentials>>,
+    /// 界面唤醒回调：状态一变就叫醒 UI，取代固定频率的无条件重绘。
+    repaint_waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub logs: Mutex<VecDeque<LogItem>>,
     pub lessons: Mutex<Vec<Lesson>>,
     pub watch: Mutex<Vec<WatchStatus>>,
@@ -125,6 +127,7 @@ impl SharedState {
             schedule_fired_key: Mutex::new(None),
             latest_config: Mutex::new(None),
             credentials: Mutex::new(None),
+            repaint_waker: Mutex::new(None),
             logs: Mutex::new(VecDeque::new()),
             lessons: Mutex::new(Vec::new()),
             watch: Mutex::new(Vec::new()),
@@ -264,8 +267,30 @@ impl SharedState {
         client.map_or_else(NetworkSnapshot::default, |client| client.network_snapshot())
     }
 
+    /// 注册界面唤醒回调。
+    ///
+    /// 用回调而不是直接存 `egui::Context`，是为了让 worker 这一层保持与 UI
+    /// 无关；界面在启动时注册一次即可。
+    pub fn set_repaint_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) {
+        *self.repaint_waker.lock() = Some(waker);
+    }
+
+    /// 状态有变。
+    ///
+    /// `revision` 此前只写不读（全仓无任何读取点），worker 里几十处 touch()
+    /// 都是纯开销；界面则以固定频率无条件重绘。现在改为事件化：状态一变就
+    /// 叫醒界面，界面在空闲时可以真的空闲。
     pub(crate) fn touch(&self) {
         self.revision.fetch_add(1, Ordering::Relaxed);
+        let waker = self.repaint_waker.lock().clone();
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    /// 当前状态版本号。界面用它做脏检查，避免每帧重算派生视图。
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
     }
 
     pub(crate) fn is_current_run(&self, generation: u64) -> bool {
