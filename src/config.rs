@@ -688,12 +688,33 @@ static RE_REDACT_HIDDEN_TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
 
 pub fn redact_diagnostic_url(raw: &str) -> String {
     let Ok(mut url) = Url::parse(raw) else {
-        return raw.split('?').next().unwrap_or_default().to_string();
+        // 兜底同样要剥分号：Servlet 系统里路径分号后面几乎总是 jsessionid。
+        return raw
+            .split(['?', '#', ';'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
     };
     let _ = url.set_username("");
     let _ = url.set_password(None);
     url.set_query(None);
     url.set_fragment(None);
+    // Servlet 的 URL 重写把会话标识以矩阵参数嵌在路径里
+    // （/eams/home.action;jsessionid=…），既不在 query 也不在 fragment，
+    // 上面四步全碰不到它——而用户恰恰常从登录态的地址栏复制出这种地址。
+    // 整段剥掉每个路径段的分号后缀而不只认 jsessionid：矩阵参数在诊断包里
+    // 没有任何正当用途。
+    if url.path().contains(';') {
+        let cleaned = url.path_segments().map(|segments| {
+            segments
+                .map(|segment| segment.split(';').next().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("/")
+        });
+        if let Some(cleaned) = cleaned {
+            url.set_path(&cleaned);
+        }
+    }
     url.to_string()
 }
 
@@ -1256,6 +1277,27 @@ https://example.edu/eams?sessionId=abc&course=1";
 
         let url = redact_diagnostic_url("https://user:secret@example.edu/eams?a=1#detail");
         assert_eq!(url, "https://example.edu/eams");
+    }
+
+    /// Servlet 的 URL 重写把 jsessionid 以矩阵参数嵌进路径——用户从登录态
+    /// 地址栏复制的地址就长这样，它不在 query 也不在 fragment。
+    #[test]
+    fn diagnostic_url_strips_matrix_parameters_from_path() {
+        let url = redact_diagnostic_url(
+            "https://jw.example.edu/eams/homeExt.action;jsessionid=8D2AFE12C34?x=1",
+        );
+        assert_eq!(url, "https://jw.example.edu/eams/homeExt.action");
+
+        // 每一段路径的分号后缀都要剥，不只最后一段。
+        let url = redact_diagnostic_url(
+            "https://jw.example.edu/eams;jsessionid=AAA/home.action;jsessionid=BBB",
+        );
+        assert!(!url.contains("AAA") && !url.contains("BBB"), "{url}");
+        assert_eq!(url, "https://jw.example.edu/eams/home.action");
+
+        // 解析失败的兜底路径同样不能放过分号后缀。
+        let url = redact_diagnostic_url("not a url;jsessionid=CCC?x=1");
+        assert!(!url.contains("CCC"), "{url}");
     }
 
     // E-06：示例配置漂移过两次（教用户写一个 skip_serializing 的字段、
