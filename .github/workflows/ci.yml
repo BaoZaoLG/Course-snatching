@@ -77,7 +77,7 @@ jobs:
           $msrv = $meta.packages[0].rust_version
           if (-not $msrv) { throw "Cargo.toml 缺少 rust-version" }
           "version=$msrv" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master：MSRV job 传显式 toolchain，不该钉在某个版本分支上
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # master：MSRV job 传显式 toolchain，不该钉在某个版本分支上
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
