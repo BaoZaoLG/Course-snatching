@@ -72,10 +72,10 @@ pub use types::{
 
 use crate::eams::parse::{
     classify_elect_response, extract_all_profile_ids, extract_profiles_detailed,
-    extract_project_semester, merge_lesson_counts, normalize_base, page_looks_like_elect_ui,
-    parse_catalog_with_strategy, parse_lessons_from_html_table, parse_lessons_from_page,
-    parse_lessons_js_like, parse_lessons_json, plausible_profile_id, save_debug_text,
-    score_elect_page, validate_numeric_id, VerifyOutcome,
+    extract_project_semester, has_drop_control, merge_lesson_counts, normalize_base,
+    page_looks_like_elect_ui, parse_catalog_with_strategy, parse_lessons_from_html_table,
+    parse_lessons_from_page, parse_lessons_js_like, parse_lessons_json, plausible_profile_id,
+    save_debug_text, score_elect_page, validate_numeric_id, VerifyOutcome,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
@@ -199,6 +199,14 @@ impl EamsClient {
                 .await
             {
                 Ok(text) => {
+                    // 「解析成功且非空」不能当验收标准：候选表里的
+                    // defaultPage / innerIndex / stdElectCourse 本身就是**选课
+                    // 目录页**，它们用同一套 lessonJSONs，永远解析成功、永远
+                    // 非空。只看这个，等于稳定地把整个可选目录认成已选课程，
+                    // 然后把它摆在退课按钮旁边。必须要有已选视图的正面证据。
+                    if !has_drop_control(&text) {
+                        continue;
+                    }
                     if let Ok((lessons, _)) = parse_catalog_with_strategy(&text) {
                         if !lessons.is_empty() {
                             *self.elected_endpoint.lock() = Some(Some(path));

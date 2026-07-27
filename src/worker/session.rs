@@ -82,6 +82,58 @@ pub(super) async fn try_relogin(
     Some(client.login(&username, password.as_str()).await)
 }
 
+/// 保活嗅探到登录失效后的自救：按与抢课主循环相同的规则尝试自动重登。
+///
+/// 返回 true 表示不必清会话——要么重登成功，要么会话已被别的路径接管。
+/// 返回 false 才是「确实失效且救不回来」。
+async fn keepalive_relogin(state: &Arc<SharedState>, client: &EamsClient, session: u64) -> bool {
+    /// `logging_in` 必须无论如何都放掉：卡在 true 会让登录按钮永久失灵。
+    struct Guard<'a>(&'a SharedState);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            self.0.logging_in.store(false, Ordering::Release);
+        }
+    }
+
+    // 与手动登录互斥，也挡住下一次保活 tick 重复发起重登。
+    if state.logging_in.swap(true, Ordering::AcqRel) {
+        // 已经有别的登录在跑，交给它——保活不该插手，更不该清会话。
+        return true;
+    }
+    let _guard = Guard(state);
+
+    for attempt in 1..=MAX_RELOGIN_ATTEMPTS {
+        // 会话已被更替（用户自己重登或退出）：陈旧保活无权再动它。
+        if !state.is_current_session(session) {
+            return true;
+        }
+        match try_relogin(state, client, attempt).await {
+            // 没有保留凭据：说清楚为什么救不回来，开关在哪。
+            None => {
+                state.log(
+                    LogLevel::Warn,
+                    "会话已过期，且未保留本次会话凭据，无法自动重登（可在高级设置中开启）",
+                );
+                return false;
+            }
+            Some(Ok(())) => {
+                if !state.is_current_session(session) {
+                    return true;
+                }
+                state.log(LogLevel::Success, "会话保活发现登录失效，已自动重新登录");
+                return true;
+            }
+            Some(Err(error)) => {
+                state.log(
+                    LogLevel::Warn,
+                    format!("保活自动重登第 {attempt} 次失败：{error}"),
+                );
+            }
+        }
+    }
+    false
+}
+
 pub fn login_and_fetch(state: Arc<SharedState>, req: LoginRequest) {
     let LoginRequest {
         base_url,
@@ -320,8 +372,16 @@ pub fn keepalive(state: Arc<SharedState>, notify_enabled: bool, sound_enabled: b
             }
             Ok(None) => {}
             Err(error) if is_auth_error(&error) => {
+                // 先自救再报丧。直接 clear_session 的代价此前被严重低估：
+                // 它会抹掉重登凭据、清掉 client，并通过 logged_in=false 让 UI
+                // 帧循环 cancel_schedule_arm——「晚上设好定时、次日早上开抢」
+                // 这个招牌场景，会在夜里会话过期的那一刻无人看管地静默死亡，
+                // 早上醒来既没抢到课，定时也早已被取消。
+                if keepalive_relogin(&state, &client, session).await {
+                    return;
+                }
                 state.clear_session("登录已过期，请重新登录");
-                state.log(LogLevel::Warn, "会话保活发现登录失效");
+                state.log(LogLevel::Warn, "会话保活发现登录失效，且自动重登未成功");
                 crate::notify::dispatch_alert(
                     "登录失效",
                     "请重新登录后继续",
@@ -516,6 +576,58 @@ mod tests {
         assert!(
             outcome.is_none(),
             "must not attempt a credential-less login"
+        );
+    }
+
+    // 保活嗅到失效时的自救路径：没有凭据就如实认输，并说清开关在哪。
+    // 不碰网络——没有凭据时连一个请求都不该发。
+    #[test]
+    fn keepalive_relogin_without_credentials_gives_up_and_explains() {
+        let state = SharedState::new();
+        let client = EamsClient::new("http://127.0.0.1:9/eams", 5, false).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let session = state.session_token();
+        let rescued = runtime.block_on(keepalive_relogin(&state, &client, session));
+        assert!(!rescued, "没有凭据就救不回来，必须如实返回 false");
+        let logs = log_messages(&state);
+        assert!(
+            logs.iter().any(|m| m.contains("未保留本次会话凭据")),
+            "要告诉用户为什么没有自动重登，got {logs:?}"
+        );
+        assert!(
+            !state.logging_in.load(Ordering::Acquire),
+            "logging_in 卡在 true 会让登录按钮永久失灵"
+        );
+    }
+
+    // 已经有登录在跑时，陈旧保活不得插手，更不得清会话——否则它会把用户
+    // 刚发起的那次登录连人带凭据一起抹掉。
+    #[test]
+    fn keepalive_relogin_defers_to_a_login_already_in_flight() {
+        let state = SharedState::new();
+        let client = EamsClient::new("http://127.0.0.1:9/eams", 5, false).unwrap();
+        *state.credentials.lock() = Some(SessionCredentials {
+            username: "student01".into(),
+            password: Zeroizing::new("secret".into()),
+        });
+        state.logging_in.store(true, Ordering::Release);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let session = state.session_token();
+        let rescued = runtime.block_on(keepalive_relogin(&state, &client, session));
+        assert!(rescued, "有登录在跑时保活应当让路，而不是判定失败去清会话");
+        assert!(
+            state.logging_in.load(Ordering::Acquire),
+            "让路的那一支绝不能顺手清掉别人的 logging_in"
+        );
+        assert!(
+            state.credentials.lock().is_some(),
+            "凭据必须留给正在跑的那次登录"
         );
     }
 

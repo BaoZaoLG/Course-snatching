@@ -50,6 +50,18 @@ pub fn schedule_decision(now: i64, target: i64, fired: bool, armed: bool) -> Sch
         return ScheduleAction::MarkExpired;
     }
     if !armed {
+        // 宽限期只兜底「我们自己迟到了」：一个**已经待命**的目标，遇上忙碌的
+        // 帧循环或短暂休眠而稍稍错过时刻。它不能用来追认一个从未待命过的
+        // 时刻——定时时刻是 DragValue 拖出来的，拖动途中的每一个暂态值
+        // （以及「设为现在」按钮）都会瞬间变成一个「刚刚到点」的新 key，
+        // 落进 [target, target+30] 就是一次真实开抢。
+        //
+        // 从未待命 + 已经到点，只可能来自这类刚出现的时刻（拖动暂态、
+        // 「设为现在」、错过目标后才打开程序/登录）。这些情况下都不该替
+        // 用户开抢：与「休眠跨过目标绝不补抢」同一条理由——人未必在场。
+        if now >= target {
+            return ScheduleAction::MarkExpired;
+        }
         return ScheduleAction::Arm;
     }
     ScheduleAction::Noop
@@ -190,11 +202,20 @@ mod tests {
         // 未到点：未待命则待命，已待命保持。
         assert_eq!(schedule_decision(target - 10, target, false, false), Arm);
         assert_eq!(schedule_decision(target - 10, target, false, true), Noop);
-        // 到点后宽限期内（含正好 +30s）仍要触发，由 arm 的立即分支完成。
-        assert_eq!(schedule_decision(target, target, false, false), Arm);
+        // 从未待命却已经到点：只可能是刚刚出现的时刻（DragValue 拖动暂态、
+        // 「设为现在」、错过目标之后才登录）。绝不能追认成一次真实开抢。
+        assert_eq!(schedule_decision(target, target, false, false), MarkExpired);
         assert_eq!(
             schedule_decision(target + SCHEDULE_GRACE_SECS, target, false, false),
-            Arm
+            MarkExpired
+        );
+        // 但差一秒到点仍然照常待命——正常路径不受影响。
+        assert_eq!(schedule_decision(target - 1, target, false, false), Arm);
+        // 宽限期属于「已待命目标」：那条路径由 arm 的待命任务自己走完，
+        // UI 侧保持 Noop 不重复插手。
+        assert_eq!(
+            schedule_decision(target + SCHEDULE_GRACE_SECS, target, false, true),
+            Noop
         );
         // 超过宽限期一秒即过期，即使仍处于待命（如手动运行横跨目标时刻）。
         assert_eq!(

@@ -47,6 +47,24 @@ fn has_strong_success_text(text: &str) -> bool {
         .any(|marker| text.contains(marker))
 }
 
+/// 这个页面是不是真的「我的已选课程」视图。
+///
+/// EAMS 的选课目录页与已选课程页共用同一套 `lessonJSONs` 结构，
+/// `parse_catalog_with_strategy` 对两者都解析成功、都返回非空列表。所以
+/// 「解析出东西了」不是验收标准——用它探测已选端点，会在典型 EAMS 上稳定
+/// 地把**整个可选目录**当成已选课程，再喂给不可逆的退课入口。
+///
+/// 判据取机制而不是措辞：已选视图必然带退课入口（退课就是同一个
+/// `batchOperator` 的 `optype=false`），可选目录没有。
+///
+/// 宁可漏判：判不出来就当探测失败，界面显示「未找到接口」远好于显示一份
+/// 错的已选清单——后者旁边就是一个点下去不可撤销的按钮。
+pub fn has_drop_control(text: &str) -> bool {
+    ["optype=false", "退课", "取消选课", "退选"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
 /// 服务器瞬态繁忙文案：高峰期以 HTTP 200 正文出现（“系统繁忙，请稍后再试”等），
 /// 命中即视为可重试，避免开抢时刻被终态放弃。词表与 worker 对 Err 路径的
 /// 限流兜底识别（限流/过快/太快/频繁/稍后）保持一致并补充繁忙类说法。
@@ -1286,6 +1304,31 @@ pub(crate) fn summarize_html(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // F-04 回归：选课目录页与已选课程页共用同一套 lessonJSONs，两者都能被
+    // parse_catalog_with_strategy 解析成非空列表。此前已选端点探测只看
+    // 「解析成功且非空」，于是在典型 EAMS 上稳定地把整个可选目录认成已选
+    // 课程——然后把它摆在一个点下去不可撤销的退课按钮旁边。
+    #[test]
+    fn the_selection_catalog_is_not_mistaken_for_the_elected_list() {
+        let catalog = "<html><body><h2>选课</h2><table id='courseTable'></table>\
+            <script>var lessonJSONs=[{id:371644,no:'CAT.001',name:'甲'}];</script>\
+            </body></html>";
+        assert!(
+            !has_drop_control(catalog),
+            "选课目录页没有退课入口，不能被当成已选课程页"
+        );
+
+        // 真正的已选视图必然带退课入口——退课就是同一个 batchOperator 的
+        // optype=false，这是机制层面的判据，不依赖某个学校的措辞。
+        for elected in [
+            "<html><body><h2>已选课程</h2><a href='stdElectCourse!batchOperator.action?optype=false'>退课</a></body></html>",
+            "<html><body>我的课表 <button>取消选课</button></body></html>",
+            "<html><body>已选 <a>退选</a></body></html>",
+        ] {
+            assert!(has_drop_control(elected), "漏判已选视图：{elected}");
+        }
+    }
 
     // F-01：验证码要素只从登录页本身取，绝不猜测端点。
     #[test]

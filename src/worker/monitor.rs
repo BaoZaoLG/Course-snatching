@@ -133,8 +133,18 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                         }
                         // 先试自动重登：这是一个「设定时开抢、半夜挂机」的
                         // 工具，会话在等待期间过期是必然事件而非异常。
-                        if attempt_relogin(&state, &client, &mut run.relogin_failures).await {
-                            continue;
+                        match until_stopped(
+                            &state,
+                            generation,
+                            attempt_relogin(&state, &client, &mut run.relogin_failures),
+                        )
+                        .await
+                        {
+                            // 用户在重登途中按了停止：立刻收摊，别让退避把
+                            // 「正在停止…」拖成分钟级。
+                            None => break,
+                            Some(true) => continue,
+                            Some(false) => {}
                         }
                         state.log(LogLevel::Error, "登录失效，抢课已停止");
                         // 先终态化看板再 clear_session：后者会立刻把 running 置 false，
@@ -620,9 +630,21 @@ pub fn start_grab(state: Arc<SharedState>, cfg: AppConfig) {
                             if confirm_auth_expired(&state, generation, &client).await {
                                 // 提交阶段掉线同样先试自动重登；目标全部保留在
                                 // pending 里，重登成功后下一轮继续。
-                                if attempt_relogin(&state, &client, &mut run.relogin_failures).await
+                                match until_stopped(
+                                    &state,
+                                    generation,
+                                    attempt_relogin(&state, &client, &mut run.relogin_failures),
+                                )
+                                .await
                                 {
-                                    continue;
+                                    // 重登途中按了停止：看板先终态化再退出，
+                                    // 不能让行卡在「提交中」。
+                                    None => {
+                                        mark_pending_stopped(&state, &pending);
+                                        break 'run;
+                                    }
+                                    Some(true) => continue,
+                                    Some(false) => {}
                                 }
                                 state.log(LogLevel::Error, "登录失效，抢课已停止");
                                 // 同刷新路径：clear_session 会立刻置 running=false，
@@ -1059,6 +1081,33 @@ fn retire_group_siblings(
     }
 }
 
+/// 在本次 run 仍然有效期间等待 `fut`；用户一按停止就立刻返回 `None`。
+///
+/// 自动重登会做 decorrelated jitter 退避、再走完整条登录链路（可能还要排
+/// governor 的冷却），叠满重试上限是分钟级。裸 `await` 会让「停止」按钮变成
+/// 摆设：界面已经显示“正在停止…”，实际却要等重登整条链路跑完才真的停下。
+///
+/// 被放弃的重登 future 在这里直接 drop——它没有跨 await 的持锁，取消是安全的。
+async fn until_stopped<T>(
+    state: &SharedState,
+    generation: u64,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            // 先看 future：已经就绪时不要白等一个轮询间隔。
+            biased;
+            value = &mut fut => return Some(value),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if !state.is_current_run(generation) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// 会话过期后尝试自动重登。返回 true 表示已恢复，调用方应继续本次 run。
 ///
 /// 没有保留凭据（用户关掉了开关）或连续失败达上限时返回 false，由调用方
@@ -1265,6 +1314,45 @@ mod tests {
         assert!(
             log_messages(&state).is_empty(),
             "capped relogin must not even announce an attempt"
+        );
+    }
+
+    // 自动重登要经过 decorrelated jitter 退避 + 完整登录链路，叠满重试上限
+    // 是分钟级。此前这里是裸 await，「停止」按钮按下去只会把界面改成
+    // “正在停止…”，真正停下来要等整条重登链路跑完。
+    #[test]
+    fn stop_penetrates_a_long_running_relogin() {
+        let state = SharedState::new();
+        let generation = state.run_generation.load(Ordering::Acquire);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (abandoned, elapsed) = runtime.block_on(async {
+            let stopper = {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    // stop_grab 做的就是推进 run 代际。
+                    state.run_generation.fetch_add(1, Ordering::AcqRel);
+                })
+            };
+            let started = std::time::Instant::now();
+            // 站在一个绝不会自己返回的重登上：只能靠停止把它放弃掉。
+            let outcome = until_stopped(
+                &state,
+                generation,
+                tokio::time::sleep(Duration::from_secs(60)),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            let _ = stopper.await;
+            (outcome.is_none(), elapsed)
+        });
+        assert!(abandoned, "停止必须能中断自动重登");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "停止应当立刻生效，实际等了 {elapsed:?}"
         );
     }
 

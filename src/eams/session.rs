@@ -137,7 +137,30 @@ impl EamsClient {
         let permit = self.governor.acquire(RequestPriority::Session).await;
         let result = async {
             let response = self.http.get(url).send().await?;
+            // 这是全客户端唯一不走 send_raw 状态检查的请求路径，错误页/
+            // 限流页的字节绝不能进验证码通道：界面解码失败后只会显示一个
+            // 没有图的弹窗，用户无从作答，每次重试还再消耗一次登录额度。
+            let status = response.status();
+            if status.as_u16() == 429 {
+                return Err(anyhow::Error::new(EamsError::RateLimited {
+                    message: "验证码图片请求被限流".into(),
+                    retry_after_secs: None,
+                }));
+            }
+            if !status.is_success() {
+                return Err(anyhow::Error::new(EamsError::HttpStatus {
+                    status: status.as_u16(),
+                    summary: "验证码图片请求被拒".into(),
+                }));
+            }
             let bytes = read_body_limited(response, 2 * 1024 * 1024).await?;
+            // 同源 302 兜转回登录页/错误页时状态码照样是 200：内容必须真是
+            // 图片。识别失败宁可报错，也不给用户一个解不出图的弹窗。
+            if !looks_like_image(&bytes) {
+                return Err(anyhow::Error::new(EamsError::Parse {
+                    message: "验证码接口返回的不是图片（可能已被重定向回登录页）".into(),
+                }));
+            }
             anyhow::Ok(bytes)
         }
         .await;
@@ -167,5 +190,35 @@ impl EamsClient {
         let home = self.url("homeExt.action")?;
         self.send_text(self.http.get(home), "验证登录状态").await?;
         Ok(())
+    }
+}
+
+/// 常见验证码图片格式的魔数。教务验证码几乎全是 JPEG/PNG/GIF/BMP，
+/// 认不出来的一律按「不是图片」处理——宁可失败也不给用户解不出的弹窗。
+fn looks_like_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG")
+        || bytes.starts_with(b"\xFF\xD8\xFF")
+        || bytes.starts_with(b"GIF8")
+        || bytes.starts_with(b"BM")
+        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_image;
+
+    #[test]
+    fn image_sniffing_accepts_real_formats_and_rejects_pages() {
+        assert!(looks_like_image(b"\x89PNG\r\n\x1a\n rest"));
+        assert!(looks_like_image(b"\xFF\xD8\xFF\xE0 jfif"));
+        assert!(looks_like_image(b"GIF89a"));
+        assert!(looks_like_image(b"BM6\x00"));
+        assert!(looks_like_image(b"RIFF\x00\x00\x00\x00WEBPVP8 "));
+        // 同源兜转回登录页的典型形状：HTML 而不是图片。
+        assert!(!looks_like_image(b"<!DOCTYPE html><html>login</html>"));
+        assert!(!looks_like_image(b"<html><body>error</body></html>"));
+        assert!(!looks_like_image(b""));
+        // RIFF 但不是 WEBP（比如 WAV）也不能当图。
+        assert!(!looks_like_image(b"RIFF\x00\x00\x00\x00WAVEfmt "));
     }
 }
