@@ -1,4 +1,5 @@
 use super::{EamsError, ElectResult, Lesson, SeatInfo};
+use crate::config::AppConfig;
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use reqwest::header::HeaderMap;
@@ -19,6 +20,104 @@ static RE_LESSON_COUNTS: LazyLock<Regex> = LazyLock::new(|| {
         .expect("counts regex")
 });
 
+/// 容量语境的“已满”文案才算 Full（可重试）。裸“已满”也出现在
+/// “学分已满，不允许再选”“选课门数已满”等终态拒绝里，不能触发 Full。
+fn is_capacity_full_text(text: &str) -> bool {
+    ["人数已满", "名额已满", "上限人数"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// 终态拒绝：学分/门数上限这类改不了的条件，重试只是白打请求。
+/// 必须先于容量与瞬态判定，否则「学分已满」会被当成可重试。
+fn is_hard_reject_text(text: &str) -> bool {
+    ["学分已满", "门数已满", "不允许再选"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// 明确的成功标记。必须先于瞬态繁忙词表：「操作成功，请稍后在已选课程中
+/// 查看」这类常见文案含「稍后」，先判繁忙会把成功当成可重试，目标留在
+/// pending 里重复提交。
+fn has_strong_success_text(text: &str) -> bool {
+    // 「退课成功」在这里是因为退课复用同一个 batchOperator 端点与同一个
+    // 分类器（F-05）；它不可能出现在选课失败的响应里，加进来是安全的。
+    ["已经选过", "已选过", "选课成功", "操作成功", "退课成功"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// 这个页面是不是真的「我的已选课程」视图。
+///
+/// EAMS 的选课目录页与已选课程页共用同一套 `lessonJSONs` 结构，
+/// `parse_catalog_with_strategy` 对两者都解析成功、都返回非空列表。所以
+/// 「解析出东西了」不是验收标准——用它探测已选端点，会在典型 EAMS 上稳定
+/// 地把**整个可选目录**当成已选课程，再喂给不可逆的退课入口。
+///
+/// 判据取机制而不是措辞：已选视图必然带退课入口（退课就是同一个
+/// `batchOperator` 的 `optype=false`），可选目录没有。
+///
+/// 宁可漏判：判不出来就当探测失败，界面显示「未找到接口」远好于显示一份
+/// 错的已选清单——后者旁边就是一个点下去不可撤销的按钮。
+pub fn has_drop_control(text: &str) -> bool {
+    ["optype=false", "退课", "取消选课", "退选"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// 服务器瞬态繁忙文案：高峰期以 HTTP 200 正文出现（“系统繁忙，请稍后再试”等），
+/// 命中即视为可重试，避免开抢时刻被终态放弃。词表与 worker 对 Err 路径的
+/// 限流兜底识别（限流/过快/太快/频繁/稍后）保持一致并补充繁忙类说法。
+fn is_transient_busy_text(text: &str) -> bool {
+    [
+        "稍后",
+        "繁忙",
+        "系统忙",
+        "限流",
+        "过快",
+        "太快",
+        "频繁",
+        "人数过多",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+/// 选课结果的判定范围。
+///
+/// 直接在整页上做子串匹配会被无关内容带偏：页脚一句「请勿频繁刷新」能让
+/// 每次提交都变成 Busy，页面上列出的其它满员课程会误触容量判定。所以先抠
+/// 服务器的结果容器（`extract_login_error` 已经是这个写法），抠不到才退回
+/// 整页摘要。
+fn extract_result_scope(html: &str) -> Option<String> {
+    // 结果容器里有「稍后」这种词才算真的在讲本次提交结果。
+    let doc = Html::parse_document(html);
+    for sel in [
+        "#actionMessage",
+        ".actionMessage",
+        ".actionError",
+        "#msgboxDiv",
+        ".alert",
+        ".error",
+    ] {
+        let Ok(selector) = Selector::parse(sel) else {
+            continue;
+        };
+        if let Some(node) = doc.select(&selector).next() {
+            let text = node
+                .text()
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn classify_elect_response(text: &str) -> ElectResult {
     let summary = summarize_html(text);
     if let Ok(value) = serde_json::from_str::<Value>(text) {
@@ -28,28 +127,48 @@ pub(crate) fn classify_elect_response(text: &str) -> ElectResult {
             return ElectResult::Success { detail };
         }
         if value.get("success").and_then(Value::as_bool) == Some(false) {
-            if detail.contains("已满") || detail.contains("上限人数") {
+            if is_hard_reject_text(&detail) {
+                return ElectResult::Failed { detail };
+            }
+            if is_capacity_full_text(&detail) {
                 return ElectResult::Full { detail };
+            }
+            if is_transient_busy_text(&detail) {
+                return ElectResult::Busy { detail };
             }
             return ElectResult::Failed { detail };
         }
     }
 
-    if text.contains("上限人数已满") || text.contains("人数已满") || text.contains("已满")
-    {
-        return ElectResult::Full { detail: summary };
+    // 判定只看结果容器；抠不到才退回整页摘要。
+    let scope = extract_result_scope(text).unwrap_or_else(|| summary.clone());
+    let detail = if scope.is_empty() {
+        summary.clone()
+    } else {
+        scope.clone()
+    };
+
+    // 强成功标记最优先——含「稍后」的成功文案不能被判成 Busy。
+    if has_strong_success_text(&scope) {
+        return ElectResult::Success { detail };
     }
-    if text.contains("已经选过") || text.contains("已选过") {
-        return ElectResult::Success { detail: summary };
+    // 终态拒绝先于容量：「学分已满」不是可重试的「人数已满」。
+    if is_hard_reject_text(&scope) {
+        return ElectResult::Failed { detail };
+    }
+    if is_capacity_full_text(&scope) {
+        return ElectResult::Full { detail };
+    }
+    // 瞬态繁忙先于普通失败标记：“操作未成功，请稍后重试”这类明确邀请重试的
+    // 文案宁可多试一轮，也不要在开抢高峰被终态放弃。
+    if is_transient_busy_text(&scope) {
+        return ElectResult::Busy { detail };
     }
     if ["失败", "未成功", "冲突", "不允许", "错误", "不可选"]
         .iter()
-        .any(|marker| text.contains(marker))
+        .any(|marker| scope.contains(marker))
     {
-        return ElectResult::Failed { detail: summary };
-    }
-    if text.contains("选课成功") || text.contains("操作成功") {
-        return ElectResult::Success { detail: summary };
+        return ElectResult::Failed { detail };
     }
     ElectResult::Failed {
         detail: if summary.is_empty() {
@@ -87,26 +206,44 @@ pub(crate) fn normalize_base(raw: &str) -> Result<Url> {
     }
     url.set_fragment(None);
     url.set_query(None);
+    // 用户填了路径就原样保留，只补尾部斜杠。
+    //
+    // 此前是「路径不以 /eams 结尾就强行拼上 /eams/」：部署在根路径或
+    // /jwxt/ 的学校会被改写成 /jwxt/eams/ 这种不存在的地址，而用户从浏览器
+    // 地址栏复制过来的恰恰是正确的那个。/eams 只应该作为「用户没填路径时」
+    // 的默认猜测。
     let path = url.path().trim_end_matches('/');
-    if !path.ends_with("/eams") && path != "eams" {
-        let next = if path.is_empty() || path == "/" {
-            "/eams/".to_string()
-        } else {
-            format!("{path}/eams/")
-        };
-        url.set_path(&next);
+    let normalized = if path.is_empty() || path == "/" {
+        "/eams/".to_string()
     } else {
-        let normalized = format!("{path}/");
-        url.set_path(&normalized);
-    }
+        format!("{path}/")
+    };
+    url.set_path(&normalized);
     Ok(url)
 }
+
+/// 宽松的 salt 兜底：不限定 36 位 UUID 形状。
+static RE_SALT_LOOSE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"SHA1\(\s*'([^']{8,64})-'").expect("loose salt regex"));
 
 pub(crate) fn extract_password_salt(html: &str) -> Option<String> {
     RE_SALT_PRIMARY
         .captures(html)
         .map(|c| c[1].to_string())
         .or_else(|| RE_SALT_FALLBACK.captures(html).map(|c| c[1].to_string()))
+        // 两条主正则都写死了 36 位 UUID 形状，换版即硬失败。宽松兜底至少
+        // 能撑过「salt 换了格式但机制没变」这种最常见的小改动。
+        .or_else(|| RE_SALT_LOOSE.captures(html).map(|c| c[1].to_string()))
+}
+
+/// 登录页是否根本没有 salt 机制（而不是「有但格式不认识」）。
+///
+/// 两者的处置完全不同：前者说明这个站点用的是别的登录方式，重试多少次都
+/// 没用；后者是解析层需要跟进的换版。错误提示必须把这两种区分开，否则用户
+/// 只会看到同一句「页面可能已改版」。
+pub(crate) fn login_page_mentions_salt(html: &str) -> bool {
+    let lowered = html.to_ascii_lowercase();
+    lowered.contains("sha1(") || lowered.contains("cryptojs")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,17 +297,273 @@ pub(crate) async fn read_body_limited(
     Ok(buf)
 }
 
+/// 登录页上的验证码要素。
+///
+/// 多数 EAMS 在连续失败若干次后强制上验证码，而 `login()` 最多重试 4 次，
+/// 恰好容易把学校推到这个阈值上——一旦触发，工具此前会永久卡死：
+/// `extract_login_error` 早就把「验证码」列为已知错误文案，却没有任何获取
+/// 或提交验证码的路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CaptchaChallenge {
+    /// 验证码图片地址（页面里给的原样值，可能是相对路径）。
+    pub image_src: String,
+    /// 提交时的表单字段名。
+    pub field_name: String,
+}
+
+/// 从登录页里找出验证码图片与输入框。
+///
+/// 只认页面自己给出的地址——绝不猜测端点。找不到就是没有验证码，
+/// 登录流程一如既往。
+pub(crate) fn extract_captcha(html: &str) -> Option<CaptchaChallenge> {
+    const MARKERS: [&str; 8] = [
+        "captcha",
+        "validatecode",
+        "checkcode",
+        "randomcode",
+        "verifycode",
+        "authcode",
+        "kaptcha",
+        "yzm",
+    ];
+    let looks_like_captcha = |value: &str| -> bool {
+        MARKERS
+            .iter()
+            .any(|m| value.to_ascii_lowercase().contains(m))
+    };
+
+    let doc = Html::parse_document(html);
+    let img_selector = Selector::parse("img").ok()?;
+    let image_src = doc.select(&img_selector).find_map(|node| {
+        let value = node.value();
+        let src = value.attr("src")?;
+        let hints = [Some(src), value.attr("id"), value.attr("name")];
+        hints
+            .into_iter()
+            .flatten()
+            .any(looks_like_captcha)
+            .then(|| src.to_string())
+    })?;
+
+    // 字段名同样从页面里取；取不到才退回最常见的那个名字。
+    let input_selector = Selector::parse("input").ok()?;
+    let field_name = doc
+        .select(&input_selector)
+        .find_map(|node| {
+            let value = node.value();
+            let name = value.attr("name")?;
+            let hints = [Some(name), value.attr("id")];
+            hints
+                .into_iter()
+                .flatten()
+                .any(looks_like_captcha)
+                .then(|| name.to_string())
+        })
+        .unwrap_or_else(|| "captcha".to_string());
+
+    Some(CaptchaChallenge {
+        image_src,
+        field_name,
+    })
+}
+
+/// 解析课程目录时命中的策略。
+///
+/// 记录它是为了「换版预警」：教务系统换版本时，命中的策略几乎必然会先变
+/// （比如从 `from_page` 掉到 `js_like` 再掉到 `json`），而这通常发生在彻底
+/// 解析失败的几天之前。此前没有任何地方记录这条信息，只能等它彻底不能用了
+/// 才发现。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogStrategy {
+    FromPage,
+    JsLike,
+    Json,
+    HtmlTable,
+}
+
+impl CatalogStrategy {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::FromPage => "page",
+            Self::JsLike => "js_like",
+            Self::Json => "json",
+            Self::HtmlTable => "html_table",
+        }
+    }
+}
+
+/// 按既定顺序尝试各解析策略，并把命中的那个报告出来。
+///
+/// 把回退链收在一处，免得两个调用点各写一遍 `or_else` 却只有一处记录命中。
+pub(crate) fn parse_catalog_with_strategy(text: &str) -> Result<(Vec<Lesson>, CatalogStrategy)> {
+    if let Ok(lessons) = parse_lessons_from_page(text) {
+        return Ok((lessons, CatalogStrategy::FromPage));
+    }
+    if let Ok(lessons) = parse_lessons_js_like(text) {
+        return Ok((lessons, CatalogStrategy::JsLike));
+    }
+    if let Ok(lessons) = parse_lessons_json(text) {
+        return Ok((lessons, CatalogStrategy::Json));
+    }
+    // 表格解析返回空表示没匹配上（它不返回 Result）。
+    let lessons = parse_lessons_from_html_table(text);
+    if lessons.is_empty() {
+        bail!("no catalog parser matched");
+    }
+    Ok((lessons, CatalogStrategy::HtmlTable))
+}
+
+/// 从 `Content-Type` 头里取字符集标签。
+fn charset_from_content_type(content_type: Option<&str>) -> Option<&'static encoding_rs::Encoding> {
+    let value = content_type?.to_ascii_lowercase();
+    let idx = value.find("charset=")?;
+    let label = value[idx + "charset=".len()..]
+        .split(&[';', ' ', '"', '\''][..])
+        .next()?
+        .trim();
+    encoding_rs::Encoding::for_label(label.as_bytes())
+}
+
+/// 从 HTML 头部的 `<meta charset>` / `<meta http-equiv>` 里取字符集。
+/// 只扫前 2KB：声明必须出现在文档开头，扫全文既慢又容易被正文误导。
+fn charset_from_meta(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    static RE_META_CHARSET: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_\-]+)"#)
+            .expect("meta charset regex")
+    });
+    let head = &bytes[..bytes.len().min(2048)];
+    // 字符集声明本身一定是 ASCII，lossy 足够。
+    let head = String::from_utf8_lossy(head);
+    let label = RE_META_CHARSET.captures(&head)?.get(1)?.as_str();
+    encoding_rs::Encoding::for_label(label.as_bytes())
+}
+
+fn replacement_ratio(text: &str) -> f32 {
+    let total = text.chars().count();
+    if total == 0 {
+        return 0.0;
+    }
+    let bad = text
+        .chars()
+        .filter(|ch| *ch == char::REPLACEMENT_CHARACTER)
+        .count();
+    bad as f32 / total as f32
+}
+
+/// 允许的替换字符比例。个别坏字节不该让整个响应作废，但成片乱码必须报错。
+const MAX_REPLACEMENT_RATIO: f32 = 0.02;
+
+/// 按 `Content-Type` → `<meta charset>` → UTF-8 → GB18030 的顺序解码响应体。
+///
+/// 原实现是 `String::from_utf8_lossy`：GB2312/GBK 站点整页变成 U+FFFD，而它
+/// 之上全部是中文子串判定（人数已满 / 系统繁忙 / 限流词表 / 登录错误），
+/// 会整体静默失效——选课成功被判成 Failed 并终态放弃。
+/// 关键在于解码失败要显式报错，静默的乱码比明确的失败危险得多。
+pub(crate) fn decode_body(content_type: Option<&str>, bytes: &[u8]) -> Result<String> {
+    // decode() 自带 BOM 嗅探，BOM 会覆盖这里选定的编码。
+    if let Some(encoding) =
+        charset_from_content_type(content_type).or_else(|| charset_from_meta(bytes))
+    {
+        let (text, _, had_errors) = encoding.decode(bytes);
+        if !had_errors || replacement_ratio(&text) <= MAX_REPLACEMENT_RATIO {
+            return Ok(text.into_owned());
+        }
+        return Err(EamsError::Parse {
+            message: format!("响应按 {} 解码失败（大量乱码）", encoding.name()),
+        }
+        .into());
+    }
+
+    // 没有任何声明：先按 UTF-8 试，明显不像 UTF-8 时再试 GB18030
+    // （中文高校站点唯一现实的另一种可能），两者都不成才报错。
+    let (utf8_text, _, utf8_errors) = encoding_rs::UTF_8.decode(bytes);
+    if !utf8_errors || replacement_ratio(&utf8_text) <= MAX_REPLACEMENT_RATIO {
+        return Ok(utf8_text.into_owned());
+    }
+    let (gbk_text, _, gbk_errors) = encoding_rs::GB18030.decode(bytes);
+    if !gbk_errors || replacement_ratio(&gbk_text) < replacement_ratio(&utf8_text) {
+        return Ok(gbk_text.into_owned());
+    }
+    Err(EamsError::Parse {
+        message: "响应解码失败：既不是 UTF-8 也不是 GB18030，且未声明字符集".into(),
+    }
+    .into())
+}
+
 pub(crate) fn looks_like_login_page(url: &Url, text: &str) -> bool {
     body_looks_like_login_page(text)
         || (url.as_str().to_ascii_lowercase().contains("login") && text.trim().is_empty())
 }
 
+/// 页面是否是登录页。
+///
+/// 判据分两级：便宜的子串预筛（绝大多数响应在这里就被排除，不必为每个响应
+/// 付 HTML 解析的代价）+ 结构确认。只做子串匹配的话，选课页导航栏里一个
+/// 「修改密码」表单、或打包进页面的 JS bundle 含这几个 token 就会命中，而
+/// 系统性误报会稳定地自我确认两次，直接终止抢课。
 pub(crate) fn body_looks_like_login_page(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    text.contains("loginform")
-        || text.contains("name=\"password\"")
-        || text.contains("id=\"password\"")
-        || (text.contains("username") && text.contains("password") && text.contains("login"))
+    let lowered = text.to_ascii_lowercase();
+    let cheap_hit = lowered.contains("loginform")
+        || lowered.contains("name=\"password\"")
+        || lowered.contains("id=\"password\"")
+        || lowered.contains("type=\"password\"")
+        || (lowered.contains("username")
+            && lowered.contains("password")
+            && lowered.contains("login"));
+    if !cheap_hit {
+        return false;
+    }
+    structural_login_page(text)
+}
+
+/// `action`/`id` 指向登录端点。
+fn is_login_endpoint(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    ["login", "cas", "authserver", "sso", "signin", "idp"]
+        .iter()
+        .any(|marker| value.contains(marker))
+}
+
+/// 页面里有真正的选课目录结构。
+///
+/// 只认结构性标记，不认泛泛的「选课」二字——登录页横幅上也可能写着选课，
+/// 用它做否定判据会漏掉真实的会话过期，那是更危险的方向。
+fn page_has_elect_catalog(text: &str) -> bool {
+    [
+        "electableLesson",
+        "lessonListOperator",
+        "stdElectCourse",
+        "lessonJSONs",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+fn structural_login_page(html: &str) -> bool {
+    static FORM_SEL: LazyLock<Option<Selector>> = LazyLock::new(|| Selector::parse("form").ok());
+    static PASSWORD_SEL: LazyLock<Option<Selector>> =
+        LazyLock::new(|| Selector::parse("input[type=password]").ok());
+    let doc = Html::parse_document(html);
+    // 一等判据：存在 form 且它指向登录端点。
+    if let Some(selector) = FORM_SEL.as_ref() {
+        let has_login_form = doc.select(selector).any(|node| {
+            let value = node.value();
+            value.attr("action").is_some_and(is_login_endpoint)
+                || value.attr("id").is_some_and(is_login_endpoint)
+                || value.attr("name").is_some_and(is_login_endpoint)
+        });
+        if has_login_form {
+            return true;
+        }
+    }
+    // 二等判据：有密码输入框，且页面里没有选课目录结构。
+    // 「修改密码」表单出现在选课页上时会被这一条挡住。
+    if let Some(selector) = PASSWORD_SEL.as_ref() {
+        if doc.select(selector).next().is_some() && !page_has_elect_catalog(html) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn extract_login_error(html: &str) -> Option<String> {
@@ -383,20 +776,43 @@ pub(crate) fn extract_profiles_detailed(text: &str) -> Vec<(String, String)> {
     out
 }
 
+/// 原始调试页面落盘。
+///
+/// 落盘即脱敏，而不是只在导出时脱敏：会话 Cookie 在有效期内等于账号，
+/// 把最危险的一份留在 %APPDATA% 里、把最安全的一份交出去，顺序是反的。
+/// 导出侧的 `redact_diagnostic_page` 保留为二次防线。
 pub(crate) fn save_debug_text(name: &str, content: &str) -> Result<()> {
-    let dir = debug_dir();
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(name), content)?;
+    let dir = AppConfig::debug_dir();
+    save_debug_text_in(&dir, name, content)?;
+    let _ = AppConfig::retain_debug_files();
     Ok(())
 }
 
-fn debug_dir() -> std::path::PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return parent.join("runtime").join("debug");
-        }
-    }
-    std::path::PathBuf::from("runtime/debug")
+/// 目录可注入，测试才能验证「落盘的那份确实已脱敏」而不是往用户
+/// 真实的 %APPDATA% 里写东西。
+pub(crate) fn save_debug_text_in(
+    dir: &std::path::Path,
+    name: &str,
+    content: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    // 含选课提交表单的页面整份丢弃，与导出侧语义一致。
+    let Some(content) = crate::config::redact_diagnostic_page(name, content) else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(dir)?;
+    let safe_name = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let path = dir.join(safe_name);
+    std::fs::write(&path, content.as_bytes())?;
+    Ok(Some(path))
 }
 
 pub(crate) fn extract_all_profile_ids(text: &str) -> Vec<String> {
@@ -635,6 +1051,13 @@ pub(crate) fn parse_lessons_json(text: &str) -> Result<Vec<Lesson>> {
         Err(_) => {
             let start = text.find('[').ok_or_else(|| anyhow!("not json"))?;
             let end = text.rfind(']').ok_or_else(|| anyhow!("not json"))?;
+            // start > end（WAF 拦截页、乱序截断的壳页，如 "参数非法]…x = ["）时
+            // &text[start..=end] 直接 panic。这条路径是可达的：调用方在前两级
+            // 解析失败后把服务器原始响应喂进来，而 panic 发生在 spawn_task 里且
+            // JoinHandle 被 drop——抢课任务会在冲刺中途无声死掉。
+            if start >= end {
+                bail!("not json: unbalanced brackets");
+            }
             serde_json::from_str(&text[start..=end]).context("json array parse failed")?
         }
     };
@@ -875,5 +1298,264 @@ pub(crate) fn summarize_html(text: &str) -> String {
         format!("{t}…")
     } else {
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // F-04 回归：选课目录页与已选课程页共用同一套 lessonJSONs，两者都能被
+    // parse_catalog_with_strategy 解析成非空列表。此前已选端点探测只看
+    // 「解析成功且非空」，于是在典型 EAMS 上稳定地把整个可选目录认成已选
+    // 课程——然后把它摆在一个点下去不可撤销的退课按钮旁边。
+    #[test]
+    fn the_selection_catalog_is_not_mistaken_for_the_elected_list() {
+        let catalog = "<html><body><h2>选课</h2><table id='courseTable'></table>\
+            <script>var lessonJSONs=[{id:371644,no:'CAT.001',name:'甲'}];</script>\
+            </body></html>";
+        assert!(
+            !has_drop_control(catalog),
+            "选课目录页没有退课入口，不能被当成已选课程页"
+        );
+
+        // 真正的已选视图必然带退课入口——退课就是同一个 batchOperator 的
+        // optype=false，这是机制层面的判据，不依赖某个学校的措辞。
+        for elected in [
+            "<html><body><h2>已选课程</h2><a href='stdElectCourse!batchOperator.action?optype=false'>退课</a></body></html>",
+            "<html><body>我的课表 <button>取消选课</button></body></html>",
+            "<html><body>已选 <a>退选</a></body></html>",
+        ] {
+            assert!(has_drop_control(elected), "漏判已选视图：{elected}");
+        }
+    }
+
+    // F-01：验证码要素只从登录页本身取，绝不猜测端点。
+    #[test]
+    fn captcha_is_detected_from_the_login_page_only() {
+        let with_captcha = r#"<html><body><form id="loginForm">
+            <input name="username"><input type="password" name="password">
+            <img id="captchaImg" src="/eams/captcha.action?ts=1">
+            <input name="captchaResponse" id="captcha">
+        </form></body></html>"#;
+        let challenge = extract_captcha(with_captcha).expect("captcha must be detected");
+        assert_eq!(challenge.image_src, "/eams/captcha.action?ts=1");
+        assert_eq!(challenge.field_name, "captchaResponse");
+
+        // 没有验证码的登录页必须返回 None——否则会给每次登录凭空加一步。
+        let plain = r#"<html><body><form id="loginForm">
+            <input name="username"><input type="password" name="password">
+            <img src="/eams/logo.png">
+        </form></body></html>"#;
+        assert!(extract_captcha(plain).is_none());
+
+        // 字段名取不到时退回最常见的名字，但图片地址仍然只认页面给的。
+        let no_field = r#"<img src="/eams/validateCode.action">"#;
+        let challenge = extract_captcha(no_field).unwrap();
+        assert_eq!(challenge.image_src, "/eams/validateCode.action");
+        assert_eq!(challenge.field_name, "captcha");
+    }
+
+    // T-05：命中的解析策略是「教务换版」最早的信号——它通常在彻底解析失败的
+    // 几天之前就先降级。
+    #[test]
+    fn catalog_strategy_reports_which_parser_matched() {
+        let js_like = "var lessonJSONs=[{id:371644,no:'ST.001',name:'甲',teachers:'张',stdCount:1,limitCount:9}];";
+        let (lessons, strategy) = parse_catalog_with_strategy(js_like).unwrap();
+        assert_eq!(lessons.len(), 1);
+        assert!(
+            matches!(
+                strategy,
+                CatalogStrategy::JsLike | CatalogStrategy::FromPage
+            ),
+            "got {strategy:?}"
+        );
+
+        let json = r#"[{"id":"371644","no":"ST.002","name":"乙","teachers":"李","stdCount":1,"limitCount":9}]"#;
+        let (lessons, strategy) = parse_catalog_with_strategy(json).unwrap();
+        assert_eq!(lessons.len(), 1);
+        // 具体哪一级命中不重要（前面的解析器也可能吃下 JSON 数组）——
+        // 重要的是「命中了哪一级」这条信息真的被报告出来了。
+        assert!(
+            !strategy.label().is_empty(),
+            "the winning strategy must be reported"
+        );
+
+        // 一个都不匹配时必须是 Err，而不是「空列表也算成功」。
+        assert!(parse_catalog_with_strategy("<html>什么都没有</html>").is_err());
+    }
+
+    // C-01：所有 ']' 都出现在第一个 '[' 之前时，&text[start..=end] 会 panic。
+    // 这条路径是可达的（WAF 拦截页、乱序截断的壳页），而 panic 在 spawn_task
+    // 里被吞掉——抢课任务会在冲刺中途无声死掉。必须是 Err，不是 panic。
+    #[test]
+    fn unbalanced_brackets_are_an_error_not_a_panic() {
+        for text in [
+            "参数非法]<script>var x = [",
+            "]",
+            "][",
+            "] 请求被拦截 [",
+            "}] 网关错误 [{",
+        ] {
+            let result = std::panic::catch_unwind(|| parse_lessons_json(text));
+            assert!(result.is_ok(), "parse_lessons_json panicked on {text:?}");
+            assert!(
+                result.unwrap().is_err(),
+                "unbalanced {text:?} must be a parse error"
+            );
+        }
+        // 正常的数组仍然要解析成功。
+        assert!(parse_lessons_json(
+            r#"[{"id":"371644","no":"CS.1","name":"x","teachers":"t","stdCount":1,"limitCount":2}]"#
+        )
+        .is_ok());
+    }
+
+    // C-06：判定必须先抠结果容器，且强成功标记优先于瞬态繁忙词表。
+    #[test]
+    fn success_message_containing_later_is_not_downgraded_to_busy() {
+        // 「操作成功，请稍后在已选课程中查看」含「稍后」。先判繁忙就会把
+        // 成功当成可重试，目标留在 pending 里被反复重复提交。
+        let html = r#"<html><body><div class="actionMessage">操作成功，请稍后在已选课程中查看</div></body></html>"#;
+        assert!(matches!(
+            classify_elect_response(html),
+            ElectResult::Success { .. }
+        ));
+    }
+
+    #[test]
+    fn page_footer_and_unrelated_full_courses_do_not_hijack_the_verdict() {
+        // 页脚一句「请勿频繁刷新」曾能让每次提交都变成 Busy。
+        let html = r#"<html><body>
+            <div class="actionMessage">选课成功</div>
+            <table><tr><td>其他课程 人数已满</td></tr></table>
+            <div class="footer">请勿频繁刷新本页面</div>
+        </body></html>"#;
+        assert!(
+            matches!(classify_elect_response(html), ElectResult::Success { .. }),
+            "result container must win over footer and unrelated rows"
+        );
+    }
+
+    #[test]
+    fn credit_cap_rejection_stays_terminal_while_seat_full_stays_retryable() {
+        let credit = r#"<div class="actionError">学分已满，不允许再选</div>"#;
+        assert!(matches!(
+            classify_elect_response(credit),
+            ElectResult::Failed { .. }
+        ));
+        let seats = r#"<div class="actionError">人数已满</div>"#;
+        assert!(matches!(
+            classify_elect_response(seats),
+            ElectResult::Full { .. }
+        ));
+        let busy = r#"<div class="actionError">系统繁忙，请稍后再试</div>"#;
+        assert!(matches!(
+            classify_elect_response(busy),
+            ElectResult::Busy { .. }
+        ));
+    }
+
+    // C-02：GBK 站点整页变 U+FFFD 后，其上所有中文子串判定都会静默失效——
+    // 「人数已满」认不出、选课成功被判成 Failed 并终态放弃。
+    #[test]
+    fn gbk_bodies_decode_by_header_meta_and_sniffing() {
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode("人数已满，请稍后再试");
+
+        // 1) Content-Type 声明
+        let text = decode_body(Some("text/html; charset=GBK"), &gbk_bytes).unwrap();
+        assert!(text.contains("人数已满"), "header charset ignored: {text}");
+
+        // 2) <meta charset>
+        let mut with_meta = b"<html><head><meta charset=\"gb2312\"></head><body>".to_vec();
+        with_meta.extend_from_slice(&gbk_bytes);
+        with_meta.extend_from_slice(b"</body></html>");
+        let text = decode_body(Some("text/html"), &with_meta).unwrap();
+        assert!(text.contains("人数已满"), "meta charset ignored: {text}");
+
+        // 3) 什么都没声明：UTF-8 解不动时回退 GB18030
+        let text = decode_body(None, &gbk_bytes).unwrap();
+        assert!(text.contains("人数已满"), "sniffing failed: {text}");
+
+        // 4) UTF-8 正常路径不受影响
+        let text = decode_body(Some("text/html; charset=utf-8"), "选课成功".as_bytes()).unwrap();
+        assert_eq!(text, "选课成功");
+
+        // 5) 声明了字符集却整片解不动：必须显式报错，不能继续喂乱码给判定层
+        let broken = vec![0xff_u8; 64];
+        assert!(
+            decode_body(Some("text/html; charset=utf-8"), &broken).is_err(),
+            "silent mojibake is worse than an explicit failure"
+        );
+    }
+
+    // C-07：选课页导航栏里的「修改密码」表单不能被当成登录页。
+    // 系统性误报会稳定地自我确认两次，直接 clear_session 终止抢课。
+    #[test]
+    fn change_password_form_on_an_elect_page_is_not_a_login_page() {
+        let elect_page = r#"<html><body>
+            <div id="nav"><form action="/eams/security/my.action">
+                <input type="password" name="password"><input type="password" name="password2">
+            </form></div>
+            <script>var lessonJSONs=[{id:371644,no:'CS.1'}];</script>
+            <div id="electableLessonList">课程列表</div>
+        </body></html>"#;
+        assert!(
+            !body_looks_like_login_page(elect_page),
+            "change-password form must not read as a login page"
+        );
+
+        // 真正的登录页仍然要认出来——漏判是更危险的方向。
+        for page in [
+            r#"<form id="loginForm"><input name="password"></form>"#,
+            r#"<html><body><form action="/eams/loginExt.action" method="post">
+                 <input name="username"><input type="password" name="password">
+               </form></body></html>"#,
+            r#"<html><body><form action="https://cas.example.edu/login">
+                 <input type="password" name="password">
+               </form></body></html>"#,
+        ] {
+            assert!(
+                body_looks_like_login_page(page),
+                "missed a real login page: {page}"
+            );
+        }
+    }
+
+    // S-01：调试页落盘时就必须脱敏。会话 Cookie 在有效期内等于账号，
+    // 而 %APPDATA%\debug 最长驻留 7 天。
+    #[test]
+    fn debug_pages_are_redacted_before_they_hit_the_disk() {
+        let dir = std::env::temp_dir().join(format!("cs-debug-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let page = "Set-Cookie: JSESSIONID=abc123\n<input name=\"password\" value=\"hunter2\">";
+        let path = save_debug_text_in(&dir, "login.html", page)
+            .unwrap()
+            .expect("normal page must be written");
+        let written = std::fs::read_to_string(&path).unwrap();
+        for secret in ["abc123", "hunter2"] {
+            assert!(!written.contains(secret), "debug dump leaked {secret}");
+        }
+        assert!(written.contains("[已隐藏]"));
+
+        // 含提交表单的页面整份不落盘。
+        let submission =
+            save_debug_text_in(&dir, "submit.html", "optype=true&operator0=371644:true:0").unwrap();
+        assert!(submission.is_none(), "submission form must not be written");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tmp_debug {
+    #[test]
+    fn tmp_login_fixture() {
+        let page = r#"<form id="loginForm"><input name="password"></form>"#;
+        assert!(
+            super::body_looks_like_login_page(page),
+            "fixture not detected"
+        );
     }
 }

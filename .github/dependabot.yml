@@ -1,0 +1,21 @@
+version: 2
+
+# 没有依赖机器人正是 audit.ps1 里那两条 ignore 长期挂着的根因：没人被提醒
+# 「上游已经修了，可以撤掉忽略了」。
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # 补丁级更新合并成一个 PR，别把评审注意力耗在噪音上。
+      patch-updates:
+        update-types: ["patch"]
+
+  # Action 已经固定到 commit SHA，靠 dependabot 维护那些 SHA 与版本注释。
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3

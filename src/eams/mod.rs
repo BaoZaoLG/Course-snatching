@@ -1,248 +1,319 @@
 //! 教务系统客户端：登录、课程拉取、选课提交。
 
+mod backoff;
+pub mod clock;
+
+/// 供模糊测试使用的解析入口。
+///
+/// `parse.rs` 有 24 处 `Regex::new` 与 `Html::parse_document`，输入全部来自
+/// 远端 HTML，是整个项目最脆弱、最不可控的一层。这些函数签名都是
+/// `&str -> _`，接入 fuzz 的成本极低——单独开一个受控的公开面，好过为了
+/// fuzz 把整个 parse 模块公开出去。
+///
+/// 不变式只有一条：**不许 panic**。返回 Err 完全可以接受。
+pub mod fuzz_api {
+    /// 对所有解析入口喂同一段输入。任何一个 panic 都是缺陷。
+    pub fn parse_all(text: &str) {
+        let _ = super::parse::parse_lessons_json(text);
+        let _ = super::parse::parse_lessons_from_page(text);
+        let _ = super::parse::parse_lessons_js_like(text);
+        let _ = super::parse::parse_lessons_by_regex(text);
+        let _ = super::parse::parse_lessons_from_html_table(text);
+        let _ = super::parse::classify_elect_response(text);
+        let _ = super::parse::js_like_to_json(text);
+        let _ = super::parse::summarize_html(text);
+        let _ = super::parse::extract_password_salt(text);
+        let _ = super::parse::extract_login_error(text);
+        let _ = super::parse::extract_all_profile_ids(text);
+        let _ = super::parse::extract_profiles_detailed(text);
+        let _ = super::parse::body_looks_like_login_page(text);
+        let _ = super::parse::normalize_base(text);
+    }
+
+    /// 字节流入口：字符集解码同样在远端输入的第一线。
+    pub fn decode_body(content_type: Option<&str>, bytes: &[u8]) {
+        let _ = super::parse::decode_body(content_type, bytes);
+    }
+}
+
+/// 提交后等服务端状态落定的时间。
+///
+/// 这段等待原先发生在提交闸门内部，等于白白占用最高优先级的独占许可。
+const SUBMISSION_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// 提交成功后是否做二次确认。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmMode {
+    /// 冲刺窗口内：拿到成功响应就返回。确认要花 2 个请求 + 一次等待，
+    /// 而它要回答的问题（真的选上了吗）下一轮目录刷新本来就会回答；
+    /// 误报由「已经选过」强标记在下一轮自然收敛。
+    Optimistic,
+    /// 常规：做二次确认，降低误报。
+    Verify,
+}
+/// 统一退避（decorrelated jitter）。worker 层的兜底退避也用它，避免三处
+/// 各写一份确定性阶梯造成重试雪崩。
+pub fn backoff_for_attempt(attempt: u32) -> std::time::Duration {
+    backoff::backoff_for_attempt(attempt, backoff::BACKOFF_BASE, backoff::BACKOFF_MAX)
+}
+mod governor;
 mod parse;
+#[cfg(test)]
+mod protocol_fixtures;
+mod session;
+mod transport;
 mod types;
 
+use governor::{RequestGovernor, RequestPriority};
 pub use types::{
-    is_auth_error, is_rate_limit_error, rate_limit_retry_after, EamsError, ElectResult, Lesson,
-    SeatInfo,
+    backend_error_kind, is_auth_error, is_rate_limit_error, rate_limit_retry_after,
+    BackendErrorKind, CircuitStatus, EamsError, ElectResult, Lesson, NetworkSnapshot, SeatInfo,
 };
 
 use crate::eams::parse::{
-    classify_elect_response, extract_all_profile_ids, extract_login_error, extract_password_salt,
-    extract_profiles_detailed, extract_project_semester, looks_like_login_page,
-    merge_lesson_counts, normalize_base, origin_key, page_looks_like_elect_ui,
-    parse_lessons_from_html_table, parse_lessons_from_page, parse_lessons_js_like,
-    parse_lessons_json, parse_retry_after_secs, plausible_profile_id, read_body_limited,
-    save_debug_text, score_elect_page, sha1_password, summarize_html, validate_numeric_id,
-    VerifyOutcome,
+    classify_elect_response, extract_all_profile_ids, extract_profiles_detailed,
+    extract_project_semester, has_drop_control, merge_lesson_counts, normalize_base,
+    page_looks_like_elect_ui, parse_catalog_with_strategy, parse_lessons_from_html_table,
+    parse_lessons_from_page, parse_lessons_js_like, parse_lessons_json, plausible_profile_id,
+    save_debug_text, score_elect_page, validate_numeric_id, VerifyOutcome,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, REFERER, USER_AGENT};
-use reqwest::redirect::Policy;
-use reqwest::{Client, RequestBuilder, Url};
+use reqwest::header::REFERER;
+use reqwest::{Client, Url};
 use std::collections::HashMap;
+// 生产路径的等待时长都由具名常量表达；Duration 只剩测试在直接构造。
+#[cfg(test)]
 use std::time::Duration;
-use zeroize::Zeroizing;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 Course-snatching/0.10";
-
-const MAX_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
+pub(super) const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 Course-snatching/0.10";
+pub(super) const MAX_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
-struct ProfileContext {
-    project_id: Option<String>,
-    semester_id: Option<String>,
+pub(super) struct ProfileContext {
+    pub(super) project_id: Option<String>,
+    pub(super) semester_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ResponseHandling {
+    Standard { allow_login_page: bool },
+    LoginSubmission,
 }
 
 pub struct EamsClient {
-    http: Client,
-    base: Url,
-    debug_dump_enabled: bool,
-    profile_context: Mutex<HashMap<String, ProfileContext>>,
+    pub(super) http: Client,
+    pub(super) base: Url,
+    pub(super) debug_dump_enabled: bool,
+    pub(super) profile_context: Mutex<HashMap<String, ProfileContext>>,
+    pub(super) governor: std::sync::Arc<RequestGovernor>,
+    /// 最近一次目录解析命中的策略。
+    catalog_strategy: Mutex<Option<parse::CatalogStrategy>>,
+    /// 待上报的策略变化提示（换版预警）。
+    strategy_changes: Mutex<Vec<String>>,
+    /// 「已选课程」端点的探测结果。
+    ///
+    /// `None` = 尚未探测；`Some(None)` = 探测过且都不行（本会话不再重试）；
+    /// `Some(Some(path))` = 命中的那个。三态就是为了让「失败」也被记住——
+    /// 否则每次点击都会把候选表重打一遍。
+    elected_endpoint: Mutex<Option<Option<String>>>,
 }
 
 impl EamsClient {
-    pub fn new(base_url: &str, timeout_secs: u64, debug_dump_enabled: bool) -> Result<Self> {
-        let base = normalize_base(base_url)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_static(UA));
-        let allowed_origin = origin_key(&base);
-        let http = Client::builder()
-            .default_headers(headers)
-            .cookie_store(true)
-            .timeout(Duration::from_secs(timeout_secs.max(5)))
-            .redirect(Policy::custom(move |attempt| {
-                if attempt.previous().len() >= 12 {
-                    return attempt.error("too many redirects");
-                }
-                if origin_key(attempt.url()) == allowed_origin {
-                    attempt.follow()
-                } else {
-                    attempt.error("blocked cross-origin redirect")
-                }
-            }))
-            .build()?;
-        Ok(Self {
-            http,
-            base,
-            debug_dump_enabled,
-            profile_context: Mutex::new(HashMap::new()),
-        })
+    pub fn network_snapshot(&self) -> NetworkSnapshot {
+        self.governor.snapshot()
     }
 
-    async fn send_raw_text(
-        &self,
-        request: RequestBuilder,
-        action: &str,
-        allow_login_page: bool,
-    ) -> Result<(Url, String)> {
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("{action}失败"))?;
-        let status = response.status();
-        let final_url = response.url().clone();
-        let retry_after_secs = parse_retry_after_secs(response.headers());
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-        {
-            return Err(EamsError::ResponseTooLarge(MAX_RESPONSE_BYTES / 1024 / 1024).into());
+    /// 记录本次目录解析命中的策略，并在它变化时留下一条警告。
+    ///
+    /// 策略降级（page → js_like → json → html_table）几乎必然先于彻底解析
+    /// 失败发生。此前这条信息哪里都不记，只能等它彻底不能用了才发现。
+    fn note_catalog_strategy(&self, strategy: parse::CatalogStrategy) {
+        let mut last = self.catalog_strategy.lock();
+        if *last == Some(strategy) {
+            return;
         }
-        let bytes = read_body_limited(response, MAX_RESPONSE_BYTES)
-            .await
-            .with_context(|| format!("读取{action}响应失败"))?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        if looks_like_login_page(&final_url, &text) && !allow_login_page {
-            return Err(EamsError::AuthExpired.into());
+        let previous = last.replace(strategy);
+        if let Some(previous) = previous {
+            self.strategy_changes.lock().push(format!(
+                "课程列表解析策略从 {} 变为 {}——教务系统可能换版了，请留意后续解析失败",
+                previous.label(),
+                strategy.label()
+            ));
         }
-        let code = status.as_u16();
-        if code == 429 || (code == 503 && retry_after_secs.is_some()) {
-            let summary = summarize_html(&text);
-            return Err(EamsError::RateLimited {
-                message: if summary.is_empty() {
-                    format!("HTTP {code}")
-                } else {
-                    summary
-                },
-                retry_after_secs,
-            }
-            .into());
-        }
-        if !status.is_success() {
-            return Err(EamsError::HttpStatus {
-                status: code,
-                summary: summarize_html(&text),
-            }
-            .into());
-        }
-        Ok((final_url, text))
     }
 
-    async fn send_text(&self, request: RequestBuilder, action: &str) -> Result<String> {
-        self.send_raw_text(request, action, false)
-            .await
-            .map(|(_, text)| text)
+    /// 取走累积的策略变化提示，交给 worker 写进日志。
+    ///
+    /// 协议层不认识日志系统（那是 worker 的东西），所以用「攒起来让上层取」
+    /// 而不是回调，避免为了一条提示把两层耦合起来。
+    pub fn take_strategy_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *self.strategy_changes.lock())
+    }
+
+    /// 拉取「我的已选课程」。
+    ///
+    /// 端点在不同教务版本里差异很大，所以这里的探测受三条硬约束——档案 A-04
+    /// 指出的「解析失败清缓存 → 下一轮重新探测 → 压力更大」正反馈环，绝不能
+    /// 在这里复现：
+    ///
+    /// 1. **只由用户手动触发**，永远不进抢课主循环；
+    /// 2. **每个会话最多探测一次**，命中哪个端点会被记住；
+    /// 3. **失败也记住**，不会每次点击都把候选表重打一遍。
+    pub async fn fetch_elected_lessons(&self, profile_id: &str) -> Result<Vec<Lesson>> {
+        let pid = validate_numeric_id(profile_id, "profileId", true)?;
+
+        // 先把探测结果复制出来：parking_lot 的 guard 不能跨 await 持有
+        // （`if let` 的 scrutinee 临时值会活到整个块结束）。
+        let cached = self.elected_endpoint.lock().clone();
+        // 已知失败：直接说清楚，不再打任何请求。
+        if matches!(cached, Some(None)) {
+            bail!("本教务系统未找到可用的「已选课程」接口（本次会话不再重试）");
+        }
+        // 已知可用：只打那一个。
+        if let Some(Some(path)) = cached {
+            let text = self
+                .get_text_with_priority(&path, RequestPriority::Refresh)
+                .await?;
+            return parse_catalog_with_strategy(&text)
+                .map(|(lessons, _)| lessons)
+                .context("已选课程列表解析失败");
+        }
+
+        // 首次：按候选表探测一轮，然后把结果（成功或失败）记死。
+        const CANDIDATES: [&str; 4] = [
+            "stdElectCourse!queryStdCount.action",
+            "stdElectCourse!defaultPage.action",
+            "stdElectCourse!innerIndex.action",
+            "stdElectCourse.action",
+        ];
+        let mut last_error: Option<anyhow::Error> = None;
+        for candidate in CANDIDATES {
+            let path = if pid == "0" {
+                candidate.to_string()
+            } else {
+                format!("{candidate}?profileId={pid}")
+            };
+            match self
+                .get_text_with_priority(&path, RequestPriority::Refresh)
+                .await
+            {
+                Ok(text) => {
+                    // 「解析成功且非空」不能当验收标准：候选表里的
+                    // defaultPage / innerIndex / stdElectCourse 本身就是**选课
+                    // 目录页**，它们用同一套 lessonJSONs，永远解析成功、永远
+                    // 非空。只看这个，等于稳定地把整个可选目录认成已选课程，
+                    // 然后把它摆在退课按钮旁边。必须要有已选视图的正面证据。
+                    if !has_drop_control(&text) {
+                        continue;
+                    }
+                    if let Ok((lessons, _)) = parse_catalog_with_strategy(&text) {
+                        if !lessons.is_empty() {
+                            *self.elected_endpoint.lock() = Some(Some(path));
+                            return Ok(lessons);
+                        }
+                    }
+                }
+                Err(error) => {
+                    // 登录失效要立刻上报，不要被当成「这个端点不行」继续试。
+                    if is_auth_error(&error) {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        // 记住失败，之后不再探测。
+        *self.elected_endpoint.lock() = Some(None);
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!("本教务系统未找到可用的「已选课程」接口（本次会话不再重试）")
+        }))
+    }
+
+    /// 退课。
+    ///
+    /// 与选课走同一个 `batchOperator` 端点，只是 `optype=false`——也就是说
+    /// 它不引入任何新的端点猜测。仍然过提交闸门与令牌桶：退课同样是写操作，
+    /// 没有理由绕开治理。
+    ///
+    /// 故意**不**做自动化：退课是不可逆的（名额立刻放给别人），只由用户在
+    /// 已选课程列表里显式点击触发。
+    pub async fn drop_lesson(&self, profile_id: &str, lesson_id: &str) -> Result<ElectResult> {
+        let pid = validate_numeric_id(profile_id, "profileId", true)?;
+        let lesson_id = validate_numeric_id(lesson_id, "lessonId", false)?;
+
+        let mut url = self.url("stdElectCourse!batchOperator.action")?;
+        if pid != "0" {
+            url.query_pairs_mut().append_pair("profileId", pid);
+        }
+        let mut referer = self.url("stdElectCourse!defaultPage.action")?;
+        if pid != "0" {
+            referer
+                .query_pairs_mut()
+                .append_pair("electionProfile.id", pid);
+        }
+        // operator0 的第二段是「是否选中」：退课就是 false。
+        let operator = format!("{lesson_id}:false:0");
+        let form = [("optype", "false"), ("operator0", operator.as_str())];
+        let text = {
+            let _guard = self.governor.enter_submission().await;
+            self.send_text_with_priority(
+                self.http
+                    .post(url)
+                    .header(REFERER, referer.as_str())
+                    .form(&form),
+                "退课",
+                RequestPriority::Submission,
+            )
+            .await?
+        };
+        Ok(classify_elect_response(&text))
+    }
+
+    /// 当前命中的解析策略标签，供诊断包如实记录。
+    pub fn catalog_strategy_label(&self) -> Option<&'static str> {
+        self.catalog_strategy
+            .lock()
+            .map(parse::CatalogStrategy::label)
+    }
+
+    pub fn set_burst_mode(&self, enabled: bool) {
+        self.governor.set_burst_mode(enabled);
+    }
+
+    pub fn circuit_is_open(&self) -> bool {
+        self.governor.circuit_is_open()
+    }
+
+    /// 供 worker 端到端测试构造“治理层冷却中”的场景。
+    #[cfg(test)]
+    pub fn set_cooldown_for_tests(&self, duration: Duration) {
+        self.governor.set_cooldown_for_tests(duration);
     }
 
     pub fn matches_base_url(&self, raw: &str) -> bool {
         normalize_base(raw).is_ok_and(|url| url == self.base)
     }
 
-    fn save_debug(&self, name: &str, content: &str) -> bool {
-        self.debug_dump_enabled && save_debug_text(name, content).is_ok()
+    /// 调试转储可达 12MB 且伴随目录扫描；worker runtime 只有 2 个线程，
+    /// 同步写盘会阻塞选课提交与定时器，因此移到阻塞线程池执行。
+    pub(super) async fn save_debug(&self, name: &str, content: &str) -> bool {
+        if !self.debug_dump_enabled {
+            return false;
+        }
+        let name = name.to_string();
+        let content = content.to_string();
+        tokio::task::spawn_blocking(move || save_debug_text(&name, &content).is_ok())
+            .await
+            .unwrap_or(false)
     }
 
-    fn url(&self, path: &str) -> Result<Url> {
+    pub(super) fn url(&self, path: &str) -> Result<Url> {
         if path.starts_with("http://") || path.starts_with("https://") {
             bail!("内部请求路径不能是绝对 URL");
         }
         let p = path.trim_start_matches('/');
         Ok(self.base.join(p)?)
-    }
-
-    /// 程序内登录：GET 登录页取 salt + cookie，再 POST 加密密码
-    /// 教务有“请不要过快点击”限流，因此内置等待与自动重试。
-    pub async fn login(&self, username: &str, password: &str) -> Result<()> {
-        let username = username.trim();
-        if username.is_empty() || password.is_empty() {
-            bail!("账号和密码不能为空");
-        }
-
-        let mut last_error: Option<anyhow::Error> = None;
-        for attempt in 1..=4 {
-            match self.login_once(username, password).await {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    let rate_limited = is_rate_limit_error(&error)
-                        || ["过快", "太快", "频繁", "稍后"]
-                            .iter()
-                            .any(|marker| error.to_string().contains(marker));
-                    if !rate_limited {
-                        return Err(error);
-                    }
-                    last_error = Some(error);
-                    if attempt < 4 {
-                        let wait_ms = 1200u64 * attempt as u64;
-                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-                    }
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| anyhow!("登录失败")))
-    }
-
-    async fn login_once(&self, username: &str, password: &str) -> Result<()> {
-        let login_url = self.url("loginExt.action")?;
-
-        // 1) 打开登录页，拿到 JSESSIONID + 动态 salt
-        let (_, login_html) = self
-            .send_raw_text(
-                self.http
-                    .get(login_url.clone())
-                    .header(REFERER, self.base.as_str()),
-                "打开登录页",
-                true,
-            )
-            .await?;
-        let salt = extract_password_salt(&login_html)
-            .ok_or_else(|| anyhow!("无法从登录页解析密码 salt，页面可能已改版"))?;
-
-        // 模拟人工：打开页面后稍等再提交，避免被当成连点
-        tokio::time::sleep(Duration::from_millis(800)).await;
-
-        // Hash salt and password in pieces so the password is never materialised
-        // into an intermediate non-zeroizing String.
-        let encoded = Zeroizing::new(sha1_password(salt.as_str(), password));
-        let form = [
-            ("username", username),
-            ("password", encoded.as_str()),
-            ("session_locale", "zh_CN"),
-        ];
-
-        // 2) 提交登录
-        let (final_url, body) = self
-            .send_raw_text(
-                self.http
-                    .post(login_url.clone())
-                    .header(REFERER, login_url.as_str())
-                    .header(
-                        CONTENT_TYPE,
-                        "application/x-www-form-urlencoded; charset=UTF-8",
-                    )
-                    .form(&form),
-                "提交登录",
-                true,
-            )
-            .await?;
-
-        if looks_like_login_page(&final_url, &body) {
-            let reason =
-                extract_login_error(&body).unwrap_or_else(|| "账号或密码错误，或需要验证码".into());
-            // 统一文案，方便上层识别限流
-            if reason.contains("过快") || reason.contains("太快") || reason.contains("频繁") {
-                return Err(EamsError::RateLimited {
-                    message: reason,
-                    retry_after_secs: None,
-                }
-                .into());
-            }
-            bail!("{reason}");
-        }
-
-        // 再访问一次首页确认会话
-        if self.ensure_logged_in().await.is_err() {
-            bail!("登录后会话无效，请重试");
-        }
-        Ok(())
-    }
-
-    pub async fn ensure_logged_in(&self) -> Result<()> {
-        let home = self.url("homeExt.action")?;
-        self.send_text(self.http.get(home), "验证登录状态").await?;
-        Ok(())
     }
 
     /// 解析当前可选课轮次。返回 (id, 备注说明)
@@ -268,7 +339,10 @@ impl EamsClient {
         let mut successful_requests = 0usize;
         let mut last_error: Option<anyhow::Error> = None;
         for path in paths {
-            match self.get_text(path).await {
+            match self
+                .get_text_with_priority(path, RequestPriority::Session)
+                .await
+            {
                 Ok(text) => {
                     successful_requests += 1;
                     debug_blob.push_str(&format!("\n===== {path} len={} =====\n", text.len()));
@@ -322,16 +396,21 @@ impl EamsClient {
                 .then_with(|| left.0.cmp(&right.0))
         });
 
-        self.save_debug("profiles_probe.txt", &debug_blob);
+        self.save_debug("profiles_probe.txt", &debug_blob).await;
         Ok(out)
     }
 
-    /// 进入指定选课轮次（模拟页面“进入选课>>>”）
-    /// 会尝试多种常见 Beangen EAMS 入口，返回最像真实选课页的响应。
-    pub async fn enter_elect_profile(&self, profile_id: &str) -> Result<String> {
+    /// 进入指定选课轮次（模拟页面“进入选课>>>”），继承调用方优先级。
+    async fn enter_elect_profile_with_priority(
+        &self,
+        profile_id: &str,
+        priority: RequestPriority,
+    ) -> Result<String> {
         let pid = validate_numeric_id(profile_id, "profileId", true)?;
         if pid == "0" {
-            return self.get_text("stdElectCourse!defaultPage.action").await;
+            return self
+                .get_text_with_priority("stdElectCourse!defaultPage.action", priority)
+                .await;
         }
 
         let default_url = self.url("stdElectCourse!defaultPage.action")?;
@@ -344,7 +423,10 @@ impl EamsClient {
         ] {
             let mut url = default_url.clone();
             url.query_pairs_mut().append_pair(query_name, pid);
-            match self.send_text(self.http.get(url), "进入选课轮次").await {
+            match self
+                .send_text_with_priority(self.http.get(url), "进入选课轮次", priority)
+                .await
+            {
                 Ok(text) => {
                     if score_elect_page(&text) >= 200 {
                         return Ok(text);
@@ -357,7 +439,10 @@ impl EamsClient {
         }
 
         let referer = self.url("stdElectCourse.action")?;
-        match self.get_text("stdElectCourse.action").await {
+        match self
+            .get_text_with_priority("stdElectCourse.action", priority)
+            .await
+        {
             Ok(_) => {}
             Err(error) if is_auth_error(&error) => return Err(error),
             Err(error) => last_error = Some(error),
@@ -376,12 +461,13 @@ impl EamsClient {
         ];
         for (label, form) in forms {
             match self
-                .send_text(
+                .send_text_with_priority(
                     self.http
                         .post(default_url.clone())
                         .header(REFERER, referer.as_str())
                         .form(&form),
                     "进入选课轮次",
+                    priority,
                 )
                 .await
             {
@@ -402,7 +488,8 @@ impl EamsClient {
             .map(|(_, text)| text)
             .unwrap_or_default();
         if score_elect_page(&best) < 200 {
-            self.save_debug(&format!("enter_profile_{pid}.html"), &best);
+            self.save_debug(&format!("enter_profile_{pid}.html"), &best)
+                .await;
         }
         if best.is_empty() {
             return Err(last_error
@@ -418,6 +505,43 @@ impl EamsClient {
     /// 2) GET stdElectCourse!data.action?profileId=...  -> var lessonJSONs = [...]
     /// 3) GET stdElectCourse!queryStdCount.action?profileId=...&projectId=...&semesterId=...
     pub async fn fetch_lessons(&self, profile_id: &str) -> Result<Vec<Lesson>> {
+        self.fetch_lessons_for_monitoring(profile_id)
+            .await
+            .map(|(lessons, _complete)| lessons)
+    }
+
+    /// 一轮监控用的目录 + 人数拉取。
+    ///
+    /// `pub` 是为了让 `tests/request_budget.rs` 能断言单轮请求预算——那条
+    /// 断言挡的是「解析失败清缓存 → 下一轮重新探测」这类请求放大的正反馈环。
+    pub async fn fetch_lessons_for_monitoring(
+        &self,
+        profile_id: &str,
+    ) -> Result<(Vec<Lesson>, bool)> {
+        let _refresh_guard = self.governor.enter_refresh().await;
+        self.fetch_lessons_under_refresh_gate(profile_id, RequestPriority::Refresh)
+            .await
+    }
+
+    /// Background keepalive is skipped while a full refresh is active, so it
+    /// never waits in the full-refresh FIFO ahead of foreground work.
+    pub async fn fetch_lessons_for_keepalive(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<Vec<Lesson>>> {
+        let Some(_refresh_guard) = self.governor.try_enter_refresh() else {
+            return Ok(None);
+        };
+        self.fetch_lessons_under_refresh_gate(profile_id, RequestPriority::KeepAlive)
+            .await
+            .map(|(lessons, _complete)| Some(lessons))
+    }
+
+    async fn fetch_lessons_under_refresh_gate(
+        &self,
+        profile_id: &str,
+        priority: RequestPriority,
+    ) -> Result<(Vec<Lesson>, bool)> {
         let pid = validate_numeric_id(profile_id, "profileId", true)?;
 
         // 每个登录会话只需建立一次轮次上下文，后续轮询直接请求数据接口。
@@ -425,7 +549,7 @@ impl EamsClient {
         let (project_id, semester_id, entered) = if let Some(context) = cached_context {
             (context.project_id, context.semester_id, String::new())
         } else {
-            let entered = match self.enter_elect_profile(pid).await {
+            let entered = match self.enter_elect_profile_with_priority(pid, priority).await {
                 Ok(text) => text,
                 Err(error) if is_auth_error(&error) => return Err(error),
                 Err(_) => String::new(),
@@ -445,34 +569,40 @@ impl EamsClient {
 
         // 核心：课程 JSON（其实是 JS 对象字面量）
         let data_path = format!("stdElectCourse!data.action?profileId={pid}");
-        let data_text = match self.get_text(&data_path).await {
+        let data_text = match self.get_text_with_priority(&data_path, priority).await {
             Ok(text) => text,
             Err(error) => {
                 self.profile_context.lock().remove(pid);
-                return Err(error).with_context(|| format!("请求课程数据失败: {data_path}"));
+                return Err(error).context("请求课程数据失败");
             }
         };
         // data dump on failure below
 
-        let mut lessons = match parse_lessons_from_page(&data_text)
-            .or_else(|_| parse_lessons_js_like(&data_text))
-            .or_else(|_| parse_lessons_json(&data_text))
-        {
-            Ok(lessons) => lessons,
-            Err(error) => {
+        let mut lessons = match parse_catalog_with_strategy(&data_text) {
+            Ok((lessons, strategy)) => {
+                // 命中的策略是「教务换版」最早的信号——通常在彻底解析失败的
+                // 几天之前就会先降级。记下来，别等到完全不能用才发现。
+                self.note_catalog_strategy(strategy);
+                lessons
+            }
+            Err(_error) => {
                 self.profile_context.lock().remove(pid);
-                let saved = self.save_debug("lessons_last.html", &data_text);
+                let saved = self.save_debug("lessons_last.html", &data_text).await;
                 if !entered.is_empty() {
-                    self.save_debug(&format!("fetch_enter_{pid}.html"), &entered);
+                    self.save_debug(&format!("fetch_enter_{pid}.html"), &entered)
+                        .await;
                 }
                 let hint = if saved {
-                    "，原始响应已保存到 runtime/debug/lessons_last.html"
+                    "，原始响应已保存到用户数据目录的 debug/lessons_last.html"
                 } else if self.debug_dump_enabled {
                     "，但调试响应保存失败"
                 } else {
                     "；可在高级设置中临时开启原始调试页面后重试"
                 };
-                return Err(error).with_context(|| format!("解析课程数据失败{hint}"));
+                return Err(EamsError::Parse {
+                    message: format!("解析课程数据失败{hint}"),
+                }
+                .into());
             }
         };
 
@@ -504,7 +634,7 @@ impl EamsClient {
         // 失败时课程保持 SeatInfo::Unknown，由上层决定是否提交。
         let mut merged_counts = 0usize;
         for path in count_paths {
-            match self.get_text(&path).await {
+            match self.get_text_with_priority(&path, priority).await {
                 Ok(counts) => {
                     let n = merge_lesson_counts(&mut lessons, &counts);
                     if n > 0 {
@@ -522,8 +652,6 @@ impl EamsClient {
                 Err(_) => {}
             }
         }
-        let _ = merged_counts;
-
         if lessons.is_empty() {
             // 兜底：旧解析路径
             if !entered.is_empty() {
@@ -537,26 +665,38 @@ impl EamsClient {
 
         if lessons.is_empty() {
             self.profile_context.lock().remove(pid);
-            self.save_debug("lessons_last.html", &data_text);
+            self.save_debug("lessons_last.html", &data_text).await;
             if !entered.is_empty() {
-                self.save_debug(&format!("fetch_enter_{pid}.html"), &entered);
+                self.save_debug(&format!("fetch_enter_{pid}.html"), &entered)
+                    .await;
             }
             let hint = if self.debug_dump_enabled {
-                "，请检查 runtime/debug/lessons_last.html"
+                "，请检查用户数据目录的 debug/lessons_last.html"
             } else {
                 "；可在高级设置中临时开启原始调试页面后重试"
             };
-            bail!("未能解析课程列表。请确认选课已开放{hint}");
+            return Err(EamsError::Parse {
+                message: format!("未能解析课程列表。请确认选课已开放{hint}"),
+            }
+            .into());
         }
-        Ok(lessons)
+        Ok((lessons, merged_counts > 0))
     }
 
     /// 提交选课；对“成功”响应做轻量二次确认，降低误报。
+    ///
+    /// 闸门只包住那一个 POST。原实现把二次确认也圈在提交闸门（单许可信号量）
+    /// 里，于是一次提交实际占用 3 个 RTT + 50ms，且三个请求全部走最高优先级
+    /// ——目标 A 的「事后确认」会插队挡住目标 B 的真实提交。N=3 时单轮光提交
+    /// 就要 1.1s 以上，而 README 建议冲刺间隔填 0.05–0.15s。也就是说在最需要
+    /// 快的 20 秒里，超过一半的请求预算花在「确认刚才那次是不是真成了」，
+    /// 而这个信息下一轮目录刷新本来就会给出来。
     pub async fn elect_lesson(
         &self,
         profile_id: &str,
         lesson_id: &str,
         prior_selected: Option<u32>,
+        confirm: ConfirmMode,
     ) -> Result<ElectResult> {
         let pid = validate_numeric_id(profile_id, "profileId", true)?;
         let lesson_id = validate_numeric_id(lesson_id, "lessonId", false)?;
@@ -574,23 +714,36 @@ impl EamsClient {
         }
         let operator = format!("{lesson_id}:true:0");
         let form = [("optype", "true"), ("operator0", operator.as_str())];
-        let text = self
-            .send_text(
+        // 闸门只包住 POST：guard 在这个块结束时就释放，后面的确认不再占用它。
+        let text = {
+            let _submission_guard = self.governor.enter_submission().await;
+            self.send_text_with_priority(
                 self.http
                     .post(url)
                     .header(REFERER, referer.as_str())
                     .form(&form),
                 "提交选课",
+                RequestPriority::Submission,
             )
-            .await?;
+            .await?
+        };
         let result = classify_elect_response(&text);
+        if confirm == ConfirmMode::Optimistic {
+            // 冲刺窗口内不做确认：确认要花 2 个请求 + 一次等待，正好卡在最需要
+            // 速度的时刻，而它要回答的问题下一轮目录刷新本来就会回答。误报由
+            // 「已经选过」强标记在下一轮自然收敛。
+            return Ok(result);
+        }
         if let ElectResult::Success { detail } = &result {
             match self
                 .verify_elect_success(pid, lesson_id, before_selected, detail)
                 .await
             {
+                // 复核存疑不终态化：真实成功被误判为失败会让 monitor 永久放弃
+                // 已选上的课；保留在监控队列里，下一轮重提交时服务器会返回
+                // “已经选过”（强成功标记）自然收敛。
                 Ok(VerifyOutcome::Rejected(reason)) => {
-                    return Ok(ElectResult::Failed { detail: reason });
+                    return Ok(ElectResult::Busy { detail: reason });
                 }
                 Ok(VerifyOutcome::Confirmed) => {
                     return Ok(ElectResult::Success {
@@ -612,8 +765,8 @@ impl EamsClient {
         Ok(result)
     }
 
-    /// 成功响应后的确认：人数上升 / 不在可选列表 / 已满 视为确认；
-    /// 若仍有余量且人数未变，且响应文案偏弱，则拒绝以免误报。
+    /// 成功响应后的确认：人数上升 / 不在可解析的课程列表 / 已满 视为确认；
+    /// 若仍有余量且人数未变，且响应文案偏弱，则标记存疑待下轮复核。
     async fn verify_elect_success(
         &self,
         profile_id: &str,
@@ -622,13 +775,17 @@ impl EamsClient {
         success_detail: &str,
     ) -> Result<VerifyOutcome> {
         // Brief settle time for server-side state.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(SUBMISSION_SETTLE).await;
 
         let data_path = format!("stdElectCourse!data.action?profileId={profile_id}");
-        let data_text = self.get_text(&data_path).await?;
-        if !data_text.contains(lesson_id) {
-            return Ok(VerifyOutcome::Confirmed);
-        }
+        // 确认走 Refresh 优先级：它不是延迟敏感的，绝不能插队挡住别的目标的
+        // 真实提交（原实现三个请求全走 Submission，rank 0）。
+        let data_text = self
+            .get_text_with_priority(&data_path, RequestPriority::Refresh)
+            .await?;
+        // 注意：不能凭“页面不含 lesson_id 子串”就判 Confirmed——HTTP 200 的
+        // 异常壳页（如“请求参数非法”）天然不含数字 id。必须先解析出非空
+        // 课程列表，列表中确实没有该课才算确认；页面不可解析则存疑。
         let mut lessons = parse_lessons_from_page(&data_text)
             .or_else(|_| parse_lessons_js_like(&data_text))
             .or_else(|_| parse_lessons_json(&data_text))
@@ -637,39 +794,66 @@ impl EamsClient {
             return Ok(VerifyOutcome::Inconclusive);
         }
         let count_path = format!("stdElectCourse!queryStdCount.action?profileId={profile_id}");
-        if let Ok(counts) = self.get_text(&count_path).await {
+        if let Ok(counts) = self
+            .get_text_with_priority(&count_path, RequestPriority::Refresh)
+            .await
+        {
             let _ = merge_lesson_counts(&mut lessons, &counts);
         }
         let Some(lesson) = lessons.iter().find(|l| l.id == lesson_id) else {
             return Ok(VerifyOutcome::Confirmed);
         };
 
-        if let (Some(before), Some(after)) = (before_selected, lesson.seat.selected()) {
-            if after > before {
-                return Ok(VerifyOutcome::Confirmed);
-            }
-        }
+        // ── 全局人数差不再作为「确认成功」的证据 ────────────────────
+        //
+        // 抢课高峰同一秒内有大量其他学生进出：`after > before` 完全可能由
+        // 别人造成，把失败判成成功是这里唯一不可接受的错误——一旦误判，
+        // monitor 会把目标移出 pending，等于永久放弃一门其实没抢到的课。
+        // 基线还是上一轮的陈旧快照，误差更大。
+        //
+        // 唯一与他人行为无关的权威判据是「这门课还在不在我的可选列表里」：
+        // 选上之后它就不该再出现在可选目录中。已经在上面判过了。
+        //
+        // 人数变化仍然有用，但只用作「存疑」的弱信号，不作为终态证据。
+        let counts_moved = matches!(
+            (before_selected, lesson.seat.selected()),
+            (Some(before), Some(after)) if after > before
+        );
+        let strong = success_detail.contains("选课成功")
+            || success_detail.contains("已经选过")
+            || success_detail.contains("已选过")
+            || success_detail.contains("操作成功");
+
         if lesson.seat.is_full() {
+            // 课程已满且我们刚提交成功：再抢也没有意义，按确认处理与原逻辑一致。
+            // （即便这一名额是别人占的，把目标留在 pending 也只会空转。）
             return Ok(VerifyOutcome::Confirmed);
         }
-        if lesson.seat.has_seat() {
-            let strong = success_detail.contains("选课成功")
-                || success_detail.contains("已经选过")
-                || success_detail.contains("已选过")
-                || success_detail.contains("操作成功");
-            if !strong {
-                return Ok(VerifyOutcome::Rejected(
-                    "提交返回疑似成功，但人数未变化且课程仍可选，已按失败处理".into(),
-                ));
-            }
-            return Ok(VerifyOutcome::Inconclusive);
+        if lesson.seat.has_seat() && !strong && !counts_moved {
+            // 弱成功文案 + 人数一点没动 + 课程仍可选：三者同时成立时最像
+            // 「其实没成功」。仍然只降级成存疑（上层映射为 Busy 保留重试），
+            // 绝不终态化——真实成功被误判为失败的代价更大。
+            return Ok(VerifyOutcome::Rejected(
+                "提交返回疑似成功，但人数未变化且课程仍可选，下轮将复核重试".into(),
+            ));
         }
         Ok(VerifyOutcome::Inconclusive)
     }
 
+    #[cfg(test)]
     async fn get_text(&self, path: &str) -> Result<String> {
+        self.get_text_with_priority(path, RequestPriority::Session)
+            .await
+    }
+
+    pub(super) async fn get_text_with_priority(
+        &self,
+        path: &str,
+        priority: RequestPriority,
+    ) -> Result<String> {
         let url = self.url(path)?;
-        self.send_text(self.http.get(url), &format!("请求 {path}"))
+        let endpoint = path.split_once('?').map_or(path, |(endpoint, _)| endpoint);
+        self.send_text_with_priority(self.http.get(url), &format!("请求 {endpoint}"), priority)
             .await
     }
 }
@@ -706,9 +890,10 @@ mod tests {
 
     #[test]
     fn election_result_does_not_treat_failure_as_success() {
+        // “请稍后重试”是明确的重试邀请：归为可重试的 Busy，而非成功或终态失败
         assert!(matches!(
             classify_elect_response("操作未成功，请稍后重试"),
-            ElectResult::Failed { .. }
+            ElectResult::Busy { .. }
         ));
         assert!(matches!(
             classify_elect_response("选课成功"),
@@ -722,6 +907,104 @@ mod tests {
             classify_elect_response(r#"{"success":false,"message":"时间冲突"}"#),
             ElectResult::Failed { .. }
         ));
+    }
+
+    #[test]
+    fn terminal_rejections_containing_bare_full_substring_are_not_full() {
+        // 学分/门数上限类终态拒绝含裸“已满”，不能归为可重试的 Full
+        assert!(matches!(
+            classify_elect_response("本学期学分已满，不允许再选"),
+            ElectResult::Failed { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response("选课门数已满"),
+            ElectResult::Failed { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response(r#"{"success":false,"message":"学分已满，不允许再选"}"#),
+            ElectResult::Failed { .. }
+        ));
+        // 容量语境的“已满”仍是 Full，即便文案同时含“失败”
+        assert!(matches!(
+            classify_elect_response("选课失败：人数已满"),
+            ElectResult::Full { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response("名额已满"),
+            ElectResult::Full { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response(r#"{"success":false,"message":"上限人数已满"}"#),
+            ElectResult::Full { .. }
+        ));
+    }
+
+    #[test]
+    fn transient_busy_texts_are_retryable_not_terminal() {
+        assert!(matches!(
+            classify_elect_response("系统繁忙，请稍后再试"),
+            ElectResult::Busy { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response("请不要过快点击"),
+            ElectResult::Busy { .. }
+        ));
+        assert!(matches!(
+            classify_elect_response(r#"{"success":false,"message":"系统繁忙，请稍后再试"}"#),
+            ElectResult::Busy { .. }
+        ));
+        // 明确业务拒绝不受瞬态词表误伤
+        assert!(matches!(
+            classify_elect_response("时间冲突，不允许选课"),
+            ElectResult::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn weak_success_with_unchanged_count_stays_retryable_for_reverify() {
+        // JSON success:true 但 message 无强标记，50ms 后人数未变且仍有余量：
+        // 不能终态判失败（真实成功会被永久放弃），应保留下一轮复核。
+        let submit = r#"{"success":true,"message":"提交选课申请成功"}"#;
+        let data = "var lessonJSONs=[{id:371644,no:'ABC.001',name:'Rust',teachers:'张老师',stdCount:2,limitCount:30}];";
+        let counts = "window.lessonId2Counts={'371644':{sc:2,lc:30}}";
+        let base = serve_many(vec![submit, data, counts]);
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let result = test_runtime()
+            .block_on(client.elect_lesson("0", "371644", Some(2), ConfirmMode::Verify))
+            .unwrap();
+        assert!(
+            matches!(&result, ElectResult::Busy { detail } if detail.contains("复核")),
+            "expected retryable busy, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_shell_page_is_inconclusive_not_confirmed() {
+        // HTTP 200 异常壳页不含数字 id，不能凭“页面不含 lesson_id”判 Confirmed
+        let base = serve_many(vec!["选课成功", "<html>请求参数非法</html>"]);
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let result = test_runtime()
+            .block_on(client.elect_lesson("0", "371644", Some(2), ConfirmMode::Verify))
+            .unwrap();
+        assert!(
+            matches!(&result, ElectResult::Success { detail } if detail.contains("暂不确定")),
+            "expected inconclusive success, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_confirms_when_lesson_absent_from_parsed_catalog() {
+        let others = "var lessonJSONs=[{id:999888,no:'XYZ.001',name:'其他课',teachers:'李老师',stdCount:1,limitCount:2}];";
+        let counts = "window.lessonId2Counts={'999888':{sc:1,lc:2}}";
+        let base = serve_many(vec!["选课成功", others, counts]);
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let result = test_runtime()
+            .block_on(client.elect_lesson("0", "371644", Some(2), ConfirmMode::Verify))
+            .unwrap();
+        assert!(
+            matches!(&result, ElectResult::Success { detail } if detail.contains("已二次确认")),
+            "expected confirmed success, got {result:?}"
+        );
     }
 
     #[test]
@@ -758,13 +1041,85 @@ mod tests {
         assert_eq!(second[0].no, "ABC.001");
     }
 
+    // C-03：国内高校 EAMS 基本都挂 CAS/统一身份认证，会话过期时返回的是
+    // 302 到另一 origin 的 SSO 登录页。它被同源策略拦下后若归成普通网络
+    // 错误，登录失效检测在最常见的部署形态下整体失效——用户只会看到无限
+    // 「网络异常，N 秒后重试」，退避一路爬到 30s 直到选课结束。
+    #[test]
+    fn blocked_sso_redirect_is_auth_expired_not_a_network_error() {
+        let base = serve_redirects("https://cas.example.edu/authserver/login?service=x");
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let runtime = test_runtime();
+        let error = runtime
+            .block_on(client.fetch_lessons("0"))
+            .expect_err("cross-origin SSO redirect must fail the request");
+        assert!(
+            is_auth_error(&error),
+            "SSO redirect must map to AuthExpired, got {error:#}"
+        );
+        assert_eq!(backend_error_kind(&error), BackendErrorKind::AuthExpired);
+    }
+
+    // 跳到与登录无关的第三方（图床、统计）仍然按普通拦截处理，
+    // 不能反过来把任意跨域跳转都当成会话过期。
+    #[test]
+    fn unrelated_cross_origin_redirect_stays_a_transport_error() {
+        let base = serve_redirects("https://cdn.example.net/assets/logo.png");
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let runtime = test_runtime();
+        let error = runtime
+            .block_on(client.fetch_lessons("0"))
+            .expect_err("cross-origin redirect must fail the request");
+        assert!(!is_auth_error(&error), "must not be treated as auth expiry");
+        assert_eq!(backend_error_kind(&error), BackendErrorKind::Redirect);
+    }
+
+    /// 每个连接都回 302 到指定 Location。
+    fn serve_redirects(location: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{address}/eams/")
+    }
+
     #[test]
     fn validates_base_url_security_and_normalization() {
         assert!(normalize_base("http://example.com").is_err());
+        // 没填路径时才猜 /eams/。
         let local = normalize_base("http://127.0.0.1:3000").unwrap();
         assert_eq!(local.path(), "/eams/");
         let secure = normalize_base("https://example.com/eams/").unwrap();
         assert_eq!(secure.as_str(), "https://example.com/eams/");
+
+        // A-04：用户填了路径就原样保留。此前这些会被改写成不存在的地址，
+        // 而它们恰恰是用户从浏览器地址栏复制过来的正确值。
+        assert_eq!(
+            normalize_base("https://jw.example.edu/jwxt")
+                .unwrap()
+                .path(),
+            "/jwxt/",
+            "a school deployed under /jwxt must not be rewritten to /jwxt/eams/"
+        );
+        assert_eq!(
+            normalize_base("https://jw.example.edu/eams/std")
+                .unwrap()
+                .path(),
+            "/eams/std/"
+        );
+        // query/fragment 仍然要去掉，尾斜杠仍然要补。
+        let trimmed = normalize_base("https://jw.example.edu/jwxt?a=1#x").unwrap();
+        assert_eq!(trimmed.as_str(), "https://jw.example.edu/jwxt/");
     }
 
     #[test]
@@ -809,6 +1164,113 @@ mod tests {
         assert!(requests.contains(&format!("password={expected}")));
         assert!(requests.contains("JSESSIONID=test-session"));
         assert!(!requests.contains("secret"));
+    }
+
+    #[test]
+    fn http_200_login_rate_limit_text_updates_governor_before_success() {
+        let page = r#"<form id="loginForm"><input name="password"><div class="actionError">请不要过快点击</div></form>"#;
+        let base = serve_many(vec![page]);
+        let mut client = EamsClient::new(&base, 5, false).unwrap();
+        client.governor = RequestGovernor::new_for_semantic_response_tests();
+        let login_url = client.url("loginExt.action").unwrap();
+
+        let error = test_runtime()
+            .block_on(client.send_raw_text_with_priority(
+                client.http.post(login_url),
+                "提交登录",
+                ResponseHandling::LoginSubmission,
+                RequestPriority::Session,
+            ))
+            .unwrap_err();
+
+        assert!(is_rate_limit_error(&error));
+        let snapshot = client.network_snapshot();
+        assert_eq!(snapshot.total_rate_limits, 1);
+        assert_eq!(snapshot.consecutive_errors, 1);
+        assert_eq!(
+            snapshot.last_error_kind,
+            Some(BackendErrorKind::RateLimited)
+        );
+        assert!(!snapshot.cooldown_remaining.is_zero());
+        assert_eq!(snapshot.circuit_status, CircuitStatus::Closed);
+    }
+
+    #[test]
+    fn three_http_200_login_rate_limit_pages_open_circuit() {
+        let page = r#"<form id="loginForm"><input name="password"><div class="actionError">请不要过快点击</div></form>"#;
+        let base = serve_many(vec![page, page, page]);
+        let mut client = EamsClient::new(&base, 5, false).unwrap();
+        client.governor = RequestGovernor::new_for_semantic_response_tests();
+        let login_url = client.url("loginExt.action").unwrap();
+        let runtime = test_runtime();
+
+        for attempt in 0..3 {
+            let error = runtime
+                .block_on(client.send_raw_text_with_priority(
+                    client.http.post(login_url.clone()),
+                    "提交登录",
+                    ResponseHandling::LoginSubmission,
+                    RequestPriority::Session,
+                ))
+                .unwrap_err();
+            assert!(is_rate_limit_error(&error));
+            if attempt < 2 {
+                client.governor.clear_cooldown_for_tests();
+            }
+        }
+
+        let snapshot = client.network_snapshot();
+        assert_eq!(snapshot.total_rate_limits, 3);
+        assert_eq!(snapshot.consecutive_errors, 3);
+        assert_eq!(
+            snapshot.last_error_kind,
+            Some(BackendErrorKind::RateLimited)
+        );
+        assert_eq!(snapshot.circuit_status, CircuitStatus::Open);
+        assert!(!snapshot.cooldown_remaining.is_zero());
+    }
+
+    #[test]
+    fn half_open_http_200_login_rate_limit_reopens_circuit() {
+        let page = r#"<form id="loginForm"><input name="password"><div class="actionError">请不要过快点击</div></form>"#;
+        let base = serve_many(vec![page, page, page, page]);
+        let mut client = EamsClient::new(&base, 5, false).unwrap();
+        client.governor = RequestGovernor::new_for_semantic_response_tests();
+        let login_url = client.url("loginExt.action").unwrap();
+        let runtime = test_runtime();
+
+        for attempt in 0..3 {
+            runtime
+                .block_on(client.send_raw_text_with_priority(
+                    client.http.post(login_url.clone()),
+                    "提交登录",
+                    ResponseHandling::LoginSubmission,
+                    RequestPriority::Session,
+                ))
+                .unwrap_err();
+            if attempt < 2 {
+                client.governor.clear_cooldown_for_tests();
+            }
+        }
+        tokio_sleep(&runtime, Duration::from_millis(50));
+        assert_eq!(
+            client.network_snapshot().circuit_status,
+            CircuitStatus::HalfOpen
+        );
+
+        let error = runtime
+            .block_on(client.send_raw_text_with_priority(
+                client.http.post(login_url),
+                "提交登录",
+                ResponseHandling::LoginSubmission,
+                RequestPriority::Session,
+            ))
+            .unwrap_err();
+        assert!(is_rate_limit_error(&error));
+        let snapshot = client.network_snapshot();
+        assert_eq!(snapshot.total_rate_limits, 4);
+        assert_eq!(snapshot.circuit_status, CircuitStatus::Open);
+        assert!(snapshot.cooldown_remaining >= Duration::from_millis(35));
     }
 
     #[test]
@@ -893,6 +1355,68 @@ mod tests {
     }
 
     #[test]
+    fn governance_state_survives_client_rebuild_for_same_origin() {
+        // 登录/会话失效会重建 EamsClient：同 origin 必须复用同一 governor，
+        // 限流冷却与 429 历史不能随旧实例丢弃（否则反复点登录即可绕过治理）。
+        let base = "https://governor-rebuild.test/eams";
+        let first = EamsClient::new(base, 5, false).unwrap();
+        let permit = test_runtime().block_on(first.governor.acquire(RequestPriority::Session));
+        first.governor.record_failure(
+            &permit,
+            BackendErrorKind::RateLimited,
+            Some(Duration::from_secs(120)),
+        );
+        drop(first);
+
+        let rebuilt = EamsClient::new(base, 5, false).unwrap();
+        let snapshot = rebuilt.network_snapshot();
+        assert_eq!(snapshot.total_rate_limits, 1);
+        assert!(
+            !snapshot.cooldown_remaining.is_zero(),
+            "cooldown must survive the client rebuild"
+        );
+
+        let other = EamsClient::new("https://governor-other.test/eams", 5, false).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&rebuilt.governor, &other.governor));
+        assert_eq!(other.network_snapshot().total_rate_limits, 0);
+    }
+
+    #[test]
+    fn long_server_retry_after_is_not_truncated() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = "too many requests";
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 300\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let base = format!("http://{address}/eams");
+        let client = EamsClient::new(&base, 5, false).unwrap();
+        let error = test_runtime()
+            .block_on(client.get_text("stdElectCourse!data.action?profileId=0"))
+            .unwrap_err();
+        assert!(is_rate_limit_error(&error));
+        // 服务器要求的 300s 冷却全程不被截断（解析层与治理层上限一致）。
+        assert_eq!(
+            rate_limit_retry_after(&error),
+            Some(Duration::from_secs(300))
+        );
+        let snapshot = client.network_snapshot();
+        assert!(snapshot.cooldown_remaining > Duration::from_secs(240));
+    }
+
+    #[test]
     fn rate_limited_response_honors_retry_after_header() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -970,8 +1494,11 @@ mod tests {
 
         let base = format!("http://{address}/eams");
         let client = EamsClient::new(&base, 5, false).unwrap();
-        let lessons = test_runtime().block_on(client.fetch_lessons("0")).unwrap();
+        let (lessons, complete_refresh) = test_runtime()
+            .block_on(client.fetch_lessons_for_monitoring("0"))
+            .unwrap();
         assert_eq!(lessons.len(), 1);
+        assert!(!complete_refresh);
         assert!(!lessons[0].capacity_known());
         assert_eq!(lessons[0].no, "ABC.001");
     }
@@ -1034,6 +1561,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    fn tokio_sleep(runtime: &tokio::runtime::Runtime, duration: Duration) {
+        runtime.block_on(async {
+            tokio::time::sleep(duration).await;
+        });
     }
 
     fn serve_many(bodies: Vec<&'static str>) -> String {

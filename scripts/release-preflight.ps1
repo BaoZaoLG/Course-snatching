@@ -8,11 +8,8 @@ $manifestPath = Join-Path $root "Cargo.toml"
 $mainPath = Join-Path $root "src\main.rs"
 
 $manifest = Get-Content -LiteralPath $manifestPath -Raw
-$versionMatch = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"')
-if (-not $versionMatch.Success) {
-    throw "无法从 Cargo.toml 读取版本号"
-}
-$version = $versionMatch.Groups[1].Value
+. (Join-Path $PSScriptRoot "cargo-version.ps1")
+$version = Get-CargoPackageVersion -Root $root
 
 if ([string]::IsNullOrWhiteSpace($Tag)) {
     $Tag = (& git -C $root describe --tags --exact-match HEAD 2>$null | Out-String).Trim()

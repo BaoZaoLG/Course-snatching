@@ -1,5 +1,6 @@
 use super::time::now_hms;
-use crate::eams::{EamsClient, Lesson};
+use crate::config::{redact_diagnostic_text, AppConfig};
+use crate::eams::{EamsClient, Lesson, NetworkSnapshot};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -88,6 +89,24 @@ pub struct SharedState {
     pub(crate) run_owner: AtomicU64,
     /// Bumped to cancel an armed scheduled start.
     pub(crate) schedule_arm_generation: AtomicU64,
+    /// 会话代际：登录开始/退出/清会话时自增。刷新与保活等后台任务完成
+    /// 时据此丢弃陈旧结果，避免旧账号数据写回新会话或误杀新会话。
+    pub(crate) session_generation: AtomicU64,
+    /// 当前精确待命的定时开抢键（YYYY-MM-DD HH:MM:SS）。
+    pub(crate) schedule_armed_key: Mutex<Option<String>>,
+    /// 已触发或已确认过期的定时开抢键：同一时刻只触发一次。
+    pub(crate) schedule_fired_key: Mutex<Option<String>>,
+    /// UI 最近一次保存的运行配置：定时到点开抢读取它而非 arm 时刻快照。
+    pub(crate) latest_config: Mutex<Option<AppConfig>>,
+    /// 本次会话保留的登录凭据（仅内存、永不落盘），用于会话过期后自动重登。
+    pub(crate) credentials: Mutex<Option<super::session::SessionCredentials>>,
+    /// 界面唤醒回调：状态一变就叫醒 UI，取代固定频率的无条件重绘。
+    repaint_waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// 「我的已选课程」。只在用户手动刷新时填充，永不进抢课主循环。
+    pub elected: Mutex<Vec<Lesson>>,
+    /// 待用户输入的验证码：图片字节。多数 EAMS 在连续登录失败若干次后强制
+    /// 上验证码，此前工具在这种情况下会永久卡死。
+    pub(crate) pending_captcha: Mutex<Option<Vec<u8>>>,
     pub logs: Mutex<VecDeque<LogItem>>,
     pub lessons: Mutex<Vec<Lesson>>,
     pub watch: Mutex<Vec<WatchStatus>>,
@@ -108,6 +127,14 @@ impl SharedState {
             run_generation: AtomicU64::new(0),
             run_owner: AtomicU64::new(0),
             schedule_arm_generation: AtomicU64::new(0),
+            session_generation: AtomicU64::new(0),
+            schedule_armed_key: Mutex::new(None),
+            schedule_fired_key: Mutex::new(None),
+            latest_config: Mutex::new(None),
+            credentials: Mutex::new(None),
+            repaint_waker: Mutex::new(None),
+            elected: Mutex::new(Vec::new()),
+            pending_captcha: Mutex::new(None),
             logs: Mutex::new(VecDeque::new()),
             lessons: Mutex::new(Vec::new()),
             watch: Mutex::new(Vec::new()),
@@ -117,11 +144,18 @@ impl SharedState {
         })
     }
 
+    /// 日志写入端就脱敏。
+    ///
+    /// 日志 message 本身携带服务器文本（summarize_html 保留 160 字符原文、
+    /// extract_login_error、各处 detail），而它有两个出口：「导出日志」和
+    /// 「导出诊断包」。此前只有后者脱敏，同一条数据从两个按钮出去一个明文
+    /// 一个脱敏，用户无从知晓这个区别。脱敏收敛到写入端后，不脱敏的出口在
+    /// 结构上就不存在了——包括界面上的日志抽屉。
     pub fn log(&self, level: LogLevel, message: impl Into<String>) {
         let item = LogItem {
             time: now_hms(),
             level,
-            message: message.into(),
+            message: redact_diagnostic_text(&message.into()),
         };
         let mut logs = self.logs.lock();
         logs.push_front(item);
@@ -132,8 +166,14 @@ impl SharedState {
     }
 
     pub fn set_message(&self, message: impl Into<String>) {
-        *self.worker_message.lock() = message.into();
+        // 状态栏同样会显示服务器文本（限流原因、登录错误），一并脱敏。
+        *self.worker_message.lock() = redact_diagnostic_text(&message.into());
         self.touch();
+    }
+
+    /// 清空本次会话保留的凭据。`Zeroizing` 会在 drop 时抹掉堆上的明文。
+    pub(crate) fn forget_credentials(&self) {
+        *self.credentials.lock() = None;
     }
 
     pub fn clear_session(&self, message: &str) {
@@ -141,13 +181,123 @@ impl SharedState {
         self.running.store(false, Ordering::Release);
         self.stopping.store(false, Ordering::Release);
         self.run_generation.fetch_add(1, Ordering::AcqRel);
+        self.invalidate_session_tasks();
+        // 会话到此为止，保留的凭据不再有用途——留着只是白白多一份明文。
+        self.forget_credentials();
         *self.client.lock() = None;
         self.lessons.lock().clear();
         self.set_message(message);
     }
 
+    /// 当前会话代际，配合 `is_current_session` 保护后台任务的回写。
+    pub(crate) fn session_token(&self) -> u64 {
+        self.session_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_current_session(&self, token: u64) -> bool {
+        self.session_generation.load(Ordering::Acquire) == token
+    }
+
+    /// 会话更替（登录开始/退出/清会话）：作废在途 refresh/keepalive 的回写。
+    pub(crate) fn invalidate_session_tasks(&self) {
+        self.session_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 登记新的定时待命：自增代际使旧待命任务退出、记录键，返回持有代际。
+    pub(crate) fn begin_schedule_arm(&self, key: &str) -> u64 {
+        let mut armed = self.schedule_armed_key.lock();
+        let arm_gen = self.schedule_arm_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *armed = Some(key.to_string());
+        arm_gen
+    }
+
+    /// 取消定时待命：代际自增并清空 armed 键。
+    pub(crate) fn cancel_schedule_arm(&self) {
+        let mut armed = self.schedule_armed_key.lock();
+        self.schedule_arm_generation.fetch_add(1, Ordering::AcqRel);
+        *armed = None;
+    }
+
+    /// 待命被手动开抢/登录打断时解除（不标记 fired，之后可重新待命）。
+    /// 仅在代际未被新待命/取消接管时清键，避免误清接管方的状态。
+    pub(crate) fn disarm_schedule_if_current(&self, arm_gen: u64) {
+        let mut armed = self.schedule_armed_key.lock();
+        if self.schedule_arm_generation.load(Ordering::Acquire) == arm_gen {
+            *armed = None;
+        }
+    }
+
+    /// 到点认领触发权：代际仍属当前待命则解除待命并把该键标记为已触发。
+    /// 返回 false 表示已被取消或新的待命接管，调用方必须放弃开抢。
+    pub(crate) fn claim_schedule_fire(&self, key: &str, arm_gen: u64) -> bool {
+        let mut armed = self.schedule_armed_key.lock();
+        if self.schedule_arm_generation.load(Ordering::Acquire) != arm_gen {
+            return false;
+        }
+        *armed = None;
+        *self.schedule_fired_key.lock() = Some(key.to_string());
+        true
+    }
+
+    /// 错过触发窗口：解除待命并把该键标记为已触发（过期不补抢）。
+    pub(crate) fn mark_schedule_expired(&self, key: &str) {
+        let mut armed = self.schedule_armed_key.lock();
+        self.schedule_arm_generation.fetch_add(1, Ordering::AcqRel);
+        *armed = None;
+        *self.schedule_fired_key.lock() = Some(key.to_string());
+    }
+
+    /// 用户修改开抢时刻后重置 fired 去重键，让新时刻可以再次触发。
+    pub(crate) fn clear_schedule_fired(&self) {
+        *self.schedule_fired_key.lock() = None;
+    }
+
+    pub(crate) fn schedule_armed_matches(&self, key: &str) -> bool {
+        self.schedule_armed_key.lock().as_deref() == Some(key)
+    }
+
+    pub(crate) fn schedule_fired_matches(&self, key: &str) -> bool {
+        self.schedule_fired_key.lock().as_deref() == Some(key)
+    }
+
+    /// 发布最新运行配置：定时到点开抢用它，而不是 arm 时刻的快照。
+    pub(crate) fn publish_config(&self, cfg: AppConfig) {
+        *self.latest_config.lock() = Some(cfg);
+    }
+
+    /// Returns the current in-memory network health for the active session.
+    ///
+    /// Network metrics are intentionally not persisted: they contain only aggregate
+    /// request behaviour for this run and reset when the user logs out.
+    pub fn network_snapshot(&self) -> NetworkSnapshot {
+        let client = self.client.lock().clone();
+        client.map_or_else(NetworkSnapshot::default, |client| client.network_snapshot())
+    }
+
+    /// 注册界面唤醒回调。
+    ///
+    /// 用回调而不是直接存 `egui::Context`，是为了让 worker 这一层保持与 UI
+    /// 无关；界面在启动时注册一次即可。
+    pub fn set_repaint_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) {
+        *self.repaint_waker.lock() = Some(waker);
+    }
+
+    /// 状态有变。
+    ///
+    /// `revision` 此前只写不读（全仓无任何读取点），worker 里几十处 touch()
+    /// 都是纯开销；界面则以固定频率无条件重绘。现在改为事件化：状态一变就
+    /// 叫醒界面，界面在空闲时可以真的空闲。
     pub(crate) fn touch(&self) {
         self.revision.fetch_add(1, Ordering::Relaxed);
+        let waker = self.repaint_waker.lock().clone();
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    /// 当前状态版本号。界面用它做脏检查，避免每帧重算派生视图。
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Relaxed)
     }
 
     pub(crate) fn is_current_run(&self, generation: u64) -> bool {
@@ -177,5 +327,31 @@ impl SharedState {
         self.running.load(Ordering::Acquire)
             || self.logging_in.load(Ordering::Acquire)
             || self.refreshing.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // S-03：脱敏收敛到写入端后，「导出日志」与「导出诊断包」两个按钮对
+    // 同一条数据必须产出相同结果——不存在未脱敏的出口，界面日志抽屉也一样。
+    #[test]
+    fn log_and_status_are_redacted_at_the_write_side() {
+        let state = SharedState::new();
+        state.log(
+            LogLevel::Error,
+            "登录失败：Set-Cookie: JSESSIONID=abc123 password=hunter2",
+        );
+        let logged = state.logs.lock().front().unwrap().message.clone();
+        for secret in ["abc123", "hunter2"] {
+            assert!(!logged.contains(secret), "log leaked {secret}: {logged}");
+        }
+        assert!(logged.contains("登录失败"), "over-redacted: {logged}");
+
+        state.set_message("限流原因：token=tk_live_1 请稍后");
+        let shown = state.worker_message.lock().clone();
+        assert!(!shown.contains("tk_live_1"), "status leaked: {shown}");
+        assert!(shown.contains("请稍后"), "over-redacted: {shown}");
     }
 }

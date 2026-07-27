@@ -83,12 +83,24 @@ fn beep(success: bool) {
 mod tests {
     use super::*;
 
+    // Both tests exercise the same process-global alert queue. Rust runs unit
+    // tests concurrently by default, so keep the clear/dispatch/take sequence
+    // atomic with respect to the other queue test.
+    static TEST_QUEUE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_test_queue() -> std::sync::MutexGuard<'static, ()> {
+        TEST_QUEUE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn clear_queue() {
         let _ = take_alerts();
     }
 
     #[test]
     fn dispatch_alert_four_switch_combinations() {
+        let _queue_guard = lock_test_queue();
         clear_queue();
 
         // Both off: nothing queued.
@@ -116,6 +128,7 @@ mod tests {
 
     #[test]
     fn push_toast_does_not_require_sound_path() {
+        let _queue_guard = lock_test_queue();
         clear_queue();
         push_toast("hello", "world", false);
         let alerts = take_alerts();

@@ -1,0 +1,55 @@
+# cargo-deny 配置。
+#
+# 换掉 cargo-audit 的理由不是那两条公告本身有多危险——SECURITY.md 的分析是
+# 对的：quick-xml 经 wayland-scanner 进入 lock 文件，Windows 目标根本不编译
+# 它。问题在于 cargo-audit 读的是 Cargo.lock 且没有 target 过滤能力，所以只能
+# 全局 --ignore，而这个动作会变成习惯：将来再出现同类的「仅 Linux 依赖」公告
+# 时，会有人顺手再加一行 ignore，真正该管的那条也就一起被放过了。
+#
+# 按 target 裁剪之后，ignore 列表可以是空的。
+
+[graph]
+# 本项目只发布 Windows x64。按目标裁剪依赖图后，非 Windows 平台才会拉进来的
+# 传递依赖（wayland/quick-xml 等）自然不在图里。
+targets = [{ triple = "x86_64-pc-windows-msvc" }]
+all-features = false
+
+[advisories]
+# 空的 ignore 列表是这份配置存在的意义。加任何一条之前，先确认它真的在
+# Windows 依赖图里——如果在，就该修依赖而不是忽略。
+ignore = []
+yanked = "deny"
+unmaintained = "workspace"
+
+[licenses]
+# 只列依赖图里真实出现的许可证。cargo-deny 会对「允许了但没用上」的条目
+# 发警告——留着无用条目等于把白名单变成许愿单，将来真出现新许可证时也就
+# 没人会去看它。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    # epaint_default_fonts 打包的内置字体：
+    #   (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0
+    # 两者都是标准的开源字体许可证，允许随软件分发。
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# 重复版本只警告：顺带能发现拖大二进制体积的重复依赖，但不该卡住构建。
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

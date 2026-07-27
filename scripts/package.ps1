@@ -1,12 +1,8 @@
 $ErrorActionPreference = "Stop"
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$manifest = Get-Content (Join-Path $root "Cargo.toml") -Raw
-$versionMatch = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"')
-if (-not $versionMatch.Success) {
-    throw "无法从 Cargo.toml 读取版本号"
-}
-$version = $versionMatch.Groups[1].Value
+. (Join-Path $PSScriptRoot "cargo-version.ps1")
+$version = Get-CargoPackageVersion -Root $root
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $distRoot = Join-Path $root "dist"
 $outDir = Join-Path $distRoot "Course-snatching-v$version-windows-x64-$stamp"
@@ -69,12 +65,25 @@ git=$git
         $sums += "$hash  $($_.Name)"
     }
     
-    # 简易 SBOM：记录直接依赖树（cargo tree）
-    try {
+    # 可机读 SBOM（CycloneDX）。此前写的是 cargo tree 的纯文本树：没有
+    # license、没有 hash、没有 PURL，只能给人看，工具链用不了，也没法配合
+    # Release 的 attest-sbom。
+    $cyclonedx = Get-Command cargo-cyclonedx -ErrorAction SilentlyContinue
+    if ($cyclonedx) {
+        cargo cyclonedx --format json --spec-version 1.5 --override-filename sbom.cdx | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "SBOM 生成失败" }
+        $sbom = Join-Path $root "sbom.cdx.json"
+        if (Test-Path -LiteralPath $sbom) {
+            Copy-Item -LiteralPath $sbom -Destination (Join-Path $outDir "sbom.cdx.json")
+            # Release workflow 直接从 dist 根目录取它做 attestation。
+            Copy-Item -LiteralPath $sbom -Destination (Join-Path $distRoot "sbom.cdx.json") -Force
+            Remove-Item -LiteralPath $sbom -Force
+        }
+    } else {
+        Write-Warning "未安装 cargo-cyclonedx，跳过 SBOM（cargo install cargo-cyclonedx --locked）"
+        # 退化为可读树，至少别让发布包里什么都没有。
         $tree = cargo tree --prefix none --edges normal 2>$null | Out-String
         Set-Content -LiteralPath (Join-Path $outDir "SBOM-cargo-tree.txt") -Value $tree -Encoding UTF8
-    } catch {
-        Write-Warning "SBOM 生成跳过：$($_.Exception.Message)"
     }
 
     Set-Content -LiteralPath (Join-Path $outDir "SHA256SUMS.txt") -Value ($sums -join "`n") -Encoding ASCII
@@ -85,7 +94,14 @@ git=$git
         $thumb = $env:COURSE_SNATCHING_SIGN_THUMBPRINT
         Get-ChildItem -LiteralPath $outDir -Filter *.exe | ForEach-Object {
             Write-Output "Authenticode 签名 $($_.Name) ..."
-            & signtool sign /sha1 $thumb /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            # 时间戳服务走 HTTPS 且可配置：单点明文 HTTP 一旦启用签名就会
+            # 变成发布流程的失败点。
+            $tsa = if ($env:COURSE_SNATCHING_TIMESTAMP_URL) {
+                $env:COURSE_SNATCHING_TIMESTAMP_URL
+            } else {
+                "https://timestamp.digicert.com"
+            }
+            & signtool sign /sha1 $thumb /fd SHA256 /tr $tsa /td SHA256 $_.FullName
             if ($LASTEXITCODE -ne 0) { throw "签名失败: $($_.Name)" }
         }
     }

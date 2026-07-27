@@ -19,10 +19,14 @@ function Invoke-CargoStep {
 
 Push-Location $root
 try {
+    # --locked：构建必须严格按 Cargo.lock 来。缺了它，CI 可能悄悄拉到与本地
+    # 不同的依赖版本，「可复现构建」也就无从谈起。
     Invoke-CargoStep "检查格式..." @("fmt", "--all", "--", "--check")
-    Invoke-CargoStep "运行 Clippy..." @("clippy", "--all-targets", "--all-features", "--", "-D", "warnings")
-    Invoke-CargoStep "运行全部目标测试..." @("test", "--all-targets")
-    Invoke-CargoStep "执行 Release 构建..." @("build", "--release")
+    Invoke-CargoStep "运行 Clippy..." @("clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings")
+    Invoke-CargoStep "运行全部目标测试..." @("test", "--locked", "--all-targets")
+    # 本项目只有 bin target，没有 lib，因此没有文档测试可跑
+    # （cargo test --doc 会直接报 "no library targets"）。
+    Invoke-CargoStep "执行 Release 构建..." @("build", "--locked", "--release")
 
     Write-Output "执行依赖安全审计..."
     & (Join-Path $PSScriptRoot "audit.ps1")

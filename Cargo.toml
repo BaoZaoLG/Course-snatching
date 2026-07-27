@@ -24,6 +24,12 @@ include = [
     "/scripts/**",
 ]
 
+# lib 存在的目的是解锁 tests/ 集成测试、fuzz/ 目标与文档测试，
+# 不是为了对外提供 API。
+[lib]
+name = "course_snatching"
+path = "src/lib.rs"
+
 [[bin]]
 name = "Course-snatching"
 path = "src/main.rs"
@@ -31,6 +37,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 eframe = { version = "0.35", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+# 教务站点仍大量使用 GB2312/GBK/GB18030。缺了它整页会变成 U+FFFD，
+# 而其上所有判定都是中文子串匹配，会整体静默失效。
+encoding_rs = "0.8"
 hex = "0.4"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["cookies", "form", "rustls", "gzip", "stream"] }
@@ -38,10 +47,10 @@ rfd = "0.17"
 scraper = { version = "0.27", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha1 = "0.10"
+sha1 = "0.11"
 thiserror = "2"
 parking_lot = "0.12"
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 toml = "1.1"
 url = "2"
 zeroize = "1"
@@ -51,8 +60,10 @@ raw-window-handle = "0.6"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
@@ -61,6 +72,9 @@ winresource = "0.1"
 
 [profile.release]
 codegen-units = 1
-strip = true
+# strip = true 会把符号全剥掉，panic hook 里的 Backtrace::force_capture()
+# 只剩裸地址——排障价值接近零，却仍然暴露模块布局。只剥调试信息，保留
+# 函数符号，崩溃报告才是可读的。
+strip = "debuginfo"
 opt-level = 3
 lto = "thin"

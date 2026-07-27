@@ -5,12 +5,29 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
 static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CONFIG_SAVE_LOCK: Mutex<()> = Mutex::new(());
+static CRASH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub const DEBUG_FILE_LIMIT: usize = 10;
+pub const DEBUG_TOTAL_BYTES_LIMIT: u64 = 20 * 1024 * 1024;
+pub const DEBUG_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+/// 当前配置结构版本。改字段语义/类型时 +1 并在迁移链里补一步。
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    // 没有版本号的旧配置就是 v1。
+    1
+}
+
+pub const CRASH_FILE_LIMIT: usize = 3;
+/// 崩溃报告也要有年龄上限：只按数量轮转的话，一份含服务器文本的报告可以
+/// 无限期留在盘上。
+pub const CRASH_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -22,6 +39,14 @@ pub struct WatchMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    /// 配置结构版本。
+    ///
+    /// `#[serde(default)]` 只能兜住「新增字段」，兜不住改语义 / 改类型 / 拆分。
+    /// 显式版本号让兼容逻辑从解析器里搬到一条可读的迁移链上——schedule_time
+    /// 从 HH:MM 升到 YYYY-MM-DD HH:MM:SS 那次改动，就是缺版本号被迫在解析器
+    /// 里长期背兼容包袱的证据。
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub base_url: String,
     pub username: String,
     pub interval_seconds: f64,
@@ -31,11 +56,19 @@ pub struct AppConfig {
     pub watch_lesson_ids: HashMap<String, String>,
     /// 课程序号对应的课程名/教师，便于监控卡片展示。
     pub watch_meta: HashMap<String, WatchMeta>,
+    /// 序号 → 互斥组名。
+    ///
+    /// 同组内「抢到任意一门就够了」：真实需求是「A/B/C 任选其一」或
+    /// 「抢到 A 就撤掉 B」，而 watch_serials 是平铺列表，所有目标彼此独立，
+    /// 抢到 A 之后仍会继续抢 B、C——多占了名额还占着学分。
+    /// 不在这张表里的序号就是独立目标，行为与以前完全一致。
+    pub watch_groups: HashMap<String, String>,
     /// 留空时自动探测；0 表示使用会话默认轮次。
     pub profile_id: String,
     pub timeout_seconds: u64,
     pub auto_fetch_on_login: bool,
-    /// 仅在排障时开启；调试文件可能包含教务页面中的个人信息。
+    /// 旧配置读取兼容字段。该开关只在当前会话有效，永不以开启状态写回配置。
+    #[serde(skip_serializing)]
     pub debug_dump_enabled: bool,
     /// 连续网络/解析失败达到该次数后自动停止，避免无效请求服务器。
     pub max_consecutive_errors: u32,
@@ -65,17 +98,50 @@ pub struct AppConfig {
     pub schedule_time: String,
     /// 开始后前 N 秒进入冲刺：更短间隔、去掉正抖动，抢开课窗口。
     pub open_burst_seconds: u32,
+    /// 是否在本次会话内保留凭据，用于会话过期后自动重登。
+    ///
+    /// 仅内存、永不落盘，退出登录与关闭程序即清空。默认开启：这是一个
+    /// 「设定时开抢、半夜挂机」的工具，会话在等待期间过期是必然事件，
+    /// 关掉它等于定时功能在最常见的情况下不可用；而内存里本来就有一份与
+    /// 账号等价的会话 Cookie，多留一份密码的边际风险有限。想关的用户可以
+    /// 在高级设置里关掉。
+    pub remember_credentials_for_session: bool,
+    /// 本程序不认识的字段原样保留。
+    ///
+    /// 结构体没有 `deny_unknown_fields`，而 `save_to` 是全量序列化：旧版读到
+    /// 新版写的配置会忽略未知字段，用户回滚一次版本，新字段就永久消失且毫无
+    /// 提示。原样带着走即可避免这种静默丢数据。
+    #[serde(flatten)]
+    pub unknown_fields: toml::Table,
+    /// 这份配置来自更高版本的程序：可以照常运行，但绝不覆盖写。
+    ///
+    /// 全量序列化保存会把新版本的字段结构改回旧形状，用户升级回去就会发现
+    /// 配置被降级过。宁可不保存，也不要静默破坏。跟着配置走而不是放全局，
+    /// 免得导入/导出与测试之间互相串味。
+    #[serde(skip)]
+    pub read_only: bool,
+    /// 冲刺期的轮询间隔（秒）。
+    ///
+    /// 冲刺此前唯一的差别只是去掉 0–10% 的正抖动，也就是最多快 10%——默认
+    /// 间隔 1.5s 时，20 秒的「冲刺窗口」只轮询约 13 次，令牌桶的 10 rps
+    /// 上限永远触发不到。真正的提速必须靠独立的冲刺间隔，让令牌桶（而不是
+    /// 用户间隔）成为限流点。
+    pub burst_interval_seconds: f64,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            unknown_fields: toml::Table::new(),
+            read_only: false,
             base_url: "https://example.edu/eams".into(),
             username: String::new(),
             interval_seconds: 1.5,
             watch_serials: vec![],
             watch_lesson_ids: HashMap::new(),
             watch_meta: HashMap::new(),
+            watch_groups: HashMap::new(),
             profile_id: String::new(),
             timeout_seconds: 15,
             auto_fetch_on_login: true,
@@ -94,6 +160,8 @@ impl Default for AppConfig {
             schedule_enabled: false,
             schedule_time: default_schedule_time(),
             open_burst_seconds: 20,
+            remember_credentials_for_session: true,
+            burst_interval_seconds: 0.2,
         }
     }
 }
@@ -101,7 +169,9 @@ impl Default for AppConfig {
 impl AppConfig {
     /// 用户配置放在 roaming AppData，避免安装目录无写权限，也避免和发布文件混在一起。
     pub fn path() -> PathBuf {
-        if let Some(dir) = std::env::var_os("APPDATA") {
+        // APPDATA 为空串时 PathBuf::from("") 会让配置落到当前工作目录——
+        // 对一个双击运行的桌面程序来说那可能是任何地方。空值按「没有」处理。
+        if let Some(dir) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
             return PathBuf::from(dir)
                 .join("Course-snatching")
                 .join("config.toml");
@@ -155,13 +225,29 @@ impl AppConfig {
         }
 
         match Self::read_from(&path) {
-            Ok(cfg) => (cfg, None),
+            Ok(mut cfg) => {
+                // Raw page dumps may contain personal information. A persisted legacy option
+                // must never silently re-enable them in a new application session.
+                cfg.debug_dump_enabled = false;
+                // 只读运行必须让用户知道，否则他改了设置却发现下次启动全没了。
+                let warning = cfg.read_only.then(|| {
+                    format!(
+                        "配置来自更高版本的程序（schema v{}，本程序支持 v{}），\
+                         本次只读运行：所有改动都不会被保存。请升级程序。",
+                        cfg.schema_version, CURRENT_SCHEMA_VERSION
+                    )
+                });
+                (cfg, warning)
+            }
             Err(error) => {
                 let backup = invalid_backup_path(&path);
                 let backup_note = match fs::copy(&path, &backup) {
                     Ok(_) => format!("，原文件已备份到 {}", backup.display()),
                     Err(copy_error) => format!("，且备份失败：{copy_error}"),
                 };
+                // 损坏备份此前不参与任何轮转：配置一直坏着的话，每次启动都会
+                // 再堆一份内容相同的 config.invalid-*.toml。
+                let _ = retain_invalid_backups(path.parent().unwrap_or(Path::new(".")));
                 (
                     Self::default(),
                     Some(format!(
@@ -177,7 +263,11 @@ impl AppConfig {
             .with_context(|| format!("读取配置失败：{}", path.display()))?;
         let mut cfg: Self =
             toml::from_str(&text).with_context(|| format!("解析配置失败：{}", path.display()))?;
+        cfg = migrate(cfg)?;
         cfg.normalize();
+        // This legacy field is accepted on read only. Raw pages can contain personal data,
+        // so every fresh application session must start with dumping disabled.
+        cfg.debug_dump_enabled = false;
         Ok(cfg)
     }
 
@@ -186,6 +276,12 @@ impl AppConfig {
     }
 
     fn save_to(&self, path: &Path) -> Result<()> {
+        if self.read_only {
+            bail!(
+                "配置来自更高版本的程序，本次以只读方式运行，未保存改动。\
+                 请升级程序，或手动备份后删除配置文件。"
+            );
+        }
         let _save_guard = CONFIG_SAVE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -231,10 +327,33 @@ impl AppConfig {
         });
         self.watch_meta
             .retain(|serial, _| serials.contains(serial.as_str()));
+        // 组名跟着目标走：目标被移除后留着组名只会让下次同名目标莫名其妙
+        // 继承一个旧分组。空组名等于没分组。
+        self.watch_groups
+            .retain(|serial, group| serials.contains(serial.as_str()) && !group.trim().is_empty());
+        for group in self.watch_groups.values_mut() {
+            *group = group.trim().to_string();
+        }
         if !self.ui_scale.is_finite() {
             self.ui_scale = 1.0;
         }
         self.ui_scale = self.ui_scale.clamp(0.9, 1.5);
+        // normalize() 是唯一的「变安全」漏斗：所有数值不变式都在这里兜底，
+        // 免得 UI 与 worker 各兜一次还漏掉导入/手改配置的路径。
+        if !self.interval_seconds.is_finite() {
+            self.interval_seconds = 1.5;
+        }
+        self.interval_seconds = self.interval_seconds.clamp(0.05, 30.0);
+        if !self.burst_interval_seconds.is_finite() {
+            self.burst_interval_seconds = 0.2;
+        }
+        // 上限取常规间隔：冲刺比常规还慢没有意义。
+        self.burst_interval_seconds = self
+            .burst_interval_seconds
+            .clamp(0.05, self.interval_seconds.max(0.05));
+        self.open_burst_seconds = self.open_burst_seconds.min(120);
+        self.timeout_seconds = self.timeout_seconds.clamp(5, 120);
+        self.max_consecutive_errors = self.max_consecutive_errors.clamp(1, 100);
         self.filter = self.filter.trim().to_string();
     }
 
@@ -319,8 +438,284 @@ impl AppConfig {
     }
 
     pub fn crash_log_path() -> PathBuf {
-        Self::data_dir().join("crash.log")
+        Self::crash_dir()
     }
+
+    pub fn debug_dir() -> PathBuf {
+        Self::data_dir().join("debug")
+    }
+
+    pub fn crash_dir() -> PathBuf {
+        Self::data_dir().join("crash")
+    }
+
+    /// Best-effort rotation for privacy-sensitive raw pages. Errors intentionally do not
+    /// interrupt login, monitoring, or a diagnostic dump.
+    pub fn retain_debug_files() -> io::Result<()> {
+        retain_files(
+            &Self::debug_dir(),
+            DEBUG_FILE_LIMIT,
+            DEBUG_TOTAL_BYTES_LIMIT,
+            Some(DEBUG_MAX_AGE_SECS),
+        )
+    }
+
+    pub fn retain_crash_reports() -> io::Result<()> {
+        retain_files(
+            &Self::crash_dir(),
+            CRASH_FILE_LIMIT,
+            u64::MAX,
+            Some(CRASH_MAX_AGE_SECS),
+        )
+    }
+
+    /// Panic reporting must not trigger a second panic. Each report has its own file so a
+    /// later crash does not overwrite the evidence from an earlier one.
+    ///
+    /// 报告在这里统一过一遍脱敏：panic payload 只要经手过服务器文本
+    /// （`.expect(&format!(...))` 一次疏忽就够）就会原样落盘，而这条曾是
+    /// 全项目唯一绕过脱敏的落盘路径。
+    pub fn write_crash_report(report: &str) -> io::Result<PathBuf> {
+        Self::write_crash_report_in(&Self::crash_dir(), report)
+    }
+
+    /// 目录可注入，测试才能验证「落盘的那份确实已脱敏」而不是往用户
+    /// 真实的 %APPDATA% 里写东西。
+    pub(crate) fn write_crash_report_in(dir: &Path, report: &str) -> io::Result<PathBuf> {
+        let report = redact_diagnostic_text(report);
+        let report = report.as_str();
+        fs::create_dir_all(dir)?;
+        let _ = retain_files(
+            dir,
+            CRASH_FILE_LIMIT.saturating_sub(1),
+            u64::MAX,
+            Some(CRASH_MAX_AGE_SECS),
+        );
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let seq = CRASH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "crash-{}-{}-{}.log",
+            std::process::id(),
+            stamp,
+            seq
+        ));
+        fs::write(&path, report)?;
+        let _ = retain_files(dir, CRASH_FILE_LIMIT, u64::MAX, Some(CRASH_MAX_AGE_SECS));
+        Ok(path)
+    }
+}
+
+impl AppConfig {
+    /// 与 `serial` 同组的其它序号（不含它自己）。
+    ///
+    /// 组是「任选其一」语义：抢到其中任意一门，其余的就该撤掉。
+    pub fn group_siblings(&self, serial: &str) -> Vec<String> {
+        let Some(group) = self.watch_groups.get(serial) else {
+            return Vec::new();
+        };
+        self.watch_groups
+            .iter()
+            .filter(|(other, other_group)| other_group == &group && other.as_str() != serial)
+            .map(|(other, _)| other.clone())
+            .collect()
+    }
+}
+
+/// 配置迁移链。
+///
+/// 每次改字段语义/类型就把 `CURRENT_SCHEMA_VERSION` +1，并在这里补一步；
+/// 兼容逻辑集中在这条链上，而不是散落进解析器（`normalize` 里那段 1970
+/// 占位符 hack 就是后者的下场）。
+fn migrate(mut cfg: AppConfig) -> Result<AppConfig> {
+    if cfg.schema_version > CURRENT_SCHEMA_VERSION {
+        // 未来版本：读得进来就照用，但绝不覆盖写回去。
+        cfg.read_only = true;
+        return Ok(cfg);
+    }
+    // v1 是当前版本，链上暂时没有步骤。新增迁移时形如：
+    //   if cfg.schema_version < 2 { ...; cfg.schema_version = 2; }
+    cfg.schema_version = CURRENT_SCHEMA_VERSION;
+    Ok(cfg)
+}
+
+#[derive(Debug)]
+struct RetainedFile {
+    path: PathBuf,
+    modified: SystemTime,
+    len: u64,
+}
+
+/// Removes oldest regular files until all supplied bounds hold. Directories and unreadable
+/// entries are left untouched, making this safe to use in a user-owned data directory.
+pub fn retain_files(
+    dir: &Path,
+    max_files: usize,
+    max_total_bytes: u64,
+    max_age_secs: Option<u64>,
+) -> io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let now = SystemTime::now();
+    let mut files = fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata.is_file().then(|| RetainedFile {
+                path: entry.path(),
+                modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+                len: metadata.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|file| file.modified);
+
+    let mut remaining_files = files.len();
+    let mut total = files.iter().map(|file| file.len).sum::<u64>();
+    for file in files {
+        let expired = max_age_secs.is_some_and(|max_age| {
+            now.duration_since(file.modified)
+                .map(|age| age.as_secs() > max_age)
+                .unwrap_or(false)
+        });
+        let over_limit = remaining_files > max_files || total > max_total_bytes;
+        if (expired || over_limit) && fs::remove_file(&file.path).is_ok() {
+            remaining_files = remaining_files.saturating_sub(1);
+            total = total.saturating_sub(file.len);
+        }
+    }
+    Ok(())
+}
+
+// 脱敏正则全部 LazyLock 缓存：脱敏现在跑在日志写入端（每条日志一次），
+// 每次调用重新编译三个正则的开销落在 worker 热路径上。
+static RE_REDACT_HEADER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    // 折行的 header 续行（以空白开头）也要一并抹掉，否则
+    // "Set-Cookie:\n\tJSESSIONID=…" 只抹掉了首行。
+    regex::Regex::new(r"(?im)^(cookie|set-cookie|authorization)\s*:\s*.*(?:\r?\n[ \t]+.*)*$")
+        .expect("header redaction regex")
+});
+static RE_REDACT_KEY_VALUE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\b(password|passwd|pwd|token|jsessionid|session(?:id)?)(\s*[:=]\s*)([^\s,;]+)",
+    )
+    .expect("redaction regex")
+});
+static RE_REDACT_QUERY: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)([?&](?:password|passwd|pwd|token|jsessionid|session(?:id)?)=)[^&#\s]+")
+        .expect("query redaction regex")
+});
+/// 一行里出现多对 `名=值`（典型的 Cookie 行 `a=1; JSESSIONID=x; b=2`）时，
+/// 上面的 key_value 正则会逐对命中，但一行只写了一个 header 前缀的情况
+/// 靠这条兜底：把 `; ` 分隔的敏感对逐个抹掉。
+static RE_REDACT_COOKIE_PAIR: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(jsessionid|sessionid|session|token|auth)=([^;&\s]+)")
+        .expect("cookie pair redaction regex")
+});
+
+/// Logs and diagnostic notes can contain server text. Strip the common credential and session
+/// forms before any export; raw pages are handled by a separate explicit confirmation.
+pub fn redact_diagnostic_text(text: &str) -> String {
+    let text = RE_REDACT_HEADER.replace_all(text, "$1: [已隐藏]");
+    let text = RE_REDACT_KEY_VALUE.replace_all(&text, "$1$2[已隐藏]");
+    let text = RE_REDACT_QUERY.replace_all(&text, "${1}[已隐藏]");
+    RE_REDACT_COOKIE_PAIR
+        .replace_all(&text, "$1=[已隐藏]")
+        .into_owned()
+}
+
+/// Sanitises a raw debug response before it can be added to an explicitly requested
+/// diagnostic bundle. Submission forms are excluded wholesale because retaining an
+/// election payload would create an avoidable privacy risk.
+pub fn redact_diagnostic_page(name: &str, content: &str) -> Option<String> {
+    let lowered = format!("{name}\n{content}").to_ascii_lowercase();
+    const SUBMISSION_MARKERS: [&str; 5] = [
+        "batchoperator",
+        "operator0",
+        "optype",
+        "elect_lesson",
+        "selection payload",
+    ];
+    if SUBMISSION_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return None;
+    }
+
+    let text = redact_diagnostic_text(content);
+    let text = RE_REDACT_EMBEDDED.replace_all(&text, "$1$2[已隐藏]");
+    let text = RE_REDACT_HTML_VALUE.replace_all(&text, "$1[已隐藏]$3");
+    // value 写在 name 之前的 input，以及 CSRF/隐藏令牌字段，上面两条都盖不到。
+    let text = RE_REDACT_HTML_VALUE_FIRST.replace_all(&text, "$1[已隐藏]$3");
+    Some(
+        RE_REDACT_HIDDEN_TOKEN
+            .replace_all(&text, "$1[已隐藏]$3")
+            .into_owned(),
+    )
+}
+
+static RE_REDACT_EMBEDDED: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)(password|passwd|token|session(?:id)?|jsessionid|authorization|cookie)(\s*[\"']?\s*[:=]\s*[\"']?)([^\"'&<>\s,;]+)"#,
+    )
+    .expect("embedded diagnostic secret regex")
+});
+static RE_REDACT_HTML_VALUE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)(<(?:input|meta)\b[^>]*(?:name|id)\s*=\s*[\"']?(?:password|passwd|token|session(?:id)?|jsessionid)[\"']?[^>]*\bvalue\s*=\s*[\"'])([^\"']*)([\"'])"#,
+    )
+    .expect("HTML diagnostic secret regex")
+});
+/// `<input value="secret" name="password">`：value 在 name 之前。
+static RE_REDACT_HTML_VALUE_FIRST: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)(<(?:input|meta)\b[^>]*\bvalue\s*=\s*[\"'])([^\"']*)([\"'][^>]*(?:name|id)\s*=\s*[\"']?(?:password|passwd|token|session(?:id)?|jsessionid))"#,
+    )
+    .expect("HTML value-first secret regex")
+});
+/// 隐藏的 CSRF / 一次性令牌字段：名字五花八门，凡 hidden 且名字里带
+/// csrf/token/nonce/state/ticket 的一律抹掉值。
+static RE_REDACT_HIDDEN_TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)(<input\b[^>]*(?:name|id)\s*=\s*[\"']?[a-z0-9_\-]*(?:csrf|xsrf|token|nonce|state|ticket|salt)[a-z0-9_\-]*[\"']?[^>]*\bvalue\s*=\s*[\"'])([^\"']*)([\"'])"#,
+    )
+    .expect("hidden token redaction regex")
+});
+
+pub fn redact_diagnostic_url(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        // 兜底同样要剥分号：Servlet 系统里路径分号后面几乎总是 jsessionid。
+        return raw
+            .split(['?', '#', ';'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    // Servlet 的 URL 重写把会话标识以矩阵参数嵌在路径里
+    // （/eams/home.action;jsessionid=…），既不在 query 也不在 fragment，
+    // 上面四步全碰不到它——而用户恰恰常从登录态的地址栏复制出这种地址。
+    // 整段剥掉每个路径段的分号后缀而不只认 jsessionid：矩阵参数在诊断包里
+    // 没有任何正当用途。
+    if url.path().contains(';') {
+        let cleaned = url.path_segments().map(|segments| {
+            segments
+                .map(|segment| segment.split(';').next().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("/")
+        });
+        if let Some(cleaned) = cleaned {
+            url.set_path(&cleaned);
+        }
+    }
+    url.to_string()
 }
 
 /// 定时开抢的完整本地时刻（东八区）。
@@ -524,6 +919,33 @@ fn civil_from_days_cfg(days: i64) -> (i32, u32, u32) {
     (y as i32, m as u32, d as u32)
 }
 
+/// 保留最近若干份损坏配置备份。
+///
+/// 只保留最新的几份即可定位问题；配置长期损坏时，无限堆积的备份既没用又
+/// 让用户以为程序在乱写文件。
+fn retain_invalid_backups(dir: &Path) -> io::Result<()> {
+    const KEEP: usize = 3;
+    let mut backups = fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("config.invalid-")
+        })
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((entry.path(), modified))
+        })
+        .collect::<Vec<_>>();
+    backups.sort_by_key(|(_, modified)| *modified);
+    let excess = backups.len().saturating_sub(KEEP);
+    for (path, _) in backups.into_iter().take(excess) {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
 fn invalid_backup_path(path: &Path) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -679,6 +1101,47 @@ mod tests {
         assert!(stamp.to_local_seconds().unwrap() > 0);
     }
 
+    // days_from_civil 是手写历法算法，必须有已知日期的数值断言兜底；
+    // 基准：东八区本地秒 = Unix 秒 + 8*3600（与 worker::local_now_seconds 一致）。
+    #[test]
+    fn to_local_seconds_matches_known_utc8_instants() {
+        let epoch = ScheduleStamp {
+            year: 1970,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        };
+        assert_eq!(epoch.to_local_seconds(), Some(0));
+        // 闰日：2024-02-29 08:00:00 UTC+8 == 2024-02-29T00:00:00Z == Unix 1_709_164_800。
+        let leap_day = ScheduleStamp {
+            year: 2024,
+            month: 2,
+            day: 29,
+            hour: 8,
+            minute: 0,
+            second: 0,
+        };
+        assert_eq!(leap_day.to_local_seconds(), Some(1_709_164_800 + 8 * 3600));
+        // 闰日翌日 2024-03-01 00:00:00 UTC+8 == 2024-02-29T16:00:00Z == Unix 1_709_222_400。
+        let after_leap = ScheduleStamp {
+            year: 2024,
+            month: 3,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        };
+        assert_eq!(
+            after_leap.to_local_seconds(),
+            Some(1_709_222_400 + 8 * 3600)
+        );
+        // 平年没有 2/29；闰年有。
+        assert!(ScheduleStamp::parse("2025-02-29 08:00:00").is_none());
+        assert!(ScheduleStamp::parse("2024-02-29 08:00:00").is_some());
+    }
+
     #[test]
     fn normalize_keeps_only_valid_lesson_ids_for_active_serials() {
         let mut cfg = AppConfig {
@@ -736,6 +1199,286 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("password"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn debug_dump_is_session_only_and_never_written_back() {
+        let dir = config_test_dir("debug-session");
+        let path = dir.join("config.toml");
+        let cfg = AppConfig {
+            debug_dump_enabled: true,
+            ..Default::default()
+        };
+
+        cfg.save_to(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("debug_dump_enabled"));
+        assert!(!AppConfig::read_from(&path).unwrap().debug_dump_enabled);
+
+        fs::write(&path, "debug_dump_enabled = true\n").unwrap();
+        assert!(!AppConfig::read_from(&path).unwrap().debug_dump_enabled);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retention_removes_oldest_files_until_count_and_size_fit() {
+        let dir = config_test_dir("retention");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in [
+            ("old.txt", "1111"),
+            ("middle.txt", "2222"),
+            ("new.txt", "3333"),
+        ] {
+            fs::write(dir.join(name), content).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        retain_files(&dir, 2, 8, None).unwrap();
+
+        assert!(!dir.join("old.txt").exists());
+        assert!(dir.join("middle.txt").exists());
+        assert!(dir.join("new.txt").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retention_enforces_zero_count_and_expiry_bounds() {
+        let dir = config_test_dir("retention-expiry");
+        fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.txt");
+        fs::write(&old, "old").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&old).unwrap();
+        let old_time = SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(8 * 24 * 60 * 60))
+            .unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        drop(file);
+
+        retain_files(&dir, 10, DEBUG_TOTAL_BYTES_LIMIT, Some(DEBUG_MAX_AGE_SECS)).unwrap();
+        assert!(!old.exists(), "files older than seven days must be removed");
+
+        fs::write(dir.join("one.txt"), "1").unwrap();
+        retain_files(&dir, 0, u64::MAX, None).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn diagnostic_redaction_hides_credentials_sessions_and_query_values() {
+        let text = "Cookie: session=very-secret; other=value\npassword=hunter2 token: abc123 \
+https://example.edu/eams?sessionId=abc&course=1";
+        let redacted = redact_diagnostic_text(text);
+        assert!(!redacted.contains("very-secret"));
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("abc123"));
+        assert!(!redacted.contains("sessionId=abc"));
+        assert!(redacted.contains("[已隐藏]"));
+
+        let url = redact_diagnostic_url("https://user:secret@example.edu/eams?a=1#detail");
+        assert_eq!(url, "https://example.edu/eams");
+    }
+
+    /// Servlet 的 URL 重写把 jsessionid 以矩阵参数嵌进路径——用户从登录态
+    /// 地址栏复制的地址就长这样，它不在 query 也不在 fragment。
+    #[test]
+    fn diagnostic_url_strips_matrix_parameters_from_path() {
+        let url = redact_diagnostic_url(
+            "https://jw.example.edu/eams/homeExt.action;jsessionid=8D2AFE12C34?x=1",
+        );
+        assert_eq!(url, "https://jw.example.edu/eams/homeExt.action");
+
+        // 每一段路径的分号后缀都要剥，不只最后一段。
+        let url = redact_diagnostic_url(
+            "https://jw.example.edu/eams;jsessionid=AAA/home.action;jsessionid=BBB",
+        );
+        assert!(!url.contains("AAA") && !url.contains("BBB"), "{url}");
+        assert_eq!(url, "https://jw.example.edu/eams/home.action");
+
+        // 解析失败的兜底路径同样不能放过分号后缀。
+        let url = redact_diagnostic_url("not a url;jsessionid=CCC?x=1");
+        assert!(!url.contains("CCC"), "{url}");
+    }
+
+    // E-06：示例配置漂移过两次（教用户写一个 skip_serializing 的字段、
+    // 写死一个必然过期的日期）。用测试把它钉在真实结构上。
+    #[test]
+    fn example_config_stays_in_sync_with_the_real_struct() {
+        let text = fs::read_to_string("config.example.toml").expect("example config must exist");
+        let parsed: AppConfig = toml::from_str(&text).expect("example config must deserialize");
+        // 示例里不得出现只在会话内有效、永不写回的字段。
+        assert!(
+            !text.contains("debug_dump_enabled"),
+            "example must not teach a session-only field"
+        );
+        // 也不得写死一个必然过期的开抢时刻。
+        assert!(
+            !text.contains("schedule_time = \"20"),
+            "example must not hardcode a date that expires on release"
+        );
+        // 字段集合必须与默认配置一致：新增字段忘了同步会立刻暴露。
+        let example_keys = toml::to_string(&parsed)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim().to_string()))
+            .collect::<HashSet<_>>();
+        let default_keys = toml::to_string(&AppConfig::default())
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim().to_string()))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            example_keys, default_keys,
+            "config.example.toml drifted from AppConfig"
+        );
+    }
+
+    // S-05：降级即静默丢数据是最难发现的一类问题——用户回滚一次版本，
+    // 新版本写下的字段就永久消失且毫无提示。
+    #[test]
+    fn unknown_fields_survive_a_round_trip() {
+        let text = "\
+base_url = \"https://example.edu/eams\"\n\
+schema_version = 1\n\
+some_future_option = 42\n\
+another_future_option = \"keep me\"\n";
+        let cfg: AppConfig = toml::from_str(text).unwrap();
+        assert_eq!(cfg.unknown_fields.len(), 2, "unknown keys must be captured");
+        let saved = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            saved.contains("some_future_option") && saved.contains("keep me"),
+            "a downgrade must not silently drop the newer version's settings:\n{saved}"
+        );
+    }
+
+    // 读到来自更高版本的配置：可以照常运行，但绝不覆盖写。
+    #[test]
+    fn a_newer_schema_makes_the_config_read_only() {
+        let dir = std::env::temp_dir().join(format!("cs-schema-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "schema_version = {}\nbase_url = \"https://example.edu/eams\"\n",
+                CURRENT_SCHEMA_VERSION + 1
+            ),
+        )
+        .unwrap();
+
+        let cfg = AppConfig::read_from(&path).unwrap();
+        assert!(cfg.read_only, "must refuse to overwrite");
+        let error = cfg.save_to(&path).expect_err("save must be refused");
+        assert!(
+            format!("{error:#}").contains("只读"),
+            "the refusal must explain itself, got {error:#}"
+        );
+        // 文件必须原封不动。
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains(&format!("schema_version = {}", CURRENT_SCHEMA_VERSION + 1)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 没有版本号的旧配置按 v1 处理并被写上版本号。
+    #[test]
+    fn legacy_config_without_a_version_becomes_v1() {
+        let cfg: AppConfig = toml::from_str("base_url = \"https://example.edu/eams\"").unwrap();
+        assert_eq!(cfg.schema_version, 1);
+        let migrated = migrate(cfg).unwrap();
+        assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(!migrated.read_only);
+    }
+
+    // 数值不变式统一收敛到 normalize()：UI 与 worker 各兜一次总会漏掉
+    // 导入/手改配置的路径。
+    #[test]
+    fn normalize_is_the_single_funnel_for_numeric_invariants() {
+        let mut cfg = AppConfig {
+            interval_seconds: f64::NAN,
+            burst_interval_seconds: 99.0,
+            open_burst_seconds: 9_999,
+            timeout_seconds: 1,
+            max_consecutive_errors: 0,
+            ui_scale: f32::INFINITY,
+            ..Default::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.interval_seconds, 1.5, "NaN interval must be repaired");
+        assert!(
+            cfg.burst_interval_seconds <= cfg.interval_seconds,
+            "burst must never be slower than normal"
+        );
+        assert_eq!(cfg.open_burst_seconds, 120);
+        assert_eq!(cfg.timeout_seconds, 5);
+        assert_eq!(cfg.max_consecutive_errors, 1);
+        assert_eq!(cfg.ui_scale, 1.0);
+    }
+
+    // S-02：崩溃报告曾是全项目唯一绕过脱敏的落盘路径。panic payload 只要
+    // 经手过服务器文本（一次 .expect(&format!(...)) 疏忽就够）就会原样落盘。
+    #[test]
+    fn crash_reports_are_redacted_before_they_hit_the_disk() {
+        let dir = std::env::temp_dir().join(format!("cs-crash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let report = "panicked at 'server said Set-Cookie: JSESSIONID=abc123'\n\
+                      context: password=hunter2 token=tk_live_1\n\
+                      url: https://x.edu/eams/a?sessionid=zzz";
+        let path = AppConfig::write_crash_report_in(&dir, report).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        for secret in ["abc123", "hunter2", "tk_live_1", "zzz"] {
+            assert!(!written.contains(secret), "crash report leaked {secret}");
+        }
+        // 报告主体（定位信息）必须保留，否则脱敏等于把排障价值也删了。
+        assert!(written.contains("panicked at"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // 折行 header、一行多对 cookie、value 在 name 之前的 input、隐藏 CSRF
+    // 字段——这些都是原正则盖不到的形状。
+    #[test]
+    fn redaction_covers_folded_headers_multi_pair_cookies_and_hidden_tokens() {
+        let folded = "Set-Cookie: JSESSIONID=abc123;\n\tPath=/; HttpOnly\nNext-Header: ok";
+        let out = redact_diagnostic_text(folded);
+        assert!(!out.contains("abc123"), "folded header leaked: {out}");
+        assert!(out.contains("Next-Header: ok"), "over-redacted: {out}");
+
+        let multi = "cookie line: a=1; JSESSIONID=deadbeef; theme=dark";
+        let out = redact_diagnostic_text(multi);
+        assert!(!out.contains("deadbeef"), "multi-pair cookie leaked: {out}");
+        assert!(out.contains("theme=dark"), "over-redacted: {out}");
+
+        let value_first = r#"<input value="s3cret" name="password">"#;
+        let out = redact_diagnostic_page("p.html", value_first).unwrap();
+        assert!(!out.contains("s3cret"), "value-before-name leaked: {out}");
+
+        let csrf = r#"<input type="hidden" name="csrfToken" value="ct_9f8e7d">"#;
+        let out = redact_diagnostic_page("p.html", csrf).unwrap();
+        assert!(!out.contains("ct_9f8e7d"), "hidden CSRF leaked: {out}");
+    }
+
+    #[test]
+    fn raw_diagnostic_pages_never_export_secrets_or_submission_forms() {
+        let page = concat!(
+            "Cookie: JSESSIONID=cookie-secret\n",
+            "Authorization: Bearer auth-secret\n",
+            "<input name='password' value='test-password'>",
+            "<script>var token='token-secret'; var sessionId='session-secret';</script>"
+        );
+        let redacted = redact_diagnostic_page("login.html", page).unwrap();
+        for secret in [
+            "cookie-secret",
+            "auth-secret",
+            "test-password",
+            "token-secret",
+            "session-secret",
+        ] {
+            assert!(!redacted.contains(secret), "diagnostic leaked {secret}");
+        }
+
+        let submission = "<form action='stdElectCourse!batchOperator.action'><input name='operator0' value='123:true:0'></form>";
+        assert!(redact_diagnostic_page("submit.html", submission).is_none());
     }
 
     #[test]
